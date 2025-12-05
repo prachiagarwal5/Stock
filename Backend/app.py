@@ -514,24 +514,32 @@ def download_nse_data():
 @app.route('/api/nse-dates', methods=['GET'])
 def get_nse_dates():
     """
-    Get available dates for NSE data (last 30 days)
+    Get available dates for NSE data (last 2 years of trading days)
     Returns list of dates in DD-Mon-YYYY format
     """
     try:
         dates = []
         today = datetime.now()
         
-        # Generate dates for last 30 days (NSE trading days)
-        for i in range(30):
-            date = today - timedelta(days=i)
+        # Generate dates for last 2 years (approximately 500+ trading days, excluding weekends)
+        # 2 years = ~730 days, ~500 trading days (excluding weekends/holidays)
+        start_date = today - timedelta(days=730)
+        
+        current = start_date
+        while current <= today:
             # Skip weekends (5=Saturday, 6=Sunday)
-            if date.weekday() < 5:
-                dates.append(date.strftime('%d-%b-%Y'))
+            if current.weekday() < 5:
+                dates.append(current.strftime('%d-%b-%Y'))
+            current += timedelta(days=1)
+        
+        # Reverse to show most recent first
+        dates.reverse()
         
         return jsonify({
             'success': True,
             'dates': dates,
-            'today': today.strftime('%d-%b-%Y')
+            'today': today.strftime('%d-%b-%Y'),
+            'count': len(dates)
         }), 200
     
     except Exception as e:

@@ -28,12 +28,25 @@ function App() {
                 const data = await response.json();
                 setAvailableDates(data.dates);
                 if (data.dates.length > 0) {
-                    setNseDate(data.dates[0]);
+                    // Convert DD-Mon-YYYY to YYYY-MM-DD for date input
+                    const dateStr = data.dates[0];
+                    const date = new Date(dateStr + ' 2025');
+                    const formattedDate = date.toISOString().split('T')[0];
+                    setNseDate(formattedDate);
                 }
             }
         } catch (err) {
             console.error('Error fetching NSE dates:', err);
         }
+    };
+
+    // Convert YYYY-MM-DD (from date input) to DD-Mon-YYYY format for API
+    const convertDateFormat = (dateStr) => {
+        if (!dateStr) return '';
+        const [year, month, day] = dateStr.split('-');
+        const date = new Date(year, parseInt(month) - 1, parseInt(day));
+        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        return `${day}-${months[date.getMonth()]}-${year}`;
     };
 
     const handleDownloadFromNSE = async () => {
@@ -46,13 +59,14 @@ function App() {
         setError(null);
 
         try {
+            const formattedDate = convertDateFormat(nseDate);
             const response = await fetch('http://localhost:5000/api/download-nse', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
-                    date: nseDate,
+                    date: formattedDate,
                     save_to_file: true
                 })
             });
@@ -263,20 +277,15 @@ function App() {
                         <div className="nse-download-panel">
                             <div className="form-group">
                                 <label>Select Date</label>
-                                <select
+                                <input
+                                    type="date"
                                     value={nseDate}
                                     onChange={(e) => setNseDate(e.target.value)}
                                     className="form-input"
                                     disabled={nseLoading}
-                                >
-                                    {availableDates.map((date, idx) => (
-                                        <option key={idx} value={date}>
-                                            {date}
-                                        </option>
-                                    ))}
-                                </select>
+                                />
                                 <small className="form-hint">
-                                    Showing available trading dates (last 30 days, excluding weekends)
+                                    Select any trading date from the last 2 years
                                 </small>
                             </div>
 

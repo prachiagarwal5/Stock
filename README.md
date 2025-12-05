@@ -119,6 +119,7 @@ Open your browser and go to: **http://localhost:3000**
 
 ### 1. 🔽 Download from NSE (Single Date)
 - Download market cap data from NSE for a specific date
+- Choose from dropdown or type any date (last 2 years available)
 - File saved as: `mcapDDMMYYYY.csv`
 - Automatic trading days only (no weekends/holidays)
 
@@ -171,7 +172,7 @@ GET /health
 ### 2. Get Available NSE Dates
 ```bash
 GET /api/nse-dates
-# Response: {"dates": ["05-Dec-2025", "04-Dec-2025", ...], "count": 30}
+# Response: {"dates": ["05-Dec-2025", "04-Dec-2025", ..., "05-Dec-2023"], "count": 500+, "today": "05-Dec-2025"}
 ```
 
 ### 3. Download Single Date from NSE
@@ -434,7 +435,7 @@ Included documentation files for additional reference:
 A: Check your browser's Downloads folder (usually `~/Downloads/` on Mac)
 
 **Q: Can I download data from a year ago?**  
-A: Yes, but frontend shows last 30 trading days dropdown. You can manually type any date in format `DD-Mon-YYYY`
+A: Yes! The date picker shows last 2 years of trading days. Select from dropdown or type any date in format `DD-Mon-YYYY` (e.g., 25-Nov-2024)
 
 **Q: What happens if NSE is down?**  
 A: Backend will return error with details. Try again later or upload CSV files manually
