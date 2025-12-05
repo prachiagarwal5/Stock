@@ -1,0 +1,25 @@
+{
+  "splits": [
+    {
+      "old_symbol": "TATAMOTOR",
+      "new_symbols": ["TMPV", "TMCV"],
+      "split_date": "DD-MM-YYYY",
+      "description": "Stock split or demerger - the old symbol row will be blanked out for all dates BEFORE this date"
+    }
+  ],
+  "name_changes": [
+    {
+      "old_symbol": "OLDNAME",
+      "new_symbol": "NEWNAME",
+      "change_date": "DD-MM-YYYY",
+      "description": "Company name/symbol change - old symbol row will be blanked out for all dates BEFORE this date"
+    }
+  ],
+  "delistings": [
+    {
+      "symbol": "DELISTED",
+      "delisting_date": "DD-MM-YYYY",
+      "description": "Company delisted - row will be blanked out from this date onwards (optional)"
+    }
+  ]
+}
