@@ -1,0 +1,115 @@
+# Python Virtual Environments
+venv/
+ENV/
+env/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Node/Frontend Dependencies
+node_modules/
+npm-debug.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.sublime-project
+.sublime-workspace
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+.env
+.env.local
+.env.*.local
+
+# Temporary Files
+*.tmp
+*.temp
+temp/
+tmp/
+*.bak
+*.backup
+
+# Frontend Build
+Frontend/dist/
+Frontend/build/
+Frontend/.vite/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Logs
+logs/
+*.log
+
+# Excel Temporary Files
+~$*
+*.xlsx~
+.~lock*
+
+# CSV and Excel Data Files
+*.csv
+*.xlsx
+*.xls
+*.xlsm
+
+# Misc
+.cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Local development
+local_settings.py
+*.sqlite3
+*.db
+
+# OS temporary files
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# Git
+.git/
