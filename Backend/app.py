@@ -17,9 +17,39 @@ import requests
 from io import BytesIO
 import zipfile
 from dateutil import parser as date_parser
+import numpy as np
 
 app = Flask(__name__)
 CORS(app)
+
+# Custom JSON encoder to handle NaN and Inf values
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.floating):
+            if np.isnan(obj) or np.isinf(obj):
+                return None
+            return float(obj)
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+def convert_nan_to_none(obj):
+    """Recursively convert NaN, inf, and other non-serializable values to None"""
+    if isinstance(obj, float):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, (list, tuple)):
+        return [convert_nan_to_none(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: convert_nan_to_none(value) for key, value in obj.items()}
+    elif isinstance(obj, pd.Series):
+        return obj.where(pd.notna(obj), None).to_list()
+    elif isinstance(obj, pd.DataFrame):
+        return obj.where(pd.notna(obj), None).values.tolist()
+    return obj
 
 # Configuration
 UPLOAD_FOLDER = tempfile.mkdtemp()
@@ -33,15 +63,10 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 class MarketCapConsolidator:
-    def __init__(self, upload_folder, corporate_actions=None):
+    def __init__(self, upload_folder):
         self.data_folder = upload_folder
         self.df_consolidated = None
         self.dates_list = []
-        self.corporate_actions = corporate_actions or {
-            "splits": [],
-            "name_changes": [],
-            "delistings": []
-        }
     
     def _extract_date_from_filename(self, filename):
         """Extract date from filename like mcap10112025.csv"""
@@ -128,52 +153,6 @@ class MarketCapConsolidator:
         
         self.df_consolidated = pd.DataFrame(data_for_df)
         return len(self.df_consolidated), len(sorted_dates)
-    
-    def apply_corporate_actions(self):
-        """Apply corporate actions to blank out cells before split dates"""
-        if self.df_consolidated is None:
-            return
-        
-        # Handle stock splits
-        for split in self.corporate_actions.get('splits', []):
-            old_symbol = split.get('old_symbol', '').strip()
-            new_symbols = split.get('new_symbols', [])
-            split_date = split.get('split_date', '')
-            
-            if old_symbol in self.df_consolidated['Symbol'].values:
-                # Find columns before split date
-                date_columns = [col for col in self.df_consolidated.columns 
-                              if col not in ['Symbol', 'Company Name']]
-                
-                split_datetime = self._parse_date_string(split_date)
-                if split_datetime:
-                    for date_col in date_columns:
-                        col_datetime = self._parse_date_string(date_col)
-                        if col_datetime and col_datetime < split_datetime:
-                            self.df_consolidated.loc[
-                                self.df_consolidated['Symbol'] == old_symbol, 
-                                date_col
-                            ] = None
-        
-        # Handle name changes
-        for change in self.corporate_actions.get('name_changes', []):
-            old_symbol = change.get('old_symbol', '').strip()
-            new_symbol = change.get('new_symbol', '').strip()
-            change_date = change.get('change_date', '')
-            
-            if old_symbol in self.df_consolidated['Symbol'].values:
-                date_columns = [col for col in self.df_consolidated.columns 
-                              if col not in ['Symbol', 'Company Name']]
-                
-                change_datetime = self._parse_date_string(change_date)
-                if change_datetime:
-                    for date_col in date_columns:
-                        col_datetime = self._parse_date_string(date_col)
-                        if col_datetime and col_datetime < change_datetime:
-                            self.df_consolidated.loc[
-                                self.df_consolidated['Symbol'] == old_symbol,
-                                date_col
-                            ] = None
     
     def format_excel_output(self, output_path):
         """Format and save to Excel with styling"""
@@ -284,23 +263,9 @@ def consolidate():
             if file_count == 0:
                 return jsonify({'error': 'No valid CSV files uploaded'}), 400
             
-            # Parse corporate actions if provided
-            corporate_actions = {
-                "splits": [],
-                "name_changes": [],
-                "delistings": []
-            }
-            
-            if 'corporate_actions' in request.form:
-                try:
-                    corporate_actions = json.loads(request.form.get('corporate_actions'))
-                except json.JSONDecodeError:
-                    pass
-            
             # Consolidate data
-            consolidator = MarketCapConsolidator(request_folder, corporate_actions)
+            consolidator = MarketCapConsolidator(request_folder)
             companies_count, dates_count = consolidator.load_and_consolidate_data()
-            consolidator.apply_corporate_actions()
             
             # Create output file
             output_path = os.path.join(request_folder, 'Finished_Product.xlsx')
@@ -351,40 +316,36 @@ def preview():
             if file_count == 0:
                 return jsonify({'error': 'No valid CSV files uploaded'}), 400
             
-            # Parse corporate actions
-            corporate_actions = {
-                "splits": [],
-                "name_changes": [],
-                "delistings": []
-            }
-            
-            if 'corporate_actions' in request.form:
-                try:
-                    corporate_actions = json.loads(request.form.get('corporate_actions'))
-                except json.JSONDecodeError:
-                    pass
-            
             # Consolidate data for preview
-            consolidator = MarketCapConsolidator(request_folder, corporate_actions)
+            consolidator = MarketCapConsolidator(request_folder)
             companies_count, dates_count = consolidator.load_and_consolidate_data()
-            consolidator.apply_corporate_actions()
             
-            # Get preview data (first 10 rows, first 5 columns)
+            # Get preview data (first 10 rows)
             preview_df = consolidator.df_consolidated.iloc[:10]
             
-            return jsonify({
+            # Convert all NaN/inf to None recursively
+            preview_data = convert_nan_to_none(preview_df.values.tolist())
+            columns = consolidator.df_consolidated.columns.tolist()
+            dates = [d[0] for d in consolidator.dates_list]
+            
+            response_data = {
                 'success': True,
                 'summary': {
                     'total_companies': len(consolidator.df_consolidated),
                     'total_dates': dates_count,
                     'uploaded_files': file_count,
-                    'dates': [d[0] for d in consolidator.dates_list]
+                    'dates': dates
                 },
                 'preview': {
-                    'columns': consolidator.df_consolidated.columns.tolist(),
-                    'data': preview_df.values.tolist()
+                    'columns': columns,
+                    'data': preview_data
                 }
-            }), 200
+            }
+            
+            # Convert any remaining NaN values before returning
+            response_data = convert_nan_to_none(response_data)
+            
+            return jsonify(response_data), 200
         
         finally:
             if os.path.exists(request_folder):

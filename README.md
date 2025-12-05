@@ -1,615 +1,474 @@
-# Market Cap Consolidation Tool - Complete Full Stack Solution
+# Market Cap Consolidation Tool - README
 
 ## 🎯 Overview
 
-This is a **complete automated web-based solution** for consolidating daily market cap data from NSE into a professional Excel workbook. Features include:
+This is a **complete full-stack web application** for consolidating daily market cap data with automated NSE (National Stock Exchange) integration. The system includes:
 
-- ✅ **Automated NSE Downloads** - Download Bhavcopy data directly from NSE website
-- ✅ **Date Range Downloads** - Download multiple days at once
-- ✅ **Single Date Download** - Download individual trading day data
-- ✅ **Automatic date detection** from filename patterns
-- ✅ **Multi-date consolidation** with proper date-wise columns
-- ✅ **Corporate actions** (stock splits, name changes, delistings)
-- ✅ **Professional Excel formatting** with frozen panes and styling
-- ✅ **Blank cell handling** for missing data
-- ✅ **Beautiful Web UI** built with React
-- ✅ **REST API** backend with Flask
+- ✅ **React Frontend** - Beautiful, responsive web UI with 5-tab interface
+- ✅ **Flask Backend** - REST API with automatic NSE data scraping
+- ✅ **Automated NSE Downloads** - Single date or bulk date range downloads
+- ✅ **Professional Excel Export** - Multi-date consolidation with formatting
+- ✅ **Corporate Actions Support** - Stock splits, name changes, delistings
+- ✅ **Real-time Progress Tracking** - Live status updates for bulk operations
+- ✅ **Frozen Panes & Styling** - Professional Excel output
 
 ---
 
 ## 📦 Project Structure
 
 ```
-/Users/vinayak/Desktop/Proj01/
-│
+Proj01/
 ├── Backend/
-│   ├── app.py                    # Flask API server with NSE integration
-│   ├── consolidate_marketcap.py  # Core consolidation logic
+│   ├── app.py                    # Flask REST API server
+│   ├── consolidate_marketcap.py  # Data consolidation logic
 │   ├── requirements.txt          # Python dependencies
 │   ├── venv/                     # Virtual environment
-│   └── nosubject/
-│       ├── mcap*.csv             # Downloaded market cap files
-│       └── Finished_Product.xlsx # Generated consolidation file
-│
+│   └── temp/                     # Temporary files (auto-cleaned)
 ├── Frontend/
 │   ├── src/
-│   │   ├── App.jsx              # React main component
-│   │   ├── App.css              # Styling
+│   │   ├── App.jsx              # React main component (5 tabs)
+│   │   ├── App.css              # Responsive styling
 │   │   └── main.jsx             # Entry point
-│   ├── package.json             # npm dependencies
-│   ├── vite.config.js           # Build configuration
-│   └── index.html               # HTML template
-│
-├── README.md                     # This file
-├── NSE_INTEGRATION_GUIDE.md      # Detailed NSE integration docs
-└── LIVE_STATUS.md               # Current live status
+│   ├── package.json             # Node dependencies
+│   ├── vite.config.js           # Vite configuration
+│   └── node_modules/            # Installed packages
+├── nosubject/                    # Data files directory
+│   └── *.csv                     # Input CSV files
+└── README.md                     # This file
 ```
 
 ---
 
-## 🚀 Quick Start - 3 Steps
+## 🚀 Getting Started (Full Stack Setup)
 
-### Step 1: Start Backend (Terminal 1)
+### Prerequisites:
+- Python 3.13+ installed
+- Node.js 18+ installed
+- macOS/Linux terminal
+
+### Step 1: Setup Backend Virtual Environment
+
 ```bash
 cd /Users/vinayak/Desktop/Proj01/Backend
+
+# Create virtual environment (if not already created)
+python3 -m venv venv
+
+# Activate virtual environment
 source venv/bin/activate
+
+# Install dependencies from requirements.txt
+pip install -r requirements.txt
+
+# Verify installation
+pip list
+```
+
+**Expected Output:** Should show Flask, pandas, openpyxl, requests, beautifulsoup4, python-dateutil, and other packages.
+
+### Step 2: Start Backend Server
+
+```bash
+# Make sure you're in Backend directory with venv activated
+cd /Users/vinayak/Desktop/Proj01/Backend
+source venv/bin/activate
+
+# Start Flask server
 python app.py
 ```
-✅ Backend running on: http://127.0.0.1:5000
 
-### Step 2: Start Frontend (Terminal 2)
+**Expected Output:**
+```
+ * Serving Flask app 'app'
+ * Debug mode: on
+ * Running on http://127.0.0.1:5000
+ * Debugger is active!
+```
+
+The backend will be running on **http://localhost:5000**
+
+### Step 3: Setup Frontend & Start React Server
+
+**In a new terminal:**
+
 ```bash
 cd /Users/vinayak/Desktop/Proj01/Frontend
+
+# Install Node dependencies (if not already installed)
+npm install
+
+# Start React development server
 npm run dev
 ```
-✅ Frontend running on: http://localhost:3001
 
-### Step 3: Open Browser
+**Expected Output:**
 ```
-👉 http://localhost:3001
-```
-
----
-
-## ✨ Features & Usage
-
-### 🔽 Feature 1: Download Single Day Data
-
-**Tab:** 🔽 Download from NSE
-
-1. Click "🔽 Download from NSE" tab
-2. Select a date from dropdown (last 30 trading days)
-3. Click "🔽 Download & Save CSV"
-4. File automatically saved as `mcapDDMMYYYY.csv`
-
-**Example:**
-- Select: 03-Dec-2025
-- Download: mcap03122025.csv
-- Records: 2,769 companies
-
----
-
-### 📅 Feature 2: Download Date Range
-
-**Tab:** 📅 Date Range Download
-
-1. Click "📅 Date Range Download" tab
-2. Select start date (e.g., 01-Dec-2025)
-3. Select end date (e.g., 05-Dec-2025)
-4. Click "📅 Download Date Range"
-5. **All trading days between dates automatically downloaded!**
-
-**Example:**
-- Start: 01-Dec-2025
-- End: 05-Dec-2025
-- Downloads: 03-Dec, 04-Dec, 05-Dec (5 files)
-- Each file: mcapDDMMYYYY.csv
-- Shows: Real-time progress summary
-
-**Benefits:**
-- ⏱️ Download 5+ days in seconds instead of minutes
-- 📊 Perfect for weekly/monthly data collection
-- ✅ Progress tracking shows success/failures
-- 🔄 Resume-friendly error handling
-
----
-
-### 📤 Feature 3: Upload & Process
-
-**Tab:** 📤 Upload & Process
-
-1. Drag & drop CSV files or click to select
-2. Upload single or multiple files
-3. Click "Preview Data" to verify
-4. Configure corporate actions (optional)
-5. Click "Download Excel"
-6. Get `Finished_Product.xlsx`
-
-**Supported Formats:**
-- NSE Bhavcopy CSV: `bcDDMMYYYY.csv` or `mcapDDMMYYYY.csv`
-- Custom market cap format with columns: Symbol, Security Name, Market Cap(Rs.)
-
----
-
-### ⚙️ Feature 4: Corporate Actions
-
-**Tab:** ⚙️ Corporate Actions
-
-Configure stock splits, name changes, and delistings:
-
-```json
-{
-  "splits": [{
-    "old_symbol": "TATAMOTOR",
-    "new_symbols": ["TMPV", "TMCV"],
-    "split_date": "20-11-2025"
-  }],
-  "name_changes": [{
-    "old_symbol": "OLDNAME",
-    "new_symbol": "NEWNAME",
-    "change_date": "15-11-2025"
-  }],
-  "delistings": [{
-    "symbol": "DELISTED",
-    "delisting_date": "10-11-2025"
-  }]
-}
+  VITE v4.5.14  ready in XXX ms
+  ➜  Local:   http://localhost:3000/
 ```
 
-**Effect on Excel:**
-- TATAMOTOR blanks BEFORE 20-11-2025
-- TMPV & TMCV show data FROM 20-11-2025
-- Proper historical tracking maintained
+The frontend will be running on **http://localhost:3000**
+
+### Step 4: Open the Application
+
+Open your browser and go to: **http://localhost:3000**
 
 ---
 
-### 👁️ Feature 5: Preview
+## 🎯 Application Features (4 Tabs)
 
-**Tab:** 👁️ Preview
+### 1. 🔽 Download from NSE (Single Date)
+- Download market cap data from NSE for a specific date
+- File saved as: `mcapDDMMYYYY.csv`
+- Automatic trading days only (no weekends/holidays)
 
-Before downloading Excel:
-- See summary statistics (total companies, dates, files)
-- View dates included in consolidation
-- Browse sample data (first 10 companies)
-- Verify everything looks correct
+### 2. 📅 Date Range Download (Bulk)
+- Download data for multiple dates at once
+- Enter start date and end date
+- Real-time progress with success/failure statistics
+- Automatic file naming and consolidation
 
----
+### 3. 📤 Upload & Process
+- Upload CSV files manually
+- Preview data before consolidation
 
-## 🎨 Web Interface Features
-
-### Responsive Design
-- ✅ Works on Desktop, Tablet, Mobile
-- ✅ Beautiful gradient UI (purple/blue theme)
-- ✅ Dark mode ready
-- ✅ Smooth animations and transitions
-
-### User Experience
-- ✅ Real-time loading indicators
-- ✅ Success/error messages with emojis
-- ✅ Drag & drop file upload
-- ✅ Tab-based organization
-- ✅ Progress tracking for batch downloads
-- ✅ Info boxes with helpful hints
-
-### Performance
-- ✅ Fast file downloads (2-5 seconds)
-- ✅ Instant UI feedback
-- ✅ Optimized data processing
-- ✅ Efficient memory usage
+### 4. 👁️ Preview
+- Preview consolidated data before export
+- Download Excel file with all formatting
+- Frozen panes and professional styling included
 
 ---
 
-## 🔧 Backend API Endpoints
+## 🔄 Complete Workflow Example
+
+### Scenario: Download data for last 5 trading days and generate Excel
+
+**Step 1:** Open http://localhost:3000 in browser
+
+**Step 2:** Go to "📅 Date Range Download" tab
+
+**Step 3:** 
+- Enter Start Date: 25-Nov-2025
+- Enter End Date: 05-Dec-2025
+- Click "Download"
+
+**Step 5:** Go to "👁️ Preview" tab and review data
+
+**Step 6:** Click "Download Excel" to save `Finished_Product.xlsx`
+
+**Step 7:** Open Excel file and view consolidated data with all dates as columns
+
+---
+
+## 🛠 Backend REST API Endpoints
 
 ### 1. Health Check
-```
+```bash
 GET /health
-Response: {"status": "ok"}
+# Response: {"status": "ok"}
 ```
 
-### 2. Download Single Day
-```
-POST /api/download-nse
-Body: {
-  "date": "03-Dec-2025",
-  "save_to_file": true
-}
-Response: {
-  "success": true,
-  "file": "mcap03122025.csv",
-  "records_count": 2769
-}
-```
-
-### 3. Download Date Range
-```
-POST /api/download-nse-range
-Body: {
-  "start_date": "01-Dec-2025",
-  "end_date": "05-Dec-2025",
-  "save_to_file": true
-}
-Response: {
-  "success": true,
-  "summary": {
-    "total_requested": 5,
-    "successful": 5,
-    "failed": 0
-  },
-  "files": [
-    {"date": "03-Dec-2025", "filename": "mcap03122025.csv", "records": 2769},
-    ...
-  ]
-}
-```
-
-### 4. Get Available Dates
-```
+### 2. Get Available NSE Dates
+```bash
 GET /api/nse-dates
-Response: {
-  "success": true,
-  "dates": ["05-Dec-2025", "04-Dec-2025", ..., "01-Nov-2025"],
-  "today": "05-Dec-2025"
-}
+# Response: {"dates": ["05-Dec-2025", "04-Dec-2025", ...], "count": 30}
+```
+
+### 3. Download Single Date from NSE
+```bash
+POST /api/download-nse
+# Request: {"date": "05-Dec-2025", "save_to_file": true}
+# Response: {"success": true, "filename": "mcap05122025.csv", "records": 2750}
+```
+
+### 4. Download Date Range from NSE
+```bash
+POST /api/download-nse-range
+# Request: {"start_date": "01-Dec-2025", "end_date": "05-Dec-2025", "save_to_file": true}
+# Response: {
+#   "summary": {"successful": 4, "failed": 0, "total_requested": 5},
+#   "files": [{"date": "05-Dec-2025", "filename": "mcap05122025.csv", "records": 2750}],
+#   "errors": []
+# }
 ```
 
 ### 5. Preview Consolidation
-```
+```bash
 POST /api/preview
-Body: FormData with CSV files + corporate_actions
-Response: {
-  "summary": {
-    "total_companies": 2769,
-    "total_dates": 3,
-    "dates": ["01-Dec-2025", "02-Dec-2025", "03-Dec-2025"]
-  },
-  "preview": {
-    "columns": ["Symbol", "Name", ...dates...],
-    "data": [[sample rows]]
-  }
-}
+# Request: FormData with CSV files
+# Response: Preview of consolidated data
 ```
 
-### 6. Consolidate & Download Excel
-```
+### 6. Generate Excel
+```bash
 POST /api/consolidate
-Body: FormData with CSV files + corporate_actions
-Response: Binary Excel file (Finished_Product.xlsx)
+# Request: FormData with CSV files + corporate actions (optional)
+# Response: Excel file download
 ```
 
 ---
 
-## 📊 Excel Output
+## 📋 Manual Backend Startup (Without venv)
 
-### Format
-```
-Symbol | Security Name | 01-Dec-2025 | 02-Dec-2025 | 03-Dec-2025 | ...
-RELIANCE | Reliance Industries | 2500000000 | 2510000000 | 2520000000
-INFY | Infosys Limited | 850000000 | 855000000 | 860000000
-...
+If you prefer using system Python (packages already installed):
+
+```bash
+cd /Users/vinayak/Desktop/Proj01/Backend
+/opt/miniconda3/bin/python app.py
 ```
 
-### Formatting Applied
-- ✓ Blue header row with white text
-- ✓ Dates in chronological order
-- ✓ Numbers formatted with thousand separators
-- ✓ Right-aligned numeric columns
-- ✓ First row frozen (header visible)
-- ✓ First two columns frozen (Symbol/Name visible)
-- ✓ Blank cells for missing data (not zeros)
+Or if using conda:
+
+```bash
+conda run -n base python /Users/vinayak/Desktop/Proj01/Backend/app.py
+```
 
 ---
 
-## 🔐 NSE Integration Details
-
-### Data Source
-- **Website:** https://www.nseindia.com
-- **Endpoint:** /api/reports
-- **Data Type:** CM - Bhavcopy (PR.zip)
-- **File Format:** CSV (market cap)
-- **Update Frequency:** Daily after market close
-- **Historical Range:** Last 30 trading days
-
-### Data Extracted
-- Symbol
-- Series
-- Open/High/Low/Close prices
-- Market Cap
-- Trading Volume
-- Last Trade Date
-
-### File Naming
-NSE provides files with pattern:
-- `mcapDDMMYYYY.csv` - Market cap data
-- `bcDDMMYYYY.csv` - Bhavcopy (quotation)
-- `pr03122025.csv` - Price data
-
-Our app automatically extracts and renames to: `mcapDDMMYYYY.csv`
+## 🎯 Quick Start (One-Command Setup)
 
 ---
 
-## 📋 CSV Input Format (Manual Upload)
+## 📂 Traditional CLI Usage (Without Web App)
 
-### Required Columns
-```
-Symbol | Security Name | Market Cap(Rs.)
-```
+If you prefer running the consolidation from command line instead of the web interface:
 
-### Examples
-```
-SYMBOL,Security Name,Market Cap(Rs.)
-RELIANCE,Reliance Industries Limited,2500000000000
-TCS,Tata Consultancy Services Limited,1450000000000
-INFY,Infosys Limited,850000000000
+```bash
+cd /Users/vinayak/Desktop/Proj01
+source venv/bin/activate
+python3 consolidate_marketcap.py
 ```
 
-### File Naming Convention
-- Format: `mcapDDMMYYYY.csv`
-- Examples:
-  - `mcap01122025.csv` = 01-Dec-2025
-  - `mcap31122025.csv` = 31-Dec-2025
-  - `mcap15012026.csv` = 15-Jan-2026
+This will consolidate all CSV files in `/nosubject/` and generate `Finished_Product.xlsx`
 
 ---
 
-## 🐛 Troubleshooting
+## 🛠 Troubleshooting
+
+### Backend Issues
 
 | Issue | Solution |
 |-------|----------|
-| **Port 3000 in use** | App uses 3001 automatically. Visit http://localhost:3001 |
-| **Backend not responding** | Check Flask is running: `python app.py` |
-| **NSE download fails** | Check internet connection. NSE server may be slow. |
-| **"Date range is empty"** | Dates selected fall on weekends. Try different dates. |
-| **Download hangs** | Wait 30 seconds. NSE API can be slow during market hours. |
-| **File not saving** | Check folder exists: /Backend/nosubject/ |
-| **"No CSV found"** | File naming must match: mcapDDMMYYYY.csv |
-| **Excel not opening** | Ensure file is complete (successful = total in progress summary) |
-| **Consolidation empty** | Verify CSV columns: Symbol, Security Name, Market Cap(Rs.) |
+| `ModuleNotFoundError: No module named 'flask'` | Make sure to activate venv: `source venv/bin/activate` OR use full Python path: `/opt/miniconda3/bin/python app.py` |
+| Backend won't start on port 5000 | Check if port is in use: `lsof -i :5000` and kill if needed: `kill -9 <PID>` |
+| Import errors for pandas/openpyxl | Run `pip install -r requirements.txt` again with venv activated |
+| Connection refused on http://localhost:5000 | Make sure backend server is running in another terminal |
+
+### Frontend Issues
+
+| Issue | Solution |
+|-------|----------|
+| `npm: command not found` | Install Node.js from https://nodejs.org/ |
+| `port 3000 already in use` | Kill existing process: `lsof -i :3000` then `kill -9 <PID>` |
+| `npm ERR! 404 Not Found` | Delete `node_modules` and `package-lock.json`, then run `npm install` again |
+| Files not uploading | Check that backend is running on port 5000 and CORS is enabled |
+
+### Data Issues
+
+| Issue | Solution |
+|-------|----------|
+| CSV file not recognized | Ensure filename matches `mcapDDMMYYYY.csv` pattern |
+| NSE download fails | Check internet connection and verify date is a trading day (not weekend/holiday) |
+| Column not found error | Verify CSV has columns: `Symbol`, `Security Name`, `Market Cap(Rs.)` |
+| Corporate actions not applied | Check JSON format in corporate_actions.json, use `DD-MM-YYYY` date format |
 
 ---
 
-## 🚀 Use Cases
+## 📊 CSV Input Format (For Manual Uploads)
 
-### Daily Market Monitoring
-```
-1. Open app → Download from NSE tab
-2. Select today's date
-3. Click download
-4. Upload with previous days
-5. Consolidate to Excel
-6. Share with team
-```
+### Required Columns:
+- `Symbol` - Stock ticker symbol (e.g., TCSM, RELIANCE)
+- `Security Name` or `Company Name` - Full company name
+- `Market Cap(Rs.)` - Market capitalization value in rupees
 
-### Weekly Report Generation
-```
-1. Go to Date Range Download tab
-2. Start: Monday, End: Friday
-3. Download all 5 trading days at once
-4. Consolidate with previous weeks
-5. Generate weekly report
-```
+### File Naming:
+- Format: `mcapDDMMYYYY.csv`
+- Examples:
+  - `mcap05122025.csv` = 05 DEC 2025
+  - `mcap31122025.csv` = 31 DEC 2025
+  - `mcap01012026.csv` = 01 JAN 2026
 
-### Historical Data Analysis
-```
-1. Date Range Download tab
-2. Start: 1 month ago, End: Today
-3. Download ~22 trading days
-4. Consolidate all data
-5. Perform trend analysis
-6. Export to analytics tool
-```
-
-### Corporate Action Handling
-```
-1. Download data before/after split
-2. Go to Corporate Actions tab
-3. Add split configuration
-4. Upload files
-5. Preview shows proper blanking
-6. Download corrected Excel
-```
+### File Location (For CLI usage):
+- Must be in: `/Users/vinayak/Desktop/Proj01/nosubject/`
 
 ---
 
-## 💻 Technology Stack
+## 🛡️ Advanced Configuration
 
-### Frontend
-- **React 18.2.0** - UI library
-- **Vite 4.5.14** - Build tool & dev server
-- **CSS3** - Styling with gradients and animations
-- **Fetch API** - HTTP requests
+### Backend Configuration (app.py)
 
-### Backend
-- **Flask 3.1.1** - Web framework
-- **pandas 2.3.1** - Data manipulation
-- **openpyxl 3.1.5** - Excel file generation
-- **requests 2.32.3** - HTTP requests to NSE
-- **python-dateutil 2.9.0** - Date parsing
-- **Python 3.13** - Language
+Key settings you can modify:
 
-### Infrastructure
-- **Local Development:** localhost:3001 & localhost:5000
-- **CORS Enabled:** Frontend-backend communication
-- **Temporary Files:** Cleaned up after processing
+```python
+# Flask debug mode
+app.run(debug=True)  # Set to False for production
 
----
+# CORS settings
+CORS(app, resources={r"/api/*": {"origins": "*"}})  # Restrict as needed
 
-## 📈 Performance Metrics
+# File size limits
+MAX_CONTENT_LENGTH = 100 * 1024 * 1024  # 100MB max
 
-### Download Speed
-- Single day: 2-5 seconds
-- Date range (5 days): 10-15 seconds
-- Date range (20 days): 40-60 seconds
-
-### File Sizes
-- Bhavcopy ZIP: 200-300 KB
-- Extracted CSV: 1-2 MB
-- Finished Excel: 500 KB - 2 MB
-
-### Data Volume
-- Companies per file: 2,500-3,000
-- Columns in Excel: 2 + (number of dates)
-- Max processing: 30 dates × 3,000 companies = 90,000 cells
-
----
-
-## 🔄 Workflow Diagram
-
+# Temp file cleanup
+temp_dir = "temp/"  # Where temporary files are stored
 ```
-User (Browser) http://localhost:3001
-        ↓
-    ┌───┴────┬──────────────┬──────────────┐
-    ↓        ↓              ↓              ↓
-  NSE      Upload     Corporate       Preview
-  Download  Files      Actions        Results
-    ↓        ↓              ↓              ↓
-    └────┬───┘              │              │
-         ↓                  ↓              ↓
-    Flask API Consolidation Engine
-         ↓
-    Download Excel → User
+
+### Frontend Configuration (vite.config.js)
+
+```javascript
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 3000,
+    open: true
+  }
+})
 ```
 
 ---
 
-## 🎯 Getting Started
+## 🔐 Data & Security
 
-### Prerequisites
-- Node.js 14+ (for frontend)
-- Python 3.13+ (already installed)
-- npm (comes with Node.js)
-- macOS/Linux (WSL on Windows)
+### Blank Cell Handling:
+- If symbol not in a date's CSV → cell is BLANK (not 0 or N/A)
+- Preserves data quality and prevents erroneous calculations
 
-### Installation
+### File Backup:
+- Excel files downloaded from UI are saved locally in your Downloads folder
+- Data uploaded to backend is processed temporarily and auto-cleaned after generation
+- CSV files in `/nosubject/` folder are preserved and never deleted
 
-**Already Done - No Setup Needed!**
-
-All dependencies are already installed:
-- ✅ Python venv with pandas, openpyxl, Flask, requests
-- ✅ npm packages for React and Vite
-- ✅ NSE API integration ready
-- ✅ Database folder structure created
-
-### Running the Application
-
-**Terminal 1 - Backend:**
-```bash
-cd /Users/vinayak/Desktop/Proj01/Backend
-source venv/bin/activate
-python app.py
-# Output: Running on http://127.0.0.1:5000
-```
-
-**Terminal 2 - Frontend:**
-```bash
-cd /Users/vinayak/Desktop/Proj01/Frontend
-npm run dev
-# Output: ➜ Local: http://localhost:3001/
-```
-
-**Browser:**
-```
-👉 http://localhost:3001
-```
+### NSE Data:
+- Downloaded files are automatically validated against NSE column format
+- Date filtering ensures only trading days (no weekends/holidays)
+- All data remains local - nothing is sent to external servers except NSE API
 
 ---
 
-## 📚 Documentation
+## 📈 Use Cases
 
-- **NSE_INTEGRATION_GUIDE.md** - Complete NSE API details
-- **LIVE_STATUS.md** - Current system status and checklist
-- **FULLSTACK_SETUP.md** - Full setup and deployment guide
-- **FULLSTACK_QUICK_START.md** - Quick reference commands
-
----
-
-## ✅ Feature Checklist
-
-### Downloaded Feature ✅
-- [x] Single day NSE download
-- [x] Date range NSE downloads
-- [x] Automatic CSV extraction from ZIP
-- [x] Auto file naming (mcapDDMMYYYY.csv)
-- [x] Real-time progress tracking
-- [x] Error handling and retry
-
-### Upload Feature ✅
-- [x] Drag & drop file upload
-- [x] Multiple file selection
-- [x] File validation
-- [x] Size checking
-
-### Consolidation Feature ✅
-- [x] Multi-date consolidation
-- [x] Symbol deduplication
-- [x] Automatic date extraction
-- [x] Blank cell handling
-
-### Corporate Actions ✅
-- [x] Stock splits
-- [x] Name changes
-- [x] Delistings
-- [x] Date-based blanking
-
-### Excel Export ✅
-- [x] Professional formatting
-- [x] Frozen panes
-- [x] Number formatting
-- [x] Header styling
-- [x] Proper column alignment
-
-### UI/UX ✅
-- [x] Responsive design
-- [x] Tab-based navigation
-- [x] Loading indicators
-- [x] Success/error messages
-- [x] Progress summaries
-- [x] Beautiful styling
+1. **Daily Tracking:** Monitor market cap changes across all companies
+2. **Trend Analysis:** Compare values across dates for single companies
+3. **Data Export:** Extract to analytics tools or databases
+4. **Bulk Data Collection:** Download weeks/months of data automatically
+5. **Reporting:** Create presentations with historical data
 
 ---
 
-## 🎉 You're All Set!
+## 🎓 Documentation Files
 
-Your complete market cap consolidation and NSE data download system is ready to use!
+Included documentation files for additional reference:
 
-### Next Steps:
-1. ✅ Start backend: `python app.py`
-2. ✅ Start frontend: `npm run dev`
-3. ✅ Open: http://localhost:3001
-4. ✅ Download or upload data
-5. ✅ Consolidate to Excel
-6. ✅ Download and use!
-
----
-
-## 📞 Support & Questions
-
-For issues or questions:
-1. Check TROUBLESHOOTING section above
-2. Review NSE_INTEGRATION_GUIDE.md
-3. Check terminal logs for error messages
-4. Verify all services are running
+1. **README.md** - This file (full documentation)
+2. **QUICK_START.md** - 5-minute quick reference
+3. **USAGE_GUIDE.md** - Detailed feature documentation
+4. **NSE_INTEGRATION_GUIDE.md** - NSE data source details
+5. **FULLSTACK_SETUP.md** - Complete setup walkthrough
+6. **FULLSTACK_QUICK_START.md** - Quick command reference
 
 ---
 
-## 📝 Change Log
+## ✨ Technology Stack
 
-### v2.0 (Current)
-- ✨ Added date range download feature
-- ✨ Added progress tracking for batch downloads
-- ✨ Improved error handling and reporting
-- 🔧 Better NSE API integration
-- 🎨 Enhanced UI with new tabs
+### Backend:
+- **Framework:** Flask 3.1.1
+- **Language:** Python 3.13
+- **Data Processing:** pandas 2.3.1
+- **Excel Generation:** openpyxl 3.1.5
+- **Web Scraping:** requests 2.32.3, beautifulsoup4 4.13.4
+- **CORS Support:** Flask-CORS 6.0.1
+- **Date Utilities:** python-dateutil 2.9.0
 
-### v1.0 (Initial)
-- ✨ Single day NSE download
-- ✨ Manual CSV upload
-- ✨ Data consolidation
-- ✨ Corporate action handling
-- ✨ Excel export with formatting
+### Frontend:
+- **Framework:** React 18.2.0
+- **Build Tool:** Vite 4.5.14
+- **Styling:** CSS3 with gradients and animations
+- **HTTP Client:** Fetch API
+
+### Database/Storage:
+- **Local CSV Files:** `/nosubject/` folder
+- **Excel Output:** Generated on-demand
+- **Temporary Files:** Auto-cleaned after processing
+
+---
+
+## 🎯 Key Features Comparison
+
+| Feature | CLI Tool | Web App | NSE Integration |
+|---------|----------|---------|-----------------|
+| Upload CSV files | ✅ (folder) | ✅ (drag-drop) | ✅ (auto-download) |
+| Single date processing | ✅ | ✅ | ✅ |
+| Bulk date processing | ❌ | ✅ | ✅ |
+| Real-time progress | ❌ | ✅ | ✅ |
+| Excel export | ✅ | ✅ | ✅ |
+| Web interface | ❌ | ✅ | ✅ |
+| Data preview | ❌ | ✅ | ✅ |
+| REST API | ❌ | ✅ | ✅ |
+
+---
+
+## 🚀 Performance Tips
+
+### For Large Date Ranges:
+1. Download in smaller chunks (5-10 trading days at a time)
+2. Browser may take time to download if Excel is large (>50MB)
+3. Consolidating 50+ dates might take 30-60 seconds
+
+### For System Performance:
+1. Keep temp files clean: Files are auto-deleted after download
+2. Close browser tabs if system is slow
+3. Use Chrome/Firefox for best performance (Safari may be slower)
+
+### For NSE Optimization:
+1. NSE servers may be slow during market hours (9:30-15:30 IST)
+2. Download data after market close for faster speeds
+3. Check your internet connection if downloads fail
+
+---
+
+## 📞 Support & Help
+
+### Common Questions
+
+**Q: Where are my downloaded Excel files?**  
+A: Check your browser's Downloads folder (usually `~/Downloads/` on Mac)
+
+**Q: Can I download data from a year ago?**  
+A: Yes, but frontend shows last 30 trading days dropdown. You can manually type any date in format `DD-Mon-YYYY`
+
+**Q: What happens if NSE is down?**  
+A: Backend will return error with details. Try again later or upload CSV files manually
+
+**Q: Can I run this without the web interface?**  
+A: Yes! Use the CLI: `cd Backend && source venv/bin/activate && python3 consolidate_marketcap.py`
+
+**Q: Is my data secure?**  
+A: All data is processed locally on your machine. No data is sent anywhere except NSE API calls for download
+
+---
+
+## 📝 Version History
+
+- **v2.0** (Current) - Full-stack web app with React + Flask, NSE integration, date range downloads, REST API
+- **v1.0** (Initial) - CLI-based Python script with manual CSV processing
+
+---
+
+## 🎉 You're Ready!
+
+Everything is set up and ready to use. Just:
+
+1. **Start Backend:** `cd Backend && source venv/bin/activate && python app.py`
+2. **Start Frontend:** `cd Frontend && npm run dev` (in new terminal)
+3. **Open Browser:** http://localhost:3000
+4. **Download & Consolidate:** Use the web interface or upload CSVs manually
+
+**Questions or issues?** Check the troubleshooting section above.
 
 ---
 
 *Created: December 5, 2025*  
-*Full Stack Solution: React Frontend + Flask Backend + NSE Integration*  
-*Market Cap Consolidation Tool v2.0*
+*Solution: Market Cap Consolidation Tool v2.0*  
+*Full-stack React + Flask application with NSE integration*  
+*GitHub Repository: https://github.com/vinayaksingh930/Stock*
+

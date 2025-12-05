@@ -3,20 +3,10 @@ import './App.css';
 
 function App() {
     const [uploadedFiles, setUploadedFiles] = useState([]);
-    const [corporateActions, setCorporateActions] = useState({
-        splits: [],
-        name_changes: [],
-        delistings: []
-    });
     const [loading, setLoading] = useState(false);
     const [preview, setPreview] = useState(null);
     const [error, setError] = useState(null);
     const [success, setSuccess] = useState(null);
-    const [newSplit, setNewSplit] = useState({
-        old_symbol: '',
-        new_symbols: [],
-        split_date: ''
-    });
     const [activeTab, setActiveTab] = useState('upload');
     const [nseDate, setNseDate] = useState('');
     const [availableDates, setAvailableDates] = useState([]);
@@ -149,48 +139,6 @@ function App() {
         setSuccess(null);
     };
 
-    const handleAddSplit = () => {
-        if (newSplit.old_symbol && newSplit.new_symbols.length > 0 && newSplit.split_date) {
-            setCorporateActions({
-                ...corporateActions,
-                splits: [...corporateActions.splits, newSplit]
-            });
-            setNewSplit({
-                old_symbol: '',
-                new_symbols: [],
-                split_date: ''
-            });
-            setSuccess('Stock split added successfully');
-        } else {
-            setError('Please fill in all split details');
-        }
-    };
-
-    const handleRemoveSplit = (index) => {
-        setCorporateActions({
-            ...corporateActions,
-            splits: corporateActions.splits.filter((_, i) => i !== index)
-        });
-    };
-
-    const handleAddNewSymbol = (e, currentSymbols) => {
-        const value = e.target.value;
-        if (value && !currentSymbols.includes(value)) {
-            setNewSplit({
-                ...newSplit,
-                new_symbols: [...currentSymbols, value]
-            });
-            e.target.value = '';
-        }
-    };
-
-    const handleRemoveSymbol = (index) => {
-        setNewSplit({
-            ...newSplit,
-            new_symbols: newSplit.new_symbols.filter((_, i) => i !== index)
-        });
-    };
-
     const handlePreview = async () => {
         if (uploadedFiles.length === 0) {
             setError('Please upload at least one CSV file');
@@ -202,7 +150,6 @@ function App() {
 
         const formData = new FormData();
         uploadedFiles.forEach(file => formData.append('files', file));
-        formData.append('corporate_actions', JSON.stringify(corporateActions));
 
         try {
             const response = await fetch('http://localhost:5000/api/preview', {
@@ -237,7 +184,6 @@ function App() {
 
         const formData = new FormData();
         uploadedFiles.forEach(file => formData.append('files', file));
-        formData.append('corporate_actions', JSON.stringify(corporateActions));
 
         try {
             const response = await fetch('http://localhost:5000/api/consolidate', {
@@ -295,12 +241,6 @@ function App() {
                         onClick={() => setActiveTab('upload')}
                     >
                         📤 Upload & Process
-                    </button>
-                    <button
-                        className={`tab-btn ${activeTab === 'actions' ? 'active' : ''}`}
-                        onClick={() => setActiveTab('actions')}
-                    >
-                        ⚙️ Corporate Actions
                     </button>
                     <button
                         className={`tab-btn ${activeTab === 'preview' ? 'active' : ''}`}
@@ -534,105 +474,6 @@ function App() {
                     </section>
                 )}
 
-                {activeTab === 'actions' && (
-                    <section className="section">
-                        <h2>Step 2: Configure Corporate Actions</h2>
-                        <p className="section-hint">
-                            Define stock splits, name changes, and delistings to ensure data accuracy
-                        </p>
-
-                        <div className="corporate-actions-panel">
-                            <h3>Add Stock Split/Demerger</h3>
-                            <div className="form-group">
-                                <label>Old Symbol (e.g., TATAMOTOR)</label>
-                                <input
-                                    type="text"
-                                    placeholder="Enter old company symbol"
-                                    value={newSplit.old_symbol}
-                                    onChange={(e) => setNewSplit({ ...newSplit, old_symbol: e.target.value.toUpperCase() })}
-                                    className="form-input"
-                                />
-                            </div>
-
-                            <div className="form-group">
-                                <label>New Symbols</label>
-                                <div className="new-symbols-input">
-                                    <input
-                                        type="text"
-                                        placeholder="Enter new symbol and press enter (e.g., TMPV)"
-                                        onKeyPress={(e) => {
-                                            if (e.key === 'Enter') {
-                                                handleAddNewSymbol(e, newSplit.new_symbols);
-                                            }
-                                        }}
-                                        className="form-input"
-                                    />
-                                </div>
-                                {newSplit.new_symbols.length > 0 && (
-                                    <div className="symbol-tags">
-                                        {newSplit.new_symbols.map((symbol, idx) => (
-                                            <span key={idx} className="symbol-tag">
-                                                {symbol}
-                                                <button
-                                                    type="button"
-                                                    onClick={() => handleRemoveSymbol(idx)}
-                                                    className="tag-remove"
-                                                >
-                                                    ×
-                                                </button>
-                                            </span>
-                                        ))}
-                                    </div>
-                                )}
-                            </div>
-
-                            <div className="form-group">
-                                <label>Split Date (DD-MM-YYYY)</label>
-                                <input
-                                    type="date"
-                                    value={newSplit.split_date}
-                                    onChange={(e) => {
-                                        const date = new Date(e.target.value);
-                                        const formatted = `${String(date.getDate()).padStart(2, '0')}-${String(date.getMonth() + 1).padStart(2, '0')}-${date.getFullYear()}`;
-                                        setNewSplit({ ...newSplit, split_date: formatted });
-                                    }}
-                                    className="form-input"
-                                />
-                            </div>
-
-                            <button
-                                className="btn btn-primary"
-                                onClick={handleAddSplit}
-                            >
-                                ➕ Add Split
-                            </button>
-                        </div>
-
-                        {corporateActions.splits.length > 0 && (
-                            <div className="actions-list">
-                                <h3>Configured Splits</h3>
-                                {corporateActions.splits.map((split, index) => (
-                                    <div key={index} className="action-item">
-                                        <div className="action-details">
-                                            <span className="action-badge">Split</span>
-                                            <strong>{split.old_symbol}</strong>
-                                            <span className="arrow">→</span>
-                                            <span className="new-symbols">{split.new_symbols.join(', ')}</span>
-                                            <span className="action-date">on {split.split_date}</span>
-                                        </div>
-                                        <button
-                                            className="btn btn-small btn-danger"
-                                            onClick={() => handleRemoveSplit(index)}
-                                        >
-                                            🗑️ Remove
-                                        </button>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-                    </section>
-                )}
-
                 {activeTab === 'preview' && (
                     <section className="section">
                         <h2>Step 3: Preview Results</h2>
@@ -686,10 +527,11 @@ function App() {
                                                 <tr key={rowIdx}>
                                                     {row.map((cell, colIdx) => (
                                                         <td key={colIdx}>
-                                                            {typeof cell === 'number' ? cell.toLocaleString('en-IN', {
-                                                                minimumFractionDigits: 2,
-                                                                maximumFractionDigits: 2
-                                                            }) : cell}
+                                                            {cell === null || cell === undefined ? '' :
+                                                                typeof cell === 'number' ? cell.toLocaleString('en-IN', {
+                                                                    minimumFractionDigits: 2,
+                                                                    maximumFractionDigits: 2
+                                                                }) : cell}
                                                         </td>
                                                     ))}
                                                 </tr>
