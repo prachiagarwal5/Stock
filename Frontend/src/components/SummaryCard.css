@@ -1,0 +1,105 @@
+.summary-card {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-lg);
+    padding: var(--spacing-xl);
+    border-radius: var(--radius-xl);
+    box-shadow: var(--shadow-md);
+    transition: all var(--transition-base);
+    position: relative;
+    overflow: hidden;
+}
+
+.summary-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: linear-gradient(135deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0) 100%);
+    pointer-events: none;
+}
+
+.summary-card:hover {
+    transform: translateY(-4px);
+    box-shadow: var(--shadow-xl);
+}
+
+.summary-card-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 64px;
+    height: 64px;
+    border-radius: var(--radius-lg);
+    background: rgba(255, 255, 255, 0.2);
+    backdrop-filter: blur(10px);
+    font-size: 2rem;
+    flex-shrink: 0;
+}
+
+.summary-card-content {
+    flex: 1;
+    position: relative;
+    z-index: 1;
+}
+
+.summary-card-label {
+    font-size: 0.875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    opacity: 0.9;
+    margin-bottom: var(--spacing-xs);
+}
+
+.summary-card-value {
+    font-size: 2rem;
+    font-weight: 800;
+    line-height: 1;
+}
+
+/* Variants */
+.summary-card-primary {
+    background: var(--gradient-primary);
+    color: var(--color-text-white);
+}
+
+.summary-card-success {
+    background: var(--gradient-success);
+    color: var(--color-text-white);
+}
+
+.summary-card-dark {
+    background: var(--gradient-dark);
+    color: var(--color-text-white);
+}
+
+.summary-card-light {
+    background: var(--color-bg-secondary);
+    color: var(--color-text-primary);
+    border: 2px solid var(--color-border);
+}
+
+.summary-card-light .summary-card-icon {
+    background: var(--gradient-light);
+    color: var(--color-primary);
+}
+
+/* Responsive */
+@media (max-width: 640px) {
+    .summary-card {
+        padding: var(--spacing-lg);
+    }
+
+    .summary-card-icon {
+        width: 48px;
+        height: 48px;
+        font-size: 1.5rem;
+    }
+
+    .summary-card-value {
+        font-size: 1.5rem;
+    }
+}

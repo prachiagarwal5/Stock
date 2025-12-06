@@ -15,6 +15,10 @@ import shutil
 from pathlib import Path
 import numpy as np
 from dotenv import load_dotenv
+import requests
+import zipfile
+from io import BytesIO
+from dateutil import parser as date_parser
 
 # Load environment variables from .env file
 load_dotenv()
@@ -275,16 +279,21 @@ def consolidate():
             output_path = os.path.join(request_folder, 'Finished_Product.xlsx')
             consolidator.format_excel_output(output_path)
             
-            # Send file to client
+            # Read file into memory before cleanup to avoid file locking issues
+            with open(output_path, 'rb') as f:
+                excel_data = BytesIO(f.read())
+            excel_data.seek(0)
+            
+            # Send file to client from memory
             return send_file(
-                output_path,
+                excel_data,
                 mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                 as_attachment=True,
                 download_name='Finished_Product.xlsx'
             )
         
         finally:
-            # Cleanup
+            # Cleanup - now safe because file is in memory
             if os.path.exists(request_folder):
                 shutil.rmtree(request_folder)
     

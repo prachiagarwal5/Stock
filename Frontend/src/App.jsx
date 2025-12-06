@@ -1,19 +1,21 @@
 import React, { useState } from 'react';
+import Header from './components/Header';
+import FileUpload from './components/FileUpload';
+import PreviewSection from './components/PreviewSection';
+import Alert from './components/Alert';
+import { API_URL, ENDPOINTS } from './utils/constants';
 import './App.css';
-
-// Get API URL from environment variables or use default
-const API_URL = import.meta.env.VITE_API_URL;
 
 function App() {
     const [uploadedFiles, setUploadedFiles] = useState([]);
-    const [loading, setLoading] = useState(false);
+    const [previewLoading, setPreviewLoading] = useState(false);
+    const [downloadLoading, setDownloadLoading] = useState(false);
     const [preview, setPreview] = useState(null);
     const [error, setError] = useState(null);
     const [success, setSuccess] = useState(null);
     const [activeTab, setActiveTab] = useState('upload');
 
-    const handleFileChange = (e) => {
-        const files = Array.from(e.target.files);
+    const handleFileChange = (files) => {
         setUploadedFiles(files);
         setError(null);
         setSuccess(null);
@@ -25,16 +27,16 @@ function App() {
             return;
         }
 
-        setLoading(true);
+        setPreviewLoading(true);
         setError(null);
 
         const formData = new FormData();
-        uploadedFiles.forEach(file => formData.append('files', file));
+        uploadedFiles.forEach((file) => formData.append('files', file));
 
         try {
-            const response = await fetch(`${API_URL}/api/preview`, {
+            const response = await fetch(`${API_URL}${ENDPOINTS.PREVIEW}`, {
                 method: 'POST',
-                body: formData
+                body: formData,
             });
 
             if (!response.ok) {
@@ -44,12 +46,13 @@ function App() {
 
             const data = await response.json();
             setPreview(data);
-            setSuccess('Preview loaded successfully');
+            setSuccess('Preview loaded successfully! Switch to Preview tab to view results.');
+            setActiveTab('preview');
         } catch (err) {
             setError(err.message);
             setPreview(null);
         } finally {
-            setLoading(false);
+            setPreviewLoading(false);
         }
     };
 
@@ -59,16 +62,16 @@ function App() {
             return;
         }
 
-        setLoading(true);
+        setDownloadLoading(true);
         setError(null);
 
         const formData = new FormData();
-        uploadedFiles.forEach(file => formData.append('files', file));
+        uploadedFiles.forEach((file) => formData.append('files', file));
 
         try {
-            const response = await fetch(`${API_URL}/api/consolidate`, {
+            const response = await fetch(`${API_URL}${ENDPOINTS.CONSOLIDATE}`, {
                 method: 'POST',
-                body: formData
+                body: formData,
             });
 
             if (!response.ok) {
@@ -87,171 +90,72 @@ function App() {
             window.URL.revokeObjectURL(url);
             document.body.removeChild(link);
 
-            setSuccess('Excel file downloaded successfully!');
+            setSuccess('Excel file downloaded successfully! Check your downloads folder.');
         } catch (err) {
             setError(err.message);
         } finally {
-            setLoading(false);
+            setDownloadLoading(false);
         }
     };
 
     return (
         <div className="app">
-            <header className="header">
-                <h1>📊 Market Cap Consolidation Tool</h1>
-                <p>Upload CSV files and consolidate market cap data into a professional Excel file</p>
-            </header>
+            <Header />
 
             <main className="main-content">
+                {/* Tabs */}
                 <div className="tabs">
                     <button
-                        className={`tab-btn ${activeTab === 'upload' ? 'active' : ''}`}
+                        className={`tab-button ${activeTab === 'upload' ? 'active' : ''}`}
                         onClick={() => setActiveTab('upload')}
                     >
-                        📤 Upload & Process
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                            <polyline points="17 8 12 3 7 8"></polyline>
+                            <line x1="12" y1="3" x2="12" y2="15"></line>
+                        </svg>
+                        Upload & Process
                     </button>
                     <button
-                        className={`tab-btn ${activeTab === 'preview' ? 'active' : ''}`}
+                        className={`tab-button ${activeTab === 'preview' ? 'active' : ''}`}
                         onClick={() => setActiveTab('preview')}
                     >
-                        👁️ Preview
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                            <circle cx="12" cy="12" r="3"></circle>
+                        </svg>
+                        Preview Results
                     </button>
                 </div>
 
-                {error && <div className="alert alert-error">{error}</div>}
-                {success && <div className="alert alert-success">{success}</div>}
+                {/* Alerts */}
+                {error && <Alert type="error" message={error} onClose={() => setError(null)} />}
+                {success && <Alert type="success" message={success} onClose={() => setSuccess(null)} />}
 
+                {/* Tab Content */}
                 {activeTab === 'upload' && (
-                    <section className="section">
-                        <h2>Step 1: Upload CSV Files</h2>
-                        <div className="upload-area">
-                            <input
-                                type="file"
-                                id="file-input"
-                                multiple
-                                accept=".csv"
-                                onChange={handleFileChange}
-                                className="file-input"
-                            />
-                            <label htmlFor="file-input" className="upload-label">
-                                <span className="upload-icon">📁</span>
-                                <span>Drag and drop CSV files or click to select</span>
-                                <span className="upload-hint">Supported: .csv files | Format: mcapDDMMYYYY.csv</span>
-                            </label>
-                        </div>
-
-                        {uploadedFiles.length > 0 && (
-                            <div className="file-list">
-                                <h3>Uploaded Files ({uploadedFiles.length})</h3>
-                                <ul>
-                                    {uploadedFiles.map((file, index) => (
-                                        <li key={index}>
-                                            <span className="file-icon">📄</span>
-                                            <span className="file-name">{file.name}</span>
-                                            <span className="file-size">({(file.size / 1024).toFixed(2)} KB)</span>
-                                        </li>
-                                    ))}
-                                </ul>
-                            </div>
-                        )}
-
-                        <div className="action-buttons">
-                            <button
-                                className="btn btn-primary"
-                                onClick={handlePreview}
-                                disabled={uploadedFiles.length === 0 || loading}
-                            >
-                                {loading ? '⏳ Processing...' : '👁️ Preview Data'}
-                            </button>
-                            <button
-                                className="btn btn-success"
-                                onClick={handleDownload}
-                                disabled={uploadedFiles.length === 0 || loading}
-                            >
-                                {loading ? '⏳ Processing...' : '⬇️ Download Excel'}
-                            </button>
-                        </div>
-                    </section>
+                    <FileUpload
+                        files={uploadedFiles}
+                        onFileChange={handleFileChange}
+                        onPreview={handlePreview}
+                        onDownload={handleDownload}
+                        previewLoading={previewLoading}
+                        downloadLoading={downloadLoading}
+                    />
                 )}
 
-                {activeTab === 'preview' && (
-                    <section className="section">
-                        <h2>Step 3: Preview Results</h2>
-                        {preview ? (
-                            <div className="preview-container">
-                                <div className="summary-cards">
-                                    <div className="summary-card">
-                                        <span className="summary-icon">🏢</span>
-                                        <div>
-                                            <div className="summary-label">Total Companies</div>
-                                            <div className="summary-value">{preview.summary.total_companies}</div>
-                                        </div>
-                                    </div>
-                                    <div className="summary-card">
-                                        <span className="summary-icon">📅</span>
-                                        <div>
-                                            <div className="summary-label">Total Dates</div>
-                                            <div className="summary-value">{preview.summary.total_dates}</div>
-                                        </div>
-                                    </div>
-                                    <div className="summary-card">
-                                        <span className="summary-icon">📤</span>
-                                        <div>
-                                            <div className="summary-label">Uploaded Files</div>
-                                            <div className="summary-value">{preview.summary.uploaded_files}</div>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div className="dates-list">
-                                    <h4>📊 Dates Included:</h4>
-                                    <div className="dates-tags">
-                                        {preview.summary.dates.map((date, idx) => (
-                                            <span key={idx} className="date-tag">{date}</span>
-                                        ))}
-                                    </div>
-                                </div>
-
-                                <div className="preview-table">
-                                    <h4>Sample Data (First 10 Companies)</h4>
-                                    <table>
-                                        <thead>
-                                            <tr>
-                                                {preview.preview.columns.map((col, idx) => (
-                                                    <th key={idx}>{col}</th>
-                                                ))}
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {preview.preview.data.map((row, rowIdx) => (
-                                                <tr key={rowIdx}>
-                                                    {row.map((cell, colIdx) => (
-                                                        <td key={colIdx}>
-                                                            {cell === null || cell === undefined ? '' :
-                                                                typeof cell === 'number' ? cell.toLocaleString('en-IN', {
-                                                                    minimumFractionDigits: 2,
-                                                                    maximumFractionDigits: 2
-                                                                }) : cell}
-                                                        </td>
-                                                    ))}
-                                                </tr>
-                                            ))}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-                        ) : (
-                            <div className="no-preview">
-                                <span>👁️</span>
-                                <p>No preview available yet. Upload files and click "Preview Data" to see results.</p>
-                            </div>
-                        )}
-                    </section>
-                )}
+                {activeTab === 'preview' && <PreviewSection preview={preview} />}
             </main>
 
             <footer className="footer">
-                <p>💼 Market Cap Consolidation Tool | Powered by React & Flask</p>
+                <div className="footer-content">
+                    <p>
+                        💼 Market Cap Consolidation Tool
+                        <span className="footer-separator">|</span>
+                        Powered by React & Flask
+                    </p>
+                    <p className="footer-copyright">© 2025 All rights reserved</p>
+                </div>
             </footer>
         </div>
     );
