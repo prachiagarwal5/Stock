@@ -15,10 +15,14 @@ function App() {
     const [rangeEndDate, setRangeEndDate] = useState('');
     const [rangeLoading, setRangeLoading] = useState(false);
     const [rangeProgress, setRangeProgress] = useState(null);
+    const [downloadDestination, setDownloadDestination] = useState('local');
+    const [googleDriveStatus, setGoogleDriveStatus] = useState(null);
+    const [googleDriveFiles, setGoogleDriveFiles] = useState([]);
 
-    // Fetch available NSE dates on component mount
+    // Fetch available NSE dates and Google Drive status on component mount
     React.useEffect(() => {
         fetchAvailableDates();
+        checkGoogleDriveStatus();
     }, []);
 
     const fetchAvailableDates = async () => {
@@ -37,6 +41,33 @@ function App() {
             }
         } catch (err) {
             console.error('Error fetching NSE dates:', err);
+        }
+    };
+
+    const checkGoogleDriveStatus = async () => {
+        try {
+            const response = await fetch('http://localhost:5000/api/google-drive-status');
+            if (response.ok) {
+                const data = await response.json();
+                setGoogleDriveStatus(data);
+                if (data.authenticated) {
+                    fetchGoogleDriveFiles();
+                }
+            }
+        } catch (err) {
+            console.error('Error checking Google Drive status:', err);
+        }
+    };
+
+    const fetchGoogleDriveFiles = async () => {
+        try {
+            const response = await fetch('http://localhost:5000/api/google-drive-files');
+            if (response.ok) {
+                const data = await response.json();
+                setGoogleDriveFiles(data.files || []);
+            }
+        } catch (err) {
+            console.error('Error fetching Google Drive files:', err);
         }
     };
 
@@ -198,6 +229,7 @@ function App() {
 
         const formData = new FormData();
         uploadedFiles.forEach(file => formData.append('files', file));
+        formData.append('download_destination', downloadDestination);
 
         try {
             const response = await fetch('http://localhost:5000/api/consolidate', {
@@ -210,18 +242,25 @@ function App() {
                 throw new Error(errorData.error || 'Download failed');
             }
 
-            // Create blob from response
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = 'Finished_Product.xlsx';
-            document.body.appendChild(link);
-            link.click();
-            window.URL.revokeObjectURL(url);
-            document.body.removeChild(link);
+            if (downloadDestination === 'google_drive') {
+                // Google Drive upload - response is JSON
+                const data = await response.json();
+                setSuccess(`✅ File uploaded to Google Drive!\n📎 ${data.file_name}\n🔗 ${data.web_link}`);
+                fetchGoogleDriveFiles(); // Refresh file list
+            } else {
+                // Local download - response is binary file
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = 'Finished_Product.xlsx';
+                document.body.appendChild(link);
+                link.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(link);
 
-            setSuccess('Excel file downloaded successfully!');
+                setSuccess('Excel file downloaded successfully!');
+            }
         } catch (err) {
             setError(err.message);
         } finally {
@@ -464,6 +503,53 @@ function App() {
                             </div>
                         )}
 
+                        <div className="download-options">
+                            <h3>📥 Download Destination</h3>
+                            <div className="destination-buttons">
+                                <button
+                                    className={`destination-btn ${downloadDestination === 'local' ? 'active' : ''}`}
+                                    onClick={() => setDownloadDestination('local')}
+                                >
+                                    💻 Download Locally
+                                </button>
+                                <button
+                                    className={`destination-btn ${downloadDestination === 'google_drive' ? 'active' : ''} ${!googleDriveStatus?.authenticated ? 'disabled' : ''}`}
+                                    onClick={() => {
+                                        if (googleDriveStatus?.authenticated) {
+                                            setDownloadDestination('google_drive');
+                                        } else {
+                                            setError('Google Drive is not configured. Please add credentials.json');
+                                        }
+                                    }}
+                                    disabled={!googleDriveStatus?.authenticated}
+                                    title={googleDriveStatus?.authenticated ? 'Save to Google Drive' : 'Google Drive not configured'}
+                                >
+                                    ☁️ Save to Google Drive
+                                </button>
+                            </div>
+                            {googleDriveStatus?.authenticated && (
+                                <div className="google-drive-info">
+                                    <p>✅ <strong>Google Drive Connected</strong></p>
+                                    <p>Files will be saved in the <strong>Automation</strong> folder</p>
+                                    {googleDriveFiles.length > 0 && (
+                                        <details>
+                                            <summary>📁 View saved files ({googleDriveFiles.length})</summary>
+                                            <ul className="drive-files-list">
+                                                {googleDriveFiles.map((file, idx) => (
+                                                    <li key={idx}>
+                                                        📄 {file.name}
+                                                        <a href={file.webViewLink} target="_blank" rel="noopener noreferrer" className="drive-link">
+                                                            View
+                                                        </a>
+                                                    </li>
+                                                ))}
+                                            </ul>
+                                        </details>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+
                         <div className="action-buttons">
                             <button
                                 className="btn btn-primary"
@@ -477,7 +563,7 @@ function App() {
                                 onClick={handleDownload}
                                 disabled={uploadedFiles.length === 0 || loading}
                             >
-                                {loading ? '⏳ Processing...' : '⬇️ Download Excel'}
+                                {loading ? '⏳ Processing...' : downloadDestination === 'local' ? '⬇️ Download Excel' : '☁️ Upload to Drive'}
                             </button>
                         </div>
                     </section>

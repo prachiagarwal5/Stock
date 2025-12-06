@@ -22,6 +22,7 @@ from pymongo import MongoClient
 from bson.binary import Binary
 import dotenv
 import base64
+from google_drive_service import GoogleDriveService
 
 app = Flask(__name__)
 CORS(app)
@@ -40,6 +41,23 @@ except Exception as e:
     print(f"⚠️ MongoDB connection failed: {e}")
     db = None
     excel_results_collection = None
+
+# Initialize Google Drive Service
+google_drive_service = None
+try:
+    credentials_path = os.getenv('GOOGLE_CREDENTIALS_PATH', 'credentials.json')
+    if os.path.exists(credentials_path):
+        google_drive_service = GoogleDriveService(credentials_path)
+        # Try to authenticate immediately
+        if google_drive_service.authenticate():
+            print("✅ Google Drive service initialized successfully")
+        else:
+            print("⚠️ Google Drive authentication will be attempted on first use")
+    else:
+        print(f"⚠️ Google credentials not found at {credentials_path}")
+        print("   Google Drive features will be unavailable until credentials.json is added")
+except Exception as e:
+    print(f"⚠️ Google Drive initialization warning: {e}")
 
 # Custom JSON encoder to handle NaN and Inf values
 class NumpyEncoder(json.JSONEncoder):
@@ -274,77 +292,6 @@ def save_excel_to_database(excel_path, filename, metadata):
     except Exception as e:
         print(f"⚠️ Error saving Excel to database: {e}")
         return None
-
-@app.route('/api/consolidate', methods=['POST'])
-def consolidate():
-    """
-    Main endpoint for consolidating market cap data
-    
-    Expected form data:
-    - files: Multiple CSV files
-    - corporate_actions: JSON string with corporate actions config (optional)
-    """
-    try:
-        # Check if files were uploaded
-        if 'files' not in request.files:
-            return jsonify({'error': 'No files uploaded'}), 400
-        
-        files = request.files.getlist('files')
-        
-        if not files or len(files) == 0:
-            return jsonify({'error': 'No files selected'}), 400
-        
-        # Create temporary directory for this request
-        request_folder = tempfile.mkdtemp()
-        
-        try:
-            # Save uploaded files
-            file_count = 0
-            for file in files:
-                if file and allowed_file(file.filename):
-                    filename = secure_filename(file.filename)
-                    filepath = os.path.join(request_folder, filename)
-                    file.save(filepath)
-                    file_count += 1
-            
-            if file_count == 0:
-                return jsonify({'error': 'No valid CSV files uploaded'}), 400
-            
-            # Consolidate data
-            consolidator = MarketCapConsolidator(request_folder)
-            companies_count, dates_count = consolidator.load_and_consolidate_data()
-            
-            # Create output file
-            output_path = os.path.join(request_folder, 'Finished_Product.xlsx')
-            consolidator.format_excel_output(output_path)
-            
-            # Prepare metadata for database
-            metadata = {
-                'companies_count': companies_count,
-                'dates_count': dates_count,
-                'dates': [d[0] for d in consolidator.dates_list],
-                'files_consolidated': file_count,
-                'consolidated_at': datetime.now().isoformat()
-            }
-            
-            # Save Excel to MongoDB before sending
-            db_id = save_excel_to_database(output_path, 'Finished_Product.xlsx', metadata)
-            
-            # Send file to client
-            return send_file(
-                output_path,
-                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                as_attachment=True,
-                download_name='Finished_Product.xlsx'
-            )
-        
-        finally:
-            # Cleanup
-            if os.path.exists(request_folder):
-                shutil.rmtree(request_folder)
-    
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/preview', methods=['POST'])
 def preview():
@@ -871,6 +818,224 @@ def get_excel_info(file_id):
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+# ==================== GOOGLE DRIVE ENDPOINTS ====================
+
+@app.route('/api/google-drive-auth', methods=['POST'])
+def google_drive_auth():
+    """
+    Authenticate with Google Drive
+    Returns authentication status and available actions
+    """
+    try:
+        global google_drive_service
+        
+        if google_drive_service is None:
+            credentials_path = os.getenv('GOOGLE_CREDENTIALS_PATH', 'credentials.json')
+            if not os.path.exists(credentials_path):
+                return jsonify({
+                    'authenticated': False,
+                    'error': 'Google credentials not found',
+                    'message': 'Please upload credentials.json to enable Google Drive integration'
+                }), 400
+            
+            google_drive_service = GoogleDriveService(credentials_path)
+        
+        if google_drive_service.authenticate():
+            return jsonify({
+                'authenticated': True,
+                'message': 'Successfully authenticated with Google Drive',
+                'automation_folder_id': google_drive_service.get_or_create_automation_folder()
+            }), 200
+        else:
+            return jsonify({
+                'authenticated': False,
+                'error': 'Authentication failed'
+            }), 400
+    
+    except Exception as e:
+        return jsonify({
+            'authenticated': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/consolidate', methods=['POST'])
+def consolidate():
+    """
+    Enhanced consolidate endpoint with download destination option
+    
+    Expected form data:
+    - files: Multiple CSV files
+    - download_destination: 'local' or 'google_drive'
+    - corporate_actions: JSON string with corporate actions config (optional)
+    """
+    global google_drive_service
+    
+    try:
+        # Check if files were uploaded
+        if 'files' not in request.files:
+            return jsonify({'error': 'No files uploaded'}), 400
+        
+        files = request.files.getlist('files')
+        download_destination = request.form.get('download_destination', 'local')
+        
+        if not files or len(files) == 0:
+            return jsonify({'error': 'No files selected'}), 400
+        
+        # Validate download destination
+        if download_destination not in ['local', 'google_drive']:
+            return jsonify({'error': 'Invalid download destination. Use "local" or "google_drive"'}), 400
+        
+        # Create temporary directory for this request
+        request_folder = tempfile.mkdtemp()
+        
+        try:
+            # Save uploaded files
+            file_count = 0
+            for file in files:
+                if file and allowed_file(file.filename):
+                    filename = secure_filename(file.filename)
+                    filepath = os.path.join(request_folder, filename)
+                    file.save(filepath)
+                    file_count += 1
+            
+            if file_count == 0:
+                return jsonify({'error': 'No valid CSV files uploaded'}), 400
+            
+            # Consolidate data
+            consolidator = MarketCapConsolidator(request_folder)
+            companies_count, dates_count = consolidator.load_and_consolidate_data()
+            
+            # Create output file
+            output_path = os.path.join(request_folder, 'Finished_Product.xlsx')
+            consolidator.format_excel_output(output_path)
+            
+            # Prepare metadata
+            metadata = {
+                'companies_count': companies_count,
+                'dates_count': dates_count,
+                'dates': [d[0] for d in consolidator.dates_list],
+                'files_consolidated': file_count,
+                'consolidated_at': datetime.now().isoformat()
+            }
+            
+            # Handle different download destinations
+            if download_destination == 'google_drive':
+                # Upload to Google Drive
+                if google_drive_service is None or not google_drive_service.is_authenticated():
+                    # Try to authenticate
+                    credentials_path = os.getenv('GOOGLE_CREDENTIALS_PATH', 'credentials.json')
+                    if not os.path.exists(credentials_path):
+                        return jsonify({
+                            'error': 'Google Drive not configured',
+                            'message': 'Please add credentials.json to enable Google Drive uploads'
+                        }), 400
+                    
+                    google_drive_service = GoogleDriveService(credentials_path)
+                    if not google_drive_service.authenticate():
+                        return jsonify({
+                            'error': 'Google Drive authentication failed'
+                        }), 400
+                
+                # Upload file to Google Drive
+                upload_result = google_drive_service.upload_file(
+                    output_path,
+                    'Finished_Product.xlsx'
+                )
+                
+                if upload_result is None:
+                    return jsonify({
+                        'error': 'Failed to upload to Google Drive'
+                    }), 500
+                
+                # Save metadata to database if available
+                if excel_results_collection is not None:
+                    db_id = save_excel_to_database(output_path, 'Finished_Product.xlsx', metadata)
+                
+                return jsonify({
+                    'success': True,
+                    'destination': 'google_drive',
+                    'message': 'File uploaded to Google Drive successfully',
+                    'file_name': upload_result['file_name'],
+                    'file_id': upload_result['file_id'],
+                    'web_link': upload_result['web_link'],
+                    'metadata': metadata
+                }), 200
+            
+            else:  # local download
+                # Save Excel to MongoDB before sending
+                db_id = save_excel_to_database(output_path, 'Finished_Product.xlsx', metadata)
+                
+                # Send file to client
+                return send_file(
+                    output_path,
+                    mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    as_attachment=True,
+                    download_name='Finished_Product.xlsx'
+                )
+        
+        finally:
+            # Cleanup
+            if os.path.exists(request_folder):
+                shutil.rmtree(request_folder)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/google-drive-files', methods=['GET'])
+def get_google_drive_files():
+    """
+    List all files in Google Drive Automation folder
+    """
+    try:
+        if google_drive_service is None or not google_drive_service.is_authenticated():
+            return jsonify({
+                'error': 'Google Drive not authenticated',
+                'files': []
+            }), 400
+        
+        files = google_drive_service.list_files_in_automation_folder()
+        
+        return jsonify({
+            'success': True,
+            'count': len(files),
+            'files': files
+        }), 200
+    
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'files': []
+        }), 500
+
+@app.route('/api/google-drive-status', methods=['GET'])
+def google_drive_status():
+    """
+    Check Google Drive integration status
+    """
+    try:
+        is_authenticated = (
+            google_drive_service is not None and 
+            google_drive_service.is_authenticated()
+        )
+        
+        if is_authenticated:
+            automation_folder = google_drive_service.get_or_create_automation_folder()
+        else:
+            automation_folder = None
+        
+        return jsonify({
+            'authenticated': is_authenticated,
+            'service_initialized': google_drive_service is not None,
+            'automation_folder_id': automation_folder,
+            'credentials_file': 'credentials.json' if os.path.exists('credentials.json') else None
+        }), 200
+    
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'authenticated': False
+        }), 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
