@@ -97,6 +97,28 @@
     display: flex;
     flex-direction: column;
     gap: var(--spacing-sm);
+    max-height: 240px;
+    overflow-y: auto;
+    padding-right: var(--spacing-xs);
+}
+
+/* Custom scrollbar for file list */
+.file-items::-webkit-scrollbar {
+    width: 6px;
+}
+
+.file-items::-webkit-scrollbar-track {
+    background: var(--color-bg-primary);
+    border-radius: var(--radius-full);
+}
+
+.file-items::-webkit-scrollbar-thumb {
+    background: var(--color-primary);
+    border-radius: var(--radius-full);
+}
+
+.file-items::-webkit-scrollbar-thumb:hover {
+    background: var(--color-primary-dark);
 }
 
 .file-item {

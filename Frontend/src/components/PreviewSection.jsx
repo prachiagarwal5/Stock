@@ -212,7 +212,7 @@ const PreviewSection = ({ preview }) => {
             {/* Preview Table */}
             <div className="preview-table-container">
                 <div className="table-header">
-                    <h3 className="table-title">📈 Detailed Data View</h3>
+                    <h3 className="table-title">📈 Complete Data View ({filteredData.length} Companies)</h3>
                     <div className="table-info">
                         <span className="info-badge">
                             💡 Click column headers to sort

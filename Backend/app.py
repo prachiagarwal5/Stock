@@ -334,7 +334,7 @@ def preview():
             companies_count, dates_count = consolidator.load_and_consolidate_data()
             
             # Get preview data (first 10 rows)
-            preview_df = consolidator.df_consolidated.iloc[:10]
+            preview_df = consolidator.df_consolidated
             
             # Convert all NaN/inf to None recursively
             preview_data = convert_nan_to_none(preview_df.values.tolist())
