@@ -13,33 +13,14 @@ from werkzeug.utils import secure_filename
 import tempfile
 import shutil
 from pathlib import Path
-import requests
-from io import BytesIO
-import zipfile
-from dateutil import parser as date_parser
 import numpy as np
-from pymongo import MongoClient
-from bson.binary import Binary
-import dotenv
-import base64
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
-
-# Load environment variables
-dotenv.load_dotenv()
-
-# MongoDB connection
-try:
-    mongo_uri = os.getenv('mongo_URI', 'mongodb://localhost:27017/Stocks')
-    mongo_client = MongoClient(mongo_uri)
-    db = mongo_client['Stocks']
-    excel_results_collection = db['excel_results']
-    print("✅ MongoDB connected successfully")
-except Exception as e:
-    print(f"⚠️ MongoDB connection failed: {e}")
-    db = None
-    excel_results_collection = None
 
 # Custom JSON encoder to handle NaN and Inf values
 class NumpyEncoder(json.JSONEncoder):
@@ -70,10 +51,14 @@ def convert_nan_to_none(obj):
         return obj.where(pd.notna(obj), None).values.tolist()
     return obj
 
-# Configuration
-UPLOAD_FOLDER = tempfile.mkdtemp()
+# Configuration from environment variables
+UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', tempfile.mkdtemp())
 ALLOWED_EXTENSIONS = {'csv'}
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', 50 * 1024 * 1024))  # 50MB default
+FLASK_ENV = os.getenv('FLASK_ENV', 'development')
+FLASK_DEBUG = os.getenv('FLASK_DEBUG', 'True').lower() == 'true'
+FLASK_PORT = int(os.getenv('FLASK_PORT', 5000))
+FLASK_HOST = os.getenv('FLASK_HOST', '127.0.0.1')
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
@@ -247,34 +232,6 @@ def health():
         'message': 'Market Cap Consolidation Service is running'
     }), 200
 
-def save_excel_to_database(excel_path, filename, metadata):
-    """Save Excel file to MongoDB"""
-    if excel_results_collection is None:
-        return None
-    
-    try:
-        # Read Excel file as binary
-        with open(excel_path, 'rb') as f:
-            excel_binary = Binary(f.read())
-        
-        # Create document for MongoDB
-        document = {
-            'filename': filename,
-            'file_data': excel_binary,
-            'file_size': os.path.getsize(excel_path),
-            'created_at': datetime.now(),
-            'metadata': metadata,
-            'file_type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        }
-        
-        # Insert into database
-        result = excel_results_collection.insert_one(document)
-        print(f"✅ Excel file saved to MongoDB with ID: {result.inserted_id}")
-        return result.inserted_id
-    except Exception as e:
-        print(f"⚠️ Error saving Excel to database: {e}")
-        return None
-
 @app.route('/api/consolidate', methods=['POST'])
 def consolidate():
     """
@@ -317,18 +274,6 @@ def consolidate():
             # Create output file
             output_path = os.path.join(request_folder, 'Finished_Product.xlsx')
             consolidator.format_excel_output(output_path)
-            
-            # Prepare metadata for database
-            metadata = {
-                'companies_count': companies_count,
-                'dates_count': dates_count,
-                'dates': [d[0] for d in consolidator.dates_list],
-                'files_consolidated': file_count,
-                'consolidated_at': datetime.now().isoformat()
-            }
-            
-            # Save Excel to MongoDB before sending
-            db_id = save_excel_to_database(output_path, 'Finished_Product.xlsx', metadata)
             
             # Send file to client
             return send_file(
@@ -766,111 +711,10 @@ def download_nse_range():
         print(f"Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/excel-results', methods=['GET'])
-def get_excel_results():
-    """Get list of all Excel files stored in database"""
-    if excel_results_collection is None:
-        return jsonify({'error': 'Database not connected'}), 500
-    
-    try:
-        results = list(excel_results_collection.find({}, {
-            'file_data': 0,  # Exclude binary data from list
-            'file_type': 1,
-            'filename': 1,
-            'file_size': 1,
-            'created_at': 1,
-            '_id': 1,
-            'metadata': 1
-        }).sort('created_at', -1))
-        
-        # Convert ObjectId to string and datetime to ISO format
-        for result in results:
-            result['_id'] = str(result['_id'])
-            if 'created_at' in result:
-                result['created_at'] = result['created_at'].isoformat()
-        
-        return jsonify({
-            'success': True,
-            'count': len(results),
-            'results': results
-        }), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/excel-results/<file_id>', methods=['GET'])
-def download_excel_result(file_id):
-    """Download Excel file from database"""
-    if excel_results_collection is None:
-        return jsonify({'error': 'Database not connected'}), 500
-    
-    try:
-        from bson.objectid import ObjectId
-        
-        # Find file in database
-        doc = excel_results_collection.find_one({'_id': ObjectId(file_id)})
-        
-        if not doc:
-            return jsonify({'error': 'File not found'}), 404
-        
-        # Return binary file data
-        return send_file(
-            BytesIO(doc['file_data']),
-            mimetype=doc.get('file_type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
-            as_attachment=True,
-            download_name=doc.get('filename', 'download.xlsx')
-        )
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/excel-results/<file_id>', methods=['DELETE'])
-def delete_excel_result(file_id):
-    """Delete Excel file from database"""
-    if excel_results_collection is None:
-        return jsonify({'error': 'Database not connected'}), 500
-    
-    try:
-        from bson.objectid import ObjectId
-        
-        # Delete file from database
-        result = excel_results_collection.delete_one({'_id': ObjectId(file_id)})
-        
-        if result.deleted_count == 0:
-            return jsonify({'error': 'File not found'}), 404
-        
-        return jsonify({
-            'success': True,
-            'message': 'File deleted successfully'
-        }), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/excel-results/info/<file_id>', methods=['GET'])
-def get_excel_info(file_id):
-    """Get metadata about stored Excel file"""
-    if excel_results_collection is None:
-        return jsonify({'error': 'Database not connected'}), 500
-    
-    try:
-        from bson.objectid import ObjectId
-        
-        # Find file in database
-        doc = excel_results_collection.find_one({'_id': ObjectId(file_id)}, {
-            'file_data': 0
-        })
-        
-        if not doc:
-            return jsonify({'error': 'File not found'}), 404
-        
-        doc['_id'] = str(doc['_id'])
-        if 'created_at' in doc:
-            doc['created_at'] = doc['created_at'].isoformat()
-        
-        return jsonify({
-            'success': True,
-            'file': doc
-        }), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    print(f"🚀 Starting Market Cap Consolidation Service")
+    print(f"   Environment: {FLASK_ENV}")
+    print(f"   Debug Mode: {FLASK_DEBUG}")
+    print(f"   Host: {FLASK_HOST}:{FLASK_PORT}")
+    print(f"   Upload Folder: {UPLOAD_FOLDER}")
+    app.run(debug=FLASK_DEBUG, host=FLASK_HOST, port=FLASK_PORT)
