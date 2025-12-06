@@ -4,11 +4,11 @@
 
 This is a **complete full-stack web application** for consolidating daily market cap data with automated NSE (National Stock Exchange) integration. The system includes:
 
-- ✅ **React Frontend** - Beautiful, responsive web UI with 5-tab interface
-- ✅ **Flask Backend** - REST API with automatic NSE data scraping
+- ✅ **React Frontend** - Beautiful, responsive web UI with 4-tab interface
+- ✅ **Flask Backend** - REST API with automatic NSE data scraping and MongoDB integration
 - ✅ **Automated NSE Downloads** - Single date or bulk date range downloads
 - ✅ **Professional Excel Export** - Multi-date consolidation with formatting
-- ✅ **Corporate Actions Support** - Stock splits, name changes, delistings
+- ✅ **Database Storage** - All generated Excel files automatically saved to MongoDB
 - ✅ **Real-time Progress Tracking** - Live status updates for bulk operations
 - ✅ **Frozen Panes & Styling** - Professional Excel output
 
@@ -19,14 +19,15 @@ This is a **complete full-stack web application** for consolidating daily market
 ```
 Proj01/
 ├── Backend/
-│   ├── app.py                    # Flask REST API server
+│   ├── app.py                    # Flask REST API server with MongoDB integration
 │   ├── consolidate_marketcap.py  # Data consolidation logic
 │   ├── requirements.txt          # Python dependencies
+│   ├── .env                      # Environment variables (MongoDB URI)
 │   ├── venv/                     # Virtual environment
 │   └── temp/                     # Temporary files (auto-cleaned)
 ├── Frontend/
 │   ├── src/
-│   │   ├── App.jsx              # React main component (5 tabs)
+│   │   ├── App.jsx              # React main component (4 tabs)
 │   │   ├── App.css              # Responsive styling
 │   │   └── main.jsx             # Entry point
 │   ├── package.json             # Node dependencies
@@ -203,9 +204,79 @@ POST /api/preview
 ### 6. Generate Excel
 ```bash
 POST /api/consolidate
-# Request: FormData with CSV files + corporate actions (optional)
-# Response: Excel file download
+# Request: FormData with CSV files
+# Response: Excel file download + automatic save to MongoDB
+# Note: Excel file is automatically stored in database with metadata
 ```
+
+### 7. Get All Stored Excel Files
+```bash
+GET /api/excel-results
+# Response: {"success": true, "count": 5, "results": [{...}, {...}]}
+# Lists all Excel files stored in MongoDB with metadata
+```
+
+### 8. Download Stored Excel File
+```bash
+GET /api/excel-results/<file_id>
+# Params: file_id - MongoDB ObjectId of the file
+# Response: Download Excel file from database
+```
+
+### 9. Get Excel File Info
+```bash
+GET /api/excel-results/info/<file_id>
+# Params: file_id - MongoDB ObjectId
+# Response: File metadata (size, date, companies, dates included, etc.)
+```
+
+### 10. Delete Stored Excel File
+```bash
+DELETE /api/excel-results/<file_id>
+# Params: file_id - MongoDB ObjectId
+# Response: {"success": true, "message": "File deleted successfully"}
+```
+
+---
+
+## 🗄️ Database Setup (MongoDB)
+
+### Prerequisites:
+- MongoDB installed locally or MongoDB Atlas connection string
+
+### Step 1: Update .env File
+Create or update `/Backend/.env`:
+```
+mongo_URI=mongodb://localhost:27017/Stocks
+```
+
+For MongoDB Atlas:
+```
+mongo_URI=mongodb+srv://<username>:<password>@<cluster>.mongodb.net/Stocks?retryWrites=true&w=majority
+```
+
+### Step 2: Database Structure
+The backend automatically creates:
+- **Database:** `Stocks`
+- **Collection:** `excel_results`
+
+Each document stores:
+- `filename` - Excel file name
+- `file_data` - Binary Excel file content
+- `file_size` - File size in bytes
+- `created_at` - Timestamp of creation
+- `metadata` - Object containing:
+  - `companies_count` - Number of companies in consolidation
+  - `dates_count` - Number of dates processed
+  - `dates` - Array of all dates included
+  - `files_consolidated` - Number of CSV files consolidated
+  - `consolidated_at` - ISO timestamp of consolidation
+
+### How It Works:
+1. When you download Excel, it's automatically stored in MongoDB
+2. You can retrieve past Excel files using `/api/excel-results/<file_id>`
+3. Each file is stored with complete metadata for tracking
+4. Files can be deleted from database as needed
 
 ---
 
