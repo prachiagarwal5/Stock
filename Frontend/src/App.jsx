@@ -18,6 +18,11 @@ function App() {
     const [downloadDestination, setDownloadDestination] = useState('local');
     const [googleDriveStatus, setGoogleDriveStatus] = useState(null);
     const [googleDriveFiles, setGoogleDriveFiles] = useState([]);
+    // NEW: Scrape session states
+    const [scrapeSession, setScrapeSession] = useState(null);
+    const [scrapeSessionLoading, setScrapeSessionLoading] = useState(false);
+    const [scrapeSessionPreview, setScrapeSessionPreview] = useState(null);
+    const [scrapeDownloadDestination, setScrapeDownloadDestination] = useState('local');
 
     // Fetch available NSE dates and Google Drive status on component mount
     React.useEffect(() => {
@@ -268,6 +273,264 @@ function App() {
         }
     };
 
+    // NEW: Handlers for scrape session (preview/download options)
+    const handleNSESingleDownloadSession = async () => {
+        if (!nseDate) {
+            setError('Please select a date');
+            return;
+        }
+
+        setScrapeSessionLoading(true);
+        setError(null);
+
+        try {
+            const formattedDate = convertDateFormat(nseDate);
+            const response = await fetch('http://localhost:5000/api/download-nse', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    date: formattedDate,
+                    save_to_file: false  // Temp storage mode
+                })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.error || 'Download failed');
+            }
+
+            const data = await response.json();
+            setScrapeSession({
+                session_id: data.session_id,
+                file: data.file,
+                date: data.date,
+                records_count: data.records_count,
+                type: 'single'
+            });
+            setSuccess(`✅ Downloaded: ${data.file} (${data.records_count} records)`);
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            setScrapeSessionLoading(false);
+        }
+    };
+
+    const handleNSERangeDownloadSession = async () => {
+        if (!rangeStartDate || !rangeEndDate) {
+            setError('Please select both start and end dates');
+            return;
+        }
+
+        if (rangeStartDate > rangeEndDate) {
+            setError('Start date cannot be after end date');
+            return;
+        }
+
+        setScrapeSessionLoading(true);
+        setError(null);
+
+        try {
+            const response = await fetch('http://localhost:5000/api/download-nse-range', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    start_date: convertDateFormat(rangeStartDate),
+                    end_date: convertDateFormat(rangeEndDate),
+                    save_to_file: false  // Temp storage mode
+                })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.error || 'Download failed');
+            }
+
+            const data = await response.json();
+            setScrapeSession({
+                session_id: data.session_id,
+                type: 'range',
+                summary: data.summary,
+                files: data.files,
+                errors: data.errors
+            });
+            setRangeProgress({
+                success: data.summary.successful,
+                failed: data.summary.failed,
+                total: data.summary.total_requested,
+                files: data.files,
+                errors: data.errors
+            });
+            setSuccess(`✅ Downloaded ${data.summary.successful}/${data.summary.total_requested} files`);
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            setScrapeSessionLoading(false);
+        }
+    };
+
+    const handlePreviewScrapeSession = async () => {
+        if (!scrapeSession) {
+            setError('No scrape session active');
+            return;
+        }
+
+        setScrapeSessionLoading(true);
+        setError(null);
+
+        try {
+            const response = await fetch(`http://localhost:5000/api/scrape-session/${scrapeSession.session_id}/preview`);
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.error || 'Preview failed');
+            }
+
+            const data = await response.json();
+            setScrapeSessionPreview(data);
+            setSuccess('✅ Preview loaded');
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            setScrapeSessionLoading(false);
+        }
+    };
+
+    const handleDownloadSingleCSV = async (filename) => {
+        if (!scrapeSession) {
+            setError('No scrape session active');
+            return;
+        }
+
+        try {
+            const response = await fetch(
+                `http://localhost:5000/api/scrape-session/${scrapeSession.session_id}/download-csv?filename=${encodeURIComponent(filename)}`
+            );
+
+            if (!response.ok) {
+                throw new Error('Download failed');
+            }
+
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            window.URL.revokeObjectURL(url);
+            document.body.removeChild(link);
+
+            setSuccess(`✅ Downloaded: ${filename}`);
+        } catch (err) {
+            setError(err.message);
+        }
+    };
+
+    const handleConsolidateScrapeSession = async () => {
+        if (!scrapeSession) {
+            setError('No scrape session active');
+            return;
+        }
+
+        setScrapeSessionLoading(true);
+        setError(null);
+
+        try {
+            const response = await fetch(
+                `http://localhost:5000/api/scrape-session/${scrapeSession.session_id}/consolidate`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        download_destination: scrapeDownloadDestination,
+                        file_type: 'both'  // Request both mcap and pr files
+                    })
+                }
+            );
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.error || 'Consolidation failed');
+            }
+
+            if (scrapeDownloadDestination === 'google_drive') {
+                const data = await response.json();
+                let successMsg = '✅ Files uploaded to Google Drive!\n';
+
+                // Show both file types if available
+                if (data.downloads && Array.isArray(data.downloads)) {
+                    data.downloads.forEach(file => {
+                        const fileType = file.type === 'mcap' ? '📊 Market Cap' : '📈 Net Traded Value';
+                        successMsg += `\n${fileType}: ${file.file_name}\n🔗 ${file.web_link}`;
+                    });
+                } else {
+                    successMsg += `📎 ${data.file_name}\n🔗 ${data.web_link}`;
+                }
+
+                setSuccess(successMsg);
+                fetchGoogleDriveFiles();
+            } else {
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+
+                // Detect if it's a zip or single Excel file
+                const contentType = response.headers.get('content-type');
+                const isZip = contentType && contentType.includes('zip');
+                link.download = isZip ? 'Market_Data.zip' : 'Market_Data.xlsx';
+
+                document.body.appendChild(link);
+                link.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(link);
+
+                setSuccess(isZip ?
+                    '✅ Excel files downloaded successfully (zipped)!' :
+                    '✅ Excel file downloaded successfully!'
+                );
+            }
+
+            // Clear session after successful export
+            setScrapeSession(null);
+            setScrapeSessionPreview(null);
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            setScrapeSessionLoading(false);
+        }
+    };
+
+    const handleCleanupScrapeSession = async () => {
+        if (!scrapeSession) {
+            setError('No scrape session active');
+            return;
+        }
+
+        try {
+            const response = await fetch(
+                `http://localhost:5000/api/scrape-session/${scrapeSession.session_id}/cleanup`,
+                {
+                    method: 'POST'
+                }
+            );
+
+            if (response.ok) {
+                setScrapeSession(null);
+                setScrapeSessionPreview(null);
+                setSuccess('✅ Session cleaned up');
+            }
+        } catch (err) {
+            setError(err.message);
+        }
+    };
+
     return (
         <div className="app">
             <header className="header">
@@ -337,12 +600,83 @@ function App() {
                             </div>
 
                             <button
-                                className="btn btn-primary btn-large"
-                                onClick={handleDownloadFromNSE}
-                                disabled={nseLoading || !nseDate}
+                                className="btn btn-secondary btn-large"
+                                onClick={handleNSESingleDownloadSession}
+                                disabled={scrapeSessionLoading || !nseDate}
+                                title="Download and preview before consolidation - no permanent file storage"
                             >
-                                {nseLoading ? '⏳ Downloading from NSE...' : '🔽 Download & Save CSV'}
+                                {scrapeSessionLoading ? '⏳ Downloading...' : '👁️ Preview & Process'}
                             </button>
+
+                            {scrapeSession && scrapeSession.type === 'single' && (
+                                <div className="scrape-session-panel">
+                                    <h3>📋 Downloaded Data - Ready to Process</h3>
+                                    <div className="session-info">
+                                        <p><strong>File:</strong> {scrapeSession.file}</p>
+                                        <p><strong>Date:</strong> {scrapeSession.date}</p>
+                                        <p><strong>Records:</strong> {scrapeSession.records_count}</p>
+                                    </div>
+                                    <div className="session-actions">
+                                        <button
+                                            className="btn btn-info"
+                                            onClick={handlePreviewScrapeSession}
+                                            disabled={scrapeSessionLoading}
+                                        >
+                                            👁️ Preview Data
+                                        </button>
+                                        <button
+                                            className="btn btn-warning"
+                                            onClick={() => handleDownloadSingleCSV(scrapeSession.file)}
+                                            disabled={scrapeSessionLoading}
+                                        >
+                                            📥 Download CSV
+                                        </button>
+                                        <button
+                                            className="btn btn-success"
+                                            onClick={handleConsolidateScrapeSession}
+                                            disabled={scrapeSessionLoading}
+                                        >
+                                            ✅ Export to Excel
+                                        </button>
+                                        <button
+                                            className="btn btn-danger"
+                                            onClick={handleCleanupScrapeSession}
+                                        >
+                                            🗑️ Cancel
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            {scrapeSessionPreview && (
+                                <div className="scrape-preview-panel">
+                                    <h3>📊 Data Preview</h3>
+                                    {scrapeSessionPreview.previews.map((preview, idx) => (
+                                        <div key={idx} className="file-preview">
+                                            <h4>{preview.filename}</h4>
+                                            <p>{preview.total_records} total records</p>
+                                            <table>
+                                                <thead>
+                                                    <tr>
+                                                        {preview.columns.map((col, i) => (
+                                                            <th key={i}>{col}</th>
+                                                        ))}
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {preview.preview.map((row, rowIdx) => (
+                                                        <tr key={rowIdx}>
+                                                            {row.map((cell, colIdx) => (
+                                                                <td key={colIdx}>{cell}</td>
+                                                            ))}
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
 
                             <div className="download-info">
                                 <h4>How it works:</h4>
@@ -398,12 +732,77 @@ function App() {
                             </div>
 
                             <button
-                                className="btn btn-primary btn-large"
-                                onClick={handleDownloadRangeFromNSE}
-                                disabled={rangeLoading || !rangeStartDate || !rangeEndDate}
+                                className="btn btn-secondary btn-large"
+                                onClick={handleNSERangeDownloadSession}
+                                disabled={scrapeSessionLoading || !rangeStartDate || !rangeEndDate}
+                                title="Download and preview before consolidation - no permanent file storage"
                             >
-                                {rangeLoading ? '⏳ Downloading files...' : '📅 Download Date Range'}
+                                {scrapeSessionLoading ? '⏳ Downloading...' : '👁️ Preview & Process'}
                             </button>
+
+                            {scrapeSession && scrapeSession.type === 'range' && (
+                                <div className="scrape-session-panel">
+                                    <h3>📋 Downloaded Data Range - Ready to Process</h3>
+                                    <div className="session-info">
+                                        <p><strong>Files Downloaded:</strong> {scrapeSession.summary.successful}/{scrapeSession.summary.total_requested}</p>
+                                        <p><strong>Files Count:</strong> {scrapeSession.files.length}</p>
+                                    </div>
+                                    <div className="session-actions">
+                                        <button
+                                            className="btn btn-info"
+                                            onClick={handlePreviewScrapeSession}
+                                            disabled={scrapeSessionLoading}
+                                        >
+                                            👁️ Preview All Data
+                                        </button>
+                                        <button
+                                            className="btn btn-success"
+                                            onClick={handleConsolidateScrapeSession}
+                                            disabled={scrapeSessionLoading}
+                                        >
+                                            ✅ Export to Excel
+                                        </button>
+                                        <button
+                                            className="btn btn-danger"
+                                            onClick={handleCleanupScrapeSession}
+                                        >
+                                            🗑️ Cancel
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            {scrapeSessionPreview && scrapeSession.type === 'range' && (
+                                <div className="scrape-preview-panel">
+                                    <h3>📊 Data Preview - Range</h3>
+                                    {scrapeSessionPreview.previews.map((preview, idx) => (
+                                        <div key={idx} className="file-preview">
+                                            <h4>{preview.filename}</h4>
+                                            <p>{preview.total_records} total records</p>
+                                            <table style={{ fontSize: '0.8em' }}>
+                                                <thead>
+                                                    <tr>
+                                                        {preview.columns.slice(0, 5).map((col, i) => (
+                                                            <th key={i}>{col}</th>
+                                                        ))}
+                                                        {preview.columns.length > 5 && <th>...</th>}
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {preview.preview.slice(0, 5).map((row, rowIdx) => (
+                                                        <tr key={rowIdx}>
+                                                            {row.slice(0, 5).map((cell, colIdx) => (
+                                                                <td key={colIdx}>{typeof cell === 'number' ? cell.toLocaleString() : cell}</td>
+                                                            ))}
+                                                            {row.length > 5 && <td>...</td>}
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
 
                             {rangeProgress && (
                                 <div className="progress-summary">

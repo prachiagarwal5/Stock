@@ -9,13 +9,28 @@ from openpyxl.utils import get_column_letter
 import re
 
 class MarketCapConsolidator:
-    def __init__(self, data_folder, output_file='Finished_Product.xlsx', config_file='corporate_actions.json'):
+    def __init__(self, data_folder, output_file='Finished_Product.xlsx', config_file='corporate_actions.json', file_type='mcap'):
         self.data_folder = data_folder
         self.output_file = os.path.join(data_folder, output_file)
         self.config_file = os.path.join(data_folder, config_file)
         self.df_consolidated = None
         self.dates_list = []
+        self.file_type = file_type  # 'mcap' or 'pr'
         self.corporate_actions = self._load_corporate_actions()
+        self._detect_columns()
+    
+    def _detect_columns(self):
+        """Detect which columns to use based on file type"""
+        if self.file_type == 'pr':
+            # PR files use: SECURITY, NET_TRDQTY
+            self.symbol_col = 'SECURITY'
+            self.value_col = 'NET_TRDQTY'
+            self.name_col = 'SECURITY'  # Use SECURITY for company name in PR files
+        else:
+            # MCAP files use: Symbol, Market Cap(Rs.)
+            self.symbol_col = 'Symbol'
+            self.value_col = 'Market Cap(Rs.)'
+            self.name_col = 'Security Name'
     
     def _load_corporate_actions(self):
         """Load corporate actions configuration"""
@@ -29,7 +44,8 @@ class MarketCapConsolidator:
         }
     
     def _extract_date_from_filename(self, filename):
-        """Extract date from filename like mcap10112025.csv"""
+        """Extract date from filename like mcap10112025.csv or pr10112025.csv"""
+        # Try mcap pattern first
         match = re.search(r'mcap(\d{8})', filename)
         if match:
             date_str = match.group(1)
@@ -38,6 +54,17 @@ class MarketCapConsolidator:
             month = date_str[2:4]
             year = date_str[4:8]
             return f"{day}-{month}-{year}"
+        
+        # Try pr pattern
+        match = re.search(r'pr(\d{8})', filename)
+        if match:
+            date_str = match.group(1)
+            # Format: DDMMYYYY
+            day = date_str[0:2]
+            month = date_str[2:4]
+            year = date_str[4:8]
+            return f"{day}-{month}-{year}"
+        
         return None
     
     def _parse_date_string(self, date_str):
@@ -49,15 +76,21 @@ class MarketCapConsolidator:
     
     def load_and_consolidate_data(self):
         """Load all CSV files and consolidate data"""
-        csv_files = sorted(glob.glob(os.path.join(self.data_folder, 'mcap*.csv')))
+        # Choose file pattern based on type
+        if self.file_type == 'pr':
+            pattern = os.path.join(self.data_folder, 'pr*.csv')
+        else:
+            pattern = os.path.join(self.data_folder, 'mcap*.csv')
+        
+        csv_files = sorted(glob.glob(pattern))
         
         if not csv_files:
-            print(f"No CSV files found in {self.data_folder}")
-            return False
+            print(f"No {self.file_type.upper()} CSV files found in {self.data_folder}")
+            return 0, 0  # Return 0, 0 instead of False
         
-        print(f"Found {len(csv_files)} CSV files")
+        print(f"Found {len(csv_files)} {self.file_type.upper()} CSV files")
         
-        # Dictionary to store data: {symbol: {date: market_cap}}
+        # Dictionary to store data: {symbol: {date: value}}
         consolidated_data = {}
         company_names = {}  # Store company names
         self.dates_list = []
@@ -79,24 +112,33 @@ class MarketCapConsolidator:
                 print(f"Error reading {csv_file}: {e}")
                 continue
             
-            # Extract Symbol and Market Cap
+            # Check if required columns exist
+            if self.symbol_col not in df.columns:
+                print(f"Warning: Column '{self.symbol_col}' not found. Available columns: {list(df.columns)}")
+                continue
+            
+            if self.value_col not in df.columns:
+                print(f"Warning: Column '{self.value_col}' not found. Available columns: {list(df.columns)}")
+                continue
+            
+            # Extract Symbol and Value (Market Cap or NET_TRDVAL)
             for idx, row in df.iterrows():
-                symbol = str(row.get('Symbol', '')).strip()
-                market_cap = row.get('Market Cap(Rs.)', '')
-                security_name = str(row.get('Security Name', '')).strip()
+                symbol = str(row.get(self.symbol_col, '')).strip()
+                value = row.get(self.value_col, '')
+                company_name = str(row.get(self.name_col, symbol)).strip()
                 
-                if symbol and market_cap:
+                if symbol and value:
                     if symbol not in consolidated_data:
                         consolidated_data[symbol] = {}
                     
-                    # Convert market cap to float
+                    # Convert value to float
                     try:
-                        market_cap_float = float(market_cap)
-                        consolidated_data[symbol][date_str] = market_cap_float
+                        value_float = float(value)
+                        consolidated_data[symbol][date_str] = value_float
                     except:
                         consolidated_data[symbol][date_str] = None
                     
-                    company_names[symbol] = security_name
+                    company_names[symbol] = company_name
         
         # Sort dates
         self.dates_list.sort(key=lambda x: x[1])
@@ -110,15 +152,17 @@ class MarketCapConsolidator:
                 'Company Name': company_names.get(symbol, symbol)
             }
             
-            # Add market cap for each date
+            # Add values for each date
             for date_str in sorted_dates:
                 row[date_str] = consolidated_data[symbol].get(date_str, None)
             
             data_for_df.append(row)
         
         self.df_consolidated = pd.DataFrame(data_for_df)
-        print(f"\nConsolidated data: {len(self.df_consolidated)} companies across {len(sorted_dates)} dates")
-        return True
+        companies_count = len(self.df_consolidated)
+        dates_count = len(sorted_dates)
+        print(f"\nConsolidated data: {companies_count} companies across {dates_count} dates")
+        return companies_count, dates_count
     
     def apply_corporate_actions(self):
         """Apply corporate actions to blank out cells before split dates"""
@@ -174,18 +218,29 @@ class MarketCapConsolidator:
                                 date_col
                             ] = None
     
-    def format_excel_output(self):
+    def format_excel_output(self, output_file=None):
         """Format and save to Excel with styling"""
+        if output_file:
+            self.output_file = output_file
+        
         print(f"\nCreating Excel file: {self.output_file}")
+        
+        # Replace NaN with None for cleaner output
+        df = self.df_consolidated.copy()
+        df = df.where(pd.notna(df), None)
         
         # Save to temporary CSV first
         temp_csv = self.output_file.replace('.xlsx', '_temp.csv')
-        self.df_consolidated.to_csv(temp_csv, index=False)
+        df.to_csv(temp_csv, index=False)
         
         # Create Excel workbook with formatting
         wb = Workbook()
         ws = wb.active
-        ws.title = "Market Cap Data"
+        # Title based on file type
+        if self.file_type == 'pr':
+            ws.title = "Net Traded Qty"
+        else:
+            ws.title = "Market Cap Data"
         
         # Header styling
         header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
@@ -199,10 +254,10 @@ class MarketCapConsolidator:
         )
         
         # Write headers
-        headers = self.df_consolidated.columns.tolist()
+        headers = df.columns.tolist()
         for col_num, header in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col_num)
-            cell.value = header
+            cell.value = str(header)
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = header_alignment
@@ -212,18 +267,25 @@ class MarketCapConsolidator:
         number_format = '#,##0.00'
         data_alignment = Alignment(horizontal="right", vertical="center")
         
-        for row_num, row in enumerate(self.df_consolidated.values, 2):
+        for row_num, row in enumerate(df.values, 2):
             for col_num, value in enumerate(row, 1):
                 cell = ws.cell(row=row_num, column=col_num)
                 
                 if col_num <= 2:  # Symbol and Company Name columns
-                    cell.value = value
+                    # Convert to string
+                    cell.value = str(value) if value is not None else ""
                     cell.alignment = Alignment(horizontal="left", vertical="center")
-                else:  # Market cap values
-                    if pd.notna(value):
-                        cell.value = value
-                        cell.number_format = number_format
-                        cell.alignment = data_alignment
+                else:  # Date columns with values
+                    if value is not None and value != "" and not (isinstance(value, float) and pd.isna(value)):
+                        try:
+                            # Try to convert to float for numeric values
+                            numeric_value = float(value)
+                            cell.value = numeric_value
+                            cell.number_format = number_format
+                            cell.alignment = data_alignment
+                        except (ValueError, TypeError):
+                            cell.value = value
+                            cell.alignment = data_alignment
                     else:
                         cell.value = None
                 
@@ -281,13 +343,15 @@ class MarketCapConsolidator:
     
     def run(self):
         """Run the complete consolidation process"""
+        file_type_name = "Net Traded Value" if self.file_type == 'pr' else "Market Cap"
         print("=" * 60)
-        print("Market Cap Consolidation Tool")
+        print(f"{file_type_name} Consolidation Tool")
         print("=" * 60)
         
         self.create_corporate_actions_template()
         
-        if self.load_and_consolidate_data():
+        companies_count, dates_count = self.load_and_consolidate_data()
+        if companies_count > 0:
             self.apply_corporate_actions()
             self.format_excel_output()
             print("\n✓ Consolidation complete!")
