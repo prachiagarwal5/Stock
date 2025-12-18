@@ -254,6 +254,17 @@ body {
     box-shadow: 0 4px 12px rgba(0, 200, 83, 0.4);
 }
 
+.btn-outline {
+    background: white;
+    color: #4a5568;
+    border: 1px solid #cbd5e0;
+}
+
+.btn-outline:hover:not(:disabled) {
+    background: #f7fafc;
+    transform: translateY(-1px);
+}
+
 .btn:disabled {
     opacity: 0.6;
     cursor: not-allowed;
@@ -801,6 +812,105 @@ body {
     background: #fff5f5 !important;
     border-left-color: #e74c3c !important;
     color: #c0392b;
+}
+
+.dashboard-panel {
+    background: #ffffff;
+    border: 1px solid #e3e3e3;
+    border-radius: 10px;
+    padding: 18px;
+    margin-top: 16px;
+}
+
+.dashboard-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.dashboard-sub {
+    margin: 4px 0 0;
+    color: #6b7280;
+    font-size: 0.9rem;
+}
+
+.dashboard-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px;
+    margin-bottom: 14px;
+}
+
+.dashboard-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.dashboard-errors {
+    margin-top: 10px;
+    background: #fff7ed;
+    border: 1px solid #fdba74;
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+
+.dashboard-errors h5 {
+    margin: 0 0 6px;
+    color: #c05621;
+}
+
+.dashboard-errors ul {
+    margin: 0;
+    padding-left: 18px;
+    color: #9c4221;
+    font-size: 0.95rem;
+}
+
+.dashboard-controls {
+    display: flex;
+    gap: 12px;
+    align-items: flex-end;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+
+.dashboard-controls label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-weight: 600;
+    color: #374151;
+}
+
+.dashboard-controls input {
+    width: 120px;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+}
+
+.stat .stat-value {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: #1f2937;
+    word-break: break-word;
+}
+
+.stat .stat-label {
+    font-size: 0.95rem;
+    letter-spacing: 0.01em;
+}
+
+@media (max-width: 640px) {
+    .stat .stat-value {
+        font-size: 1.4rem;
+    }
+
+    .dashboard-controls input {
+        width: 100%;
+    }
 }
 
 /* Responsive Design */

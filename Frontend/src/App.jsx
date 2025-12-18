@@ -23,6 +23,10 @@ function App() {
     const [scrapeSessionLoading, setScrapeSessionLoading] = useState(false);
     const [scrapeSessionPreview, setScrapeSessionPreview] = useState(null);
     const [scrapeDownloadDestination, setScrapeDownloadDestination] = useState('local');
+    const [dashboardResult, setDashboardResult] = useState(null);
+    const [dashboardLoading, setDashboardLoading] = useState(false);
+    const [dashboardPage, setDashboardPage] = useState(1);
+    const [dashboardPageSize, setDashboardPageSize] = useState(150);
 
     // Fetch available NSE dates and Google Drive status on component mount
     React.useEffect(() => {
@@ -540,6 +544,87 @@ function App() {
         }
     };
 
+    const formatNumber = (value) => {
+        if (value === null || value === undefined || Number.isNaN(value)) return 'N/A';
+        if (Math.abs(value) >= 1e6) {
+            return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+        }
+        return Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
+    };
+
+    const handleBuildDashboard = async () => {
+        const payload = {
+            save_to_file: true,
+            page: dashboardPage,
+            page_size: dashboardPageSize
+        };
+
+        if (scrapeSession && scrapeSession.session_id) {
+            payload.session_id = scrapeSession.session_id;
+        } else if (nseDate) {
+            payload.date = convertDateFormat(nseDate);
+        } else {
+            setError('No session or date selected for dashboard');
+            return;
+        }
+
+        setDashboardLoading(true);
+        setError(null);
+        setSuccess(null);
+
+        try {
+            const response = await fetch('http://localhost:5000/api/nse-symbol-dashboard', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.error || 'Dashboard build failed');
+            }
+
+            const data = await response.json();
+            setDashboardResult(data);
+            const start = data.range?.start || 1;
+            const end = data.range?.end || data.symbols_used || data.count || 0;
+            setSuccess(`✅ Dashboard ready for symbols ${start}-${end} of ${data.total_symbols || data.symbols_used || data.count || 0}`);
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            setDashboardLoading(false);
+        }
+    };
+
+    const handleDownloadDashboard = async () => {
+        if (!dashboardResult || !dashboardResult.download_url) {
+            setError('No dashboard available to download');
+            return;
+        }
+
+        try {
+            const response = await fetch(`http://localhost:5000${dashboardResult.download_url}`);
+            if (!response.ok) {
+                throw new Error('Dashboard download failed');
+            }
+
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = dashboardResult.file || 'Symbol_Dashboard.xlsx';
+            document.body.appendChild(link);
+            link.click();
+            window.URL.revokeObjectURL(url);
+            document.body.removeChild(link);
+            setSuccess('✅ Dashboard downloaded');
+        } catch (err) {
+            setError(err.message);
+        }
+    };
+
     return (
         <div className="app">
             <header className="header">
@@ -634,6 +719,13 @@ function App() {
                                             👁️ Preview Data
                                         </button>
                                         <button
+                                            className="btn btn-outline"
+                                            onClick={handleBuildDashboard}
+                                            disabled={scrapeSessionLoading || dashboardLoading}
+                                        >
+                                            {dashboardLoading ? '⏳ Building...' : '📊 Build Dashboard'}
+                                        </button>
+                                        <button
                                             className="btn btn-warning"
                                             onClick={() => handleDownloadSingleCSV(scrapeSession.file)}
                                             disabled={scrapeSessionLoading}
@@ -684,6 +776,93 @@ function App() {
                                             </table>
                                         </div>
                                     ))}
+                                </div>
+                            )}
+
+                            {dashboardResult && (
+                                <div className="dashboard-panel">
+                                    <div className="dashboard-header">
+                                        <div>
+                                            <h3>📊 Symbol Dashboard</h3>
+                                            <p className="dashboard-sub">Page {dashboardResult.page} of {dashboardResult.total_pages} • Showing {dashboardResult.range?.start}–{dashboardResult.range?.end} of {dashboardResult.total_symbols || dashboardResult.symbols_used || 0}</p>
+                                        </div>
+                                        <div className="pill pill-info">{dashboardResult.symbols_used || dashboardResult.count || 0} symbols</div>
+                                    </div>
+
+                                    <div className="dashboard-controls">
+                                        <label>
+                                            Page
+                                            <input
+                                                type="number"
+                                                min="1"
+                                                value={dashboardPage}
+                                                onChange={(e) => setDashboardPage(Number(e.target.value) || 1)}
+                                            />
+                                        </label>
+                                        <label>
+                                            Page Size
+                                            <input
+                                                type="number"
+                                                min="10"
+                                                max="300"
+                                                value={dashboardPageSize}
+                                                onChange={(e) => setDashboardPageSize(Number(e.target.value) || 150)}
+                                            />
+                                        </label>
+                                        <button
+                                            className="btn btn-outline"
+                                            onClick={handleBuildDashboard}
+                                            disabled={dashboardLoading}
+                                        >
+                                            {dashboardLoading ? '⏳ Refreshing...' : '🔄 Refresh'}
+                                        </button>
+                                    </div>
+
+                                    <div className="dashboard-grid">
+                                        <div className="stat">
+                                            <span className="stat-label">Impact Cost (avg)</span>
+                                            <span className="stat-value">{formatNumber(dashboardResult.averages?.impact_cost)}</span>
+                                        </div>
+                                        <div className="stat">
+                                            <span className="stat-label">Free Float Mcap (avg)</span>
+                                            <span className="stat-value">{formatNumber(dashboardResult.averages?.free_float_mcap)}</span>
+                                        </div>
+                                        <div className="stat">
+                                            <span className="stat-label">Total Mcap (avg)</span>
+                                            <span className="stat-value">{formatNumber(dashboardResult.averages?.total_market_cap)}</span>
+                                        </div>
+                                        <div className="stat">
+                                            <span className="stat-label">Traded Value (avg)</span>
+                                            <span className="stat-value">{formatNumber(dashboardResult.averages?.total_traded_value)}</span>
+                                        </div>
+                                    </div>
+                                    <div className="dashboard-actions">
+                                        <button
+                                            className="btn btn-secondary"
+                                            onClick={handleDownloadDashboard}
+                                            disabled={!dashboardResult.download_url}
+                                        >
+                                            ⬇️ Download Dashboard Excel
+                                        </button>
+                                        {dashboardResult.errors && dashboardResult.errors.length > 0 && (
+                                            <span className="pill pill-warning">{dashboardResult.errors.length} symbols failed</span>
+                                        )}
+                                    </div>
+                                    {dashboardResult.errors && dashboardResult.errors.length > 0 && (
+                                        <div className="dashboard-errors">
+                                            <h5>Failed symbols</h5>
+                                            <ul>
+                                                {dashboardResult.errors.slice(0, 10).map((err, idx) => (
+                                                    <li key={idx}>
+                                                        {err.symbol}: {err.error}
+                                                    </li>
+                                                ))}
+                                                {dashboardResult.errors.length > 10 && (
+                                                    <li>...and {dashboardResult.errors.length - 10} more</li>
+                                                )}
+                                            </ul>
+                                        </div>
+                                    )}
                                 </div>
                             )}
 
@@ -785,6 +964,13 @@ function App() {
                                             👁️ Preview All Data
                                         </button>
                                         <button
+                                            className="btn btn-outline"
+                                            onClick={handleBuildDashboard}
+                                            disabled={scrapeSessionLoading || dashboardLoading}
+                                        >
+                                            {dashboardLoading ? '⏳ Building...' : '📊 Build Dashboard'}
+                                        </button>
+                                        <button
                                             className="btn btn-success"
                                             onClick={handleConsolidateScrapeSession}
                                             disabled={scrapeSessionLoading}
@@ -830,6 +1016,45 @@ function App() {
                                             </table>
                                         </div>
                                     ))}
+                                </div>
+                            )}
+
+                            {dashboardResult && (
+                                <div className="dashboard-panel">
+                                    <div className="dashboard-header">
+                                        <h3>📊 Symbol Dashboard</h3>
+                                        <div className="pill pill-info">{dashboardResult.symbols_used || dashboardResult.count || 0} symbols</div>
+                                    </div>
+                                    <div className="dashboard-grid">
+                                        <div className="stat">
+                                            <span className="stat-label">Impact Cost (avg)</span>
+                                            <span className="stat-value">{dashboardResult.averages?.impact_cost ?? 'N/A'}</span>
+                                        </div>
+                                        <div className="stat">
+                                            <span className="stat-label">Free Float Mcap (avg)</span>
+                                            <span className="stat-value">{dashboardResult.averages?.free_float_mcap ?? 'N/A'}</span>
+                                        </div>
+                                        <div className="stat">
+                                            <span className="stat-label">Total Mcap (avg)</span>
+                                            <span className="stat-value">{dashboardResult.averages?.total_market_cap ?? 'N/A'}</span>
+                                        </div>
+                                        <div className="stat">
+                                            <span className="stat-label">Traded Value (avg)</span>
+                                            <span className="stat-value">{dashboardResult.averages?.total_traded_value ?? 'N/A'}</span>
+                                        </div>
+                                    </div>
+                                    <div className="dashboard-actions">
+                                        <button
+                                            className="btn btn-secondary"
+                                            onClick={handleDownloadDashboard}
+                                            disabled={!dashboardResult.download_url}
+                                        >
+                                            ⬇️ Download Dashboard Excel
+                                        </button>
+                                        {dashboardResult.errors && dashboardResult.errors.length > 0 && (
+                                            <span className="pill pill-warning">{dashboardResult.errors.length} symbols failed</span>
+                                        )}
+                                    </div>
                                 </div>
                             )}
 

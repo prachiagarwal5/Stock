@@ -22,8 +22,10 @@ from pymongo import MongoClient
 from bson.binary import Binary
 import dotenv
 import base64
+import math
 from google_drive_service import GoogleDriveService
 from consolidate_marketcap import MarketCapConsolidator
+from nse_symbol_metrics import SymbolMetricsFetcher
 
 app = Flask(__name__)
 CORS(app)
@@ -90,6 +92,45 @@ def convert_nan_to_none(obj):
     elif isinstance(obj, pd.DataFrame):
         return obj.where(pd.notna(obj), None).values.tolist()
     return obj
+
+
+def _parse_mcap_date_from_filename(filename):
+    match = re.search(r'mcap(\d{2})(\d{2})(\d{4})', filename, re.IGNORECASE)
+    if not match:
+        return None
+    day, month, year = match.groups()
+    try:
+        return datetime(int(year), int(month), int(day))
+    except Exception:
+        return None
+
+
+def collect_symbols_from_files(file_paths):
+    symbols = set()
+    for path in file_paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            df = pd.read_csv(path)
+            df.columns = df.columns.str.strip()
+            if 'Symbol' in df.columns:
+                for sym in df['Symbol'].dropna():
+                    sym_clean = str(sym).strip()
+                    if sym_clean:
+                        symbols.add(sym_clean)
+        except Exception as exc:
+            print(f"⚠️ Unable to read symbols from {path}: {exc}")
+    return sorted(symbols)
+
+
+def find_mcap_files_in_range(base_dir, start_dt, end_dt):
+    pattern = os.path.join(base_dir, 'mcap*.csv')
+    files = []
+    for path in glob.glob(pattern):
+        dt = _parse_mcap_date_from_filename(os.path.basename(path))
+        if dt and start_dt <= dt <= end_dt:
+            files.append(path)
+    return sorted(files)
 
 
 # ===== Cache helpers =====
@@ -1207,6 +1248,155 @@ def download_nse_range():
     except Exception as e:
         print(f"Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/nse-symbol-dashboard', methods=['POST'])
+def nse_symbol_dashboard():
+    """
+    Build a dashboard of impact cost, free float market cap, traded value, and index for symbols in MCAP files.
+    Payload options:
+    {
+        "session_id": "..."   # use in-memory scrape session mcap files
+        "date": "03-Dec-2025" # use persisted nosubject/mcapDDMMYYYY.csv
+        "start_date": "01-Dec-2025", "end_date": "05-Dec-2025" # optional range scan in nosubject
+        "symbols": ["ABB", ...],  # optional explicit list
+        "save_to_file": true/false  # default true, saves Excel to same folder
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        session_id = data.get('session_id')
+        date_str = data.get('date')
+        start_date_str = data.get('start_date')
+        end_date_str = data.get('end_date')
+        save_to_file = data.get('save_to_file', True)
+        provided_symbols = data.get('symbols') or []
+        page = int(data.get('page', 1)) if str(data.get('page', '')).strip() != '' else 1
+        page_size = int(data.get('page_size', data.get('max_symbols', 150))) if str(data.get('page_size', '')).strip() != '' else int(data.get('max_symbols', 150))
+        page_size = max(10, min(page_size, 300))  # clamp to avoid huge calls
+
+        symbols = provided_symbols[:] if provided_symbols else []
+        target_files = []
+        output_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
+        tag = None
+
+        if session_id:
+            if session_id not in SCRAPE_SESSIONS:
+                return jsonify({'error': 'Session not found or expired'}), 404
+            session_folder = SCRAPE_SESSIONS[session_id]['folder']
+            target_files = [
+                os.path.join(session_folder, f)
+                for f in os.listdir(session_folder)
+                if f.lower().startswith('mcap') and f.lower().endswith('.csv')
+            ]
+            output_dir = session_folder
+            tag = session_id[:8]
+
+        elif date_str:
+            try:
+                date_obj = date_parser.parse(date_str)
+            except Exception:
+                return jsonify({'error': 'Invalid date format. Use DD-Mon-YYYY'}), 400
+            filename_date = date_obj.strftime('%d%m%Y')
+            tag = filename_date
+            mcap_path = os.path.join(output_dir, f"mcap{filename_date}.csv")
+            target_files = [mcap_path]
+
+        elif start_date_str and end_date_str:
+            try:
+                start_dt = date_parser.parse(start_date_str)
+                end_dt = date_parser.parse(end_date_str)
+            except Exception:
+                return jsonify({'error': 'Invalid start/end date format. Use DD-Mon-YYYY'}), 400
+            if start_dt > end_dt:
+                return jsonify({'error': 'start_date cannot be after end_date'}), 400
+            target_files = find_mcap_files_in_range(output_dir, start_dt, end_dt)
+            tag = f"{start_dt.strftime('%d%m%Y')}_{end_dt.strftime('%d%m%Y')}"
+
+        if not symbols:
+            symbols = collect_symbols_from_files(target_files)
+
+        if not symbols:
+            return jsonify({'error': 'No symbols found. Provide symbols or download MCAP first.'}), 400
+
+        # Drop duplicates and keep order
+        symbols = list(dict.fromkeys(symbols))
+
+        total_symbols = len(symbols)
+        if total_symbols == 0:
+            return jsonify({'error': 'No symbols found. Provide symbols or download MCAP first.'}), 400
+
+        total_pages = max(1, math.ceil(total_symbols / page_size))
+        page = max(1, min(page, total_pages))
+        start_idx = (page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_symbols)
+        symbols_slice = symbols[start_idx:end_idx]
+
+        fetcher = SymbolMetricsFetcher()
+
+        excel_path = None
+        download_name = None
+        if save_to_file:
+            os.makedirs(output_dir, exist_ok=True)
+            download_name = f"Symbol_Dashboard_{tag or 'latest'}.xlsx"
+            excel_path = os.path.join(output_dir, download_name)
+
+        result = fetcher.build_dashboard(symbols_slice, excel_path=excel_path, max_symbols=None)
+
+        download_url = None
+        if excel_path and download_name:
+            if session_id:
+                download_url = f"/api/nse-symbol-dashboard/download?file={download_name}&session_id={session_id}"
+            else:
+                download_url = f"/api/nse-symbol-dashboard/download?file={download_name}"
+
+        return jsonify({
+            'success': True,
+            'count': result.get('count', 0),
+            'averages': result.get('averages', {}),
+            'errors': result.get('errors', []),
+            'file': download_name,
+            'download_url': download_url,
+            'symbols_used': len(symbols_slice),
+            'total_symbols': total_symbols,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': total_pages,
+            'range': {'start': start_idx + 1, 'end': end_idx}
+        }), 200
+    except Exception as e:
+        print(f"Error building symbol dashboard: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/nse-symbol-dashboard/download', methods=['GET'])
+def download_symbol_dashboard():
+    file_name = request.args.get('file')
+    session_id = request.args.get('session_id')
+
+    if not file_name:
+        return jsonify({'error': 'file parameter is required'}), 400
+
+    safe_name = secure_filename(file_name)
+
+    if session_id:
+        if session_id not in SCRAPE_SESSIONS:
+            return jsonify({'error': 'Session not found'}), 404
+        base_dir = SCRAPE_SESSIONS[session_id]['folder']
+    else:
+        base_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
+
+    file_path = os.path.join(base_dir, safe_name)
+
+    if not os.path.exists(file_path):
+        return jsonify({'error': 'Dashboard file not found'}), 404
+
+    return send_file(
+        file_path,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=safe_name
+    )
 
 @app.route('/api/excel-results', methods=['GET'])
 def get_excel_results():
