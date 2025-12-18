@@ -740,9 +740,16 @@ def consolidate_scrape_session(session_id):
         if file_type in ['pr', 'both'] and pr_files:
             print(f"\n📊 Processing PR files...")
             try:
-                # Create temporary folder with only pr files
+                # Create temporary folder with pr files and copy mcap files for cross-lookup filtering
                 pr_temp_folder = tempfile.mkdtemp()
                 for f in pr_files:
+                    src = os.path.join(session['folder'], f)
+                    dst = os.path.join(pr_temp_folder, f)
+                    if os.path.exists(src):
+                        shutil.copy2(src, dst)
+
+                # Also copy MCAP files so PR consolidator can filter by overlap
+                for f in mcap_files:
                     src = os.path.join(session['folder'], f)
                     dst = os.path.join(pr_temp_folder, f)
                     if os.path.exists(src):

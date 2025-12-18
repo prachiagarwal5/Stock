@@ -22,9 +22,9 @@ class MarketCapConsolidator:
     def _detect_columns(self):
         """Detect which columns to use based on file type"""
         if self.file_type == 'pr':
-            # PR files use: SECURITY, NET_TRDQTY
+            # PR files use: SECURITY, NET_TRDVAL (value) and need to align to MCAP security names
             self.symbol_col = 'SECURITY'
-            self.value_col = 'NET_TRDQTY'
+            self.value_col = 'NET_TRDVAL'
             self.name_col = 'SECURITY'  # Use SECURITY for company name in PR files
         else:
             # MCAP files use: Symbol, Market Cap(Rs.)
@@ -73,6 +73,39 @@ class MarketCapConsolidator:
             return datetime.strptime(date_str, "%d-%m-%Y")
         except:
             return None
+
+    def _normalize_name(self, name):
+        """Lowercase and strip non-alphanumeric for matching"""
+        if not isinstance(name, str):
+            name = str(name)
+        name = name.lower().strip()
+        name = re.sub(r'[^a-z0-9]+', ' ', name)
+        return name.strip()
+
+    def _build_mcap_lookup(self):
+        """Build a lookup of MCAP security names to symbols for PR filtering"""
+        lookup = {}
+        pattern = os.path.join(self.data_folder, 'mcap*.csv')
+        for mcap_file in glob.glob(pattern):
+            try:
+                df_mcap = pd.read_csv(mcap_file)
+                df_mcap.columns = df_mcap.columns.str.strip()
+                if 'Security Name' not in df_mcap.columns or 'Symbol' not in df_mcap.columns:
+                    continue
+                for _, row in df_mcap.iterrows():
+                    name = str(row.get('Security Name', '')).strip()
+                    symbol = str(row.get('Symbol', '')).strip()
+                    if name:
+                        name_key = self._normalize_name(name)
+                        if name_key and name_key not in lookup:
+                            lookup[name_key] = {'symbol': symbol, 'name': name}
+                    if symbol:
+                        symbol_key = self._normalize_name(symbol)
+                        if symbol_key and symbol_key not in lookup:
+                            lookup[symbol_key] = {'symbol': symbol, 'name': name or symbol}
+            except Exception as e:
+                print(f"Warning: could not read MCAP file {mcap_file}: {e}")
+        return lookup
     
     def load_and_consolidate_data(self):
         """Load all CSV files and consolidate data"""
@@ -94,6 +127,12 @@ class MarketCapConsolidator:
         consolidated_data = {}
         company_names = {}  # Store company names
         self.dates_list = []
+
+        # For PR files, pre-load MCAP security names to filter down to only overlapping entries
+        mcap_lookup = {}
+        if self.file_type == 'pr':
+            mcap_lookup = self._build_mcap_lookup()
+            print(f"Loaded {len(mcap_lookup)} MCAP security names for PR filtering")
         
         for csv_file in csv_files:
             date_str = self._extract_date_from_filename(os.path.basename(csv_file))
@@ -123,9 +162,20 @@ class MarketCapConsolidator:
             
             # Extract Symbol and Value (Market Cap or NET_TRDVAL)
             for idx, row in df.iterrows():
-                symbol = str(row.get(self.symbol_col, '')).strip()
+                raw_symbol = str(row.get(self.symbol_col, '')).strip()
                 value = row.get(self.value_col, '')
-                company_name = str(row.get(self.name_col, symbol)).strip()
+                company_name = str(row.get(self.name_col, raw_symbol)).strip()
+
+                if self.file_type == 'pr' and mcap_lookup:
+                    lookup_key = self._normalize_name(company_name)
+                    symbol_key = self._normalize_name(raw_symbol)
+                    match = mcap_lookup.get(lookup_key) or mcap_lookup.get(symbol_key)
+                    if not match:
+                        continue  # Skip securities not present in MCAP
+                    symbol = match.get('symbol') or raw_symbol
+                    company_name = match.get('name') or company_name
+                else:
+                    symbol = raw_symbol
                 
                 if symbol and value:
                     if symbol not in consolidated_data:
@@ -238,7 +288,7 @@ class MarketCapConsolidator:
         ws = wb.active
         # Title based on file type
         if self.file_type == 'pr':
-            ws.title = "Net Traded Qty"
+            ws.title = "Net Traded Value"
         else:
             ws.title = "Market Cap Data"
         
