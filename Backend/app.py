@@ -37,11 +37,13 @@ try:
     mongo_client = MongoClient(mongo_uri)
     db = mongo_client['Stocks']
     excel_results_collection = db['excel_results']
+    bhavcache_collection = db['bhavcache']
     print("✅ MongoDB connected successfully")
 except Exception as e:
     print(f"⚠️ MongoDB connection failed: {e}")
     db = None
     excel_results_collection = None
+    bhavcache_collection = None
 
 # Initialize Google Drive Service
 google_drive_service = None
@@ -88,6 +90,60 @@ def convert_nan_to_none(obj):
     elif isinstance(obj, pd.DataFrame):
         return obj.where(pd.notna(obj), None).values.tolist()
     return obj
+
+
+# ===== Cache helpers =====
+def _normalize_iso_date(dt):
+    return dt.strftime('%Y-%m-%d')
+
+
+def get_cached_csv(date_iso, data_type):
+    if bhavcache_collection is None:
+        return None
+    doc = bhavcache_collection.find_one({'date': date_iso, 'type': data_type})
+    if not doc:
+        return None
+    try:
+        csv_bytes = doc.get('file_data')
+        if not csv_bytes:
+            return None
+        df = pd.read_csv(BytesIO(csv_bytes))
+        return {
+            'df': df,
+            'records': doc.get('records', len(df)),
+            'columns': doc.get('columns', df.columns.tolist()),
+            'stored_at': doc.get('stored_at')
+        }
+    except Exception as e:
+        print(f"⚠️ Failed to read cached {data_type} for {date_iso}: {e}")
+        return None
+
+
+def put_cached_csv(date_iso, data_type, df, source='nse'):
+    if bhavcache_collection is None or df is None:
+        return None
+    try:
+        csv_buf = BytesIO()
+        df.to_csv(csv_buf, index=False)
+        bhavcache_collection.update_one(
+            {'date': date_iso, 'type': data_type},
+            {
+                '$set': {
+                    'date': date_iso,
+                    'type': data_type,
+                    'file_data': csv_buf.getvalue(),
+                    'records': len(df),
+                    'columns': df.columns.tolist(),
+                    'stored_at': datetime.now().isoformat(),
+                    'source': source
+                }
+            },
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        print(f"⚠️ Failed to cache {data_type} for {date_iso}: {e}")
+        return None
 
 # Configuration
 UPLOAD_FOLDER = tempfile.mkdtemp()
@@ -905,13 +961,14 @@ def download_nse_range():
     Expected payload: {
         "start_date": "01-Dec-2025",  # Format: DD-Mon-YYYY
         "end_date": "05-Dec-2025",    # Format: DD-Mon-YYYY
-        "save_to_file": true/false    # If false, temp stores; if true, saves permanently
+        "save_to_file": true/false,   # If false, temp stores; if true, saves permanently
+        "refresh_mode": "missing_only" or "force"  # Optional, default missing_only
     }
     Returns: {
         "success": true,
         "session_id": "...",  # If save_to_file is false
-        "summary": {...},
-        "files": [...]
+        "summary": {...},       # counts and status per date/type
+        "entries": [...]        # per-day, per-type status
     }
     """
     try:
@@ -919,7 +976,11 @@ def download_nse_range():
         start_date_str = data.get('start_date', '')
         end_date_str = data.get('end_date', '')
         save_to_file = data.get('save_to_file', True)
-        
+        refresh_mode = data.get('refresh_mode', 'missing_only')  # missing_only | force
+
+        if refresh_mode not in ['missing_only', 'force']:
+            return jsonify({'error': 'Invalid refresh_mode. Use missing_only or force'}), 400
+
         if not start_date_str or not end_date_str:
             return jsonify({'error': 'Both start_date and end_date are required'}), 400
         
@@ -951,121 +1012,172 @@ def download_nse_range():
         if not save_to_file:
             session_id = create_scrape_session()
         
-        # Download data for each trading date
         downloads_summary = {
-            'success_count': 0,
+            'total_requested': len(trading_dates),
+            'cached_count': 0,
+            'fetched_count': 0,
             'failed_count': 0,
-            'files': [],
+            'entries': [],
             'errors': []
         }
-        
-        print(f"Downloading NSE data for {len(trading_dates)} trading days...")
-        
+
+        print(f"Downloading NSE data for {len(trading_dates)} trading days (mode={refresh_mode})...")
+
         for trade_date in trading_dates:
-            try:
-                nse_date_formatted = trade_date.strftime('%d-%b-%Y')
-                filename_date = trade_date.strftime('%d%m%Y')
-                
-                # NSE API request
-                api_url = "https://www.nseindia.com/api/reports"
-                params = {
-                    'archives': json.dumps([{
-                        "name": "CM - Bhavcopy (PR.zip)",
-                        "type": "archives",
-                        "category": "capital-market",
-                        "section": "equities"
-                    }]),
-                    'date': nse_date_formatted,
-                    'type': 'equities',
-                    'mode': 'single'
-                }
-                
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-                }
-                
-                # Download the ZIP file
-                response = requests.get(api_url, params=params, headers=headers, timeout=30)
-                
-                if response.status_code != 200:
-                    downloads_summary['errors'].append({
-                        'date': nse_date_formatted,
-                        'error': f'NSE API error: {response.status_code}'
-                    })
-                    downloads_summary['failed_count'] += 1
-                    continue
-                
-                # Extract ZIP file
+            nse_date_formatted = trade_date.strftime('%d-%b-%Y')
+            filename_date = trade_date.strftime('%d%m%Y')
+            date_iso = _normalize_iso_date(trade_date)
+
+            cached_mcap = None if refresh_mode == 'force' else get_cached_csv(date_iso, 'mcap')
+            cached_pr = None if refresh_mode == 'force' else get_cached_csv(date_iso, 'pr')
+
+            need_mcap = refresh_mode == 'force' or cached_mcap is None
+            need_pr = refresh_mode == 'force' or cached_pr is None
+
+            mcap_df = cached_mcap['df'] if cached_mcap else None
+            pr_df = cached_pr['df'] if cached_pr else None
+
+            # Download only if any missing or force
+            if need_mcap or need_pr:
                 try:
+                    api_url = "https://www.nseindia.com/api/reports"
+                    params = {
+                        'archives': json.dumps([{
+                            "name": "CM - Bhavcopy (PR.zip)",
+                            "type": "archives",
+                            "category": "capital-market",
+                            "section": "equities"
+                        }]),
+                        'date': nse_date_formatted,
+                        'type': 'equities',
+                        'mode': 'single'
+                    }
+
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+                    }
+
+                    response = requests.get(api_url, params=params, headers=headers, timeout=30)
+                    if response.status_code != 200:
+                        downloads_summary['errors'].append({
+                            'date': nse_date_formatted,
+                            'error': f'NSE API error: {response.status_code}'
+                        })
+                        downloads_summary['failed_count'] += 1
+                        continue
+
                     zip_data = BytesIO(response.content)
                     with zipfile.ZipFile(zip_data, 'r') as zip_ref:
                         file_list = zip_ref.namelist()
-                        
-                        # Find market cap file
-                        csv_file = None
+
+                        mcap_file = None
+                        pr_file = None
                         for file in file_list:
-                            if file.lower().endswith('.csv') and 'mcap' in file.lower():
-                                csv_file = file
-                                break
-                        
-                        if not csv_file:
-                            downloads_summary['errors'].append({
-                                'date': nse_date_formatted,
-                                'error': 'No market cap CSV file found in ZIP'
-                            })
-                            downloads_summary['failed_count'] += 1
-                            continue
-                        
-                        # Extract CSV content
-                        csv_content = zip_ref.read(csv_file)
-                        df = pd.read_csv(BytesIO(csv_content))
-                        
-                        # Create output filename
-                        output_filename = f"mcap{filename_date}.csv"
-                        
-                        # Save to file
-                        if save_to_file:
-                            output_path = os.path.join(
-                                os.path.dirname(__file__),
-                                'nosubject',
-                                output_filename
-                            )
-                            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                            df.to_csv(output_path, index=False)
-                            
-                            downloads_summary['files'].append({
-                                'date': nse_date_formatted,
-                                'filename': output_filename,
-                                'records': len(df),
-                                'status': 'saved'
-                            })
-                        else:
-                            # Save to temporary session
-                            temp_path = os.path.join(SCRAPE_SESSIONS[session_id]['folder'], output_filename)
-                            df.to_csv(temp_path, index=False)
-                            SCRAPE_SESSIONS[session_id]['files'].append(output_filename)
-                            
-                            downloads_summary['files'].append({
-                                'date': nse_date_formatted,
-                                'filename': output_filename,
-                                'records': len(df),
-                                'status': 'temp'
-                            })
-                        
-                        downloads_summary['success_count'] += 1
-                        print(f"✅ Downloaded: {nse_date_formatted} ({len(df)} records)")
-                
+                            if file.lower().startswith('mcap') and file.lower().endswith('.csv'):
+                                mcap_file = file
+                            if file.lower().startswith('pr') and file.lower().endswith('.csv'):
+                                pr_file = file
+
+                        # fallback: bhavcopy as mcap
+                        if not mcap_file:
+                            for file in file_list:
+                                if file.lower().endswith('.csv') and ('bhav' in file.lower() or file.lower().startswith('bh')):
+                                    mcap_file = file
+                                    break
+
+                        if need_mcap and mcap_file:
+                            try:
+                                csv_content = zip_ref.read(mcap_file)
+                                mcap_df = pd.read_csv(BytesIO(csv_content))
+                                mcap_df.columns = mcap_df.columns.str.strip()
+                                put_cached_csv(date_iso, 'mcap', mcap_df, source='nse')
+                            except Exception as e:
+                                downloads_summary['errors'].append({
+                                    'date': nse_date_formatted,
+                                    'type': 'mcap',
+                                    'error': f'Error reading MCAP: {e}'
+                                })
+
+                        if need_pr and pr_file:
+                            try:
+                                csv_content = zip_ref.read(pr_file)
+                                pr_df = pd.read_csv(BytesIO(csv_content))
+                                pr_df.columns = pr_df.columns.str.strip()
+                                put_cached_csv(date_iso, 'pr', pr_df, source='nse')
+                            except Exception as e:
+                                downloads_summary['errors'].append({
+                                    'date': nse_date_formatted,
+                                    'type': 'pr',
+                                    'error': f'Error reading PR: {e}'
+                                })
                 except Exception as e:
                     downloads_summary['errors'].append({
                         'date': nse_date_formatted,
-                        'error': f'Error extracting CSV: {str(e)}'
+                        'error': f'Error fetching ZIP: {str(e)}'
                     })
                     downloads_summary['failed_count'] += 1
-            
-            except Exception as e:
-                downloads_summary['errors'].append({
+                    continue
+
+            # Write files from cache/download to storage or session
+            def _write_df(df, fname):
+                if df is None:
+                    return False
+                if save_to_file:
+                    output_path = os.path.join(os.path.dirname(__file__), 'nosubject', fname)
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    df.to_csv(output_path, index=False)
+                else:
+                    temp_path = os.path.join(SCRAPE_SESSIONS[session_id]['folder'], fname)
+                    df.to_csv(temp_path, index=False)
+                    if fname not in SCRAPE_SESSIONS[session_id]['files']:
+                        SCRAPE_SESSIONS[session_id]['files'].append(fname)
+                return True
+
+            # MCAP handling
+            if mcap_df is not None:
+                fname_mcap = f"mcap{filename_date}.csv"
+                _write_df(mcap_df, fname_mcap)
+                status = 'cached' if cached_mcap and refresh_mode != 'force' else 'fetched'
+                downloads_summary['entries'].append({
                     'date': nse_date_formatted,
-                    'error': str(e)
+                    'type': 'mcap',
+                    'status': status,
+                    'filename': fname_mcap,
+                    'records': len(mcap_df)
+                })
+                if status == 'cached':
+                    downloads_summary['cached_count'] += 1
+                else:
+                    downloads_summary['fetched_count'] += 1
+            else:
+                downloads_summary['entries'].append({
+                    'date': nse_date_formatted,
+                    'type': 'mcap',
+                    'status': 'missing'
+                })
+                downloads_summary['failed_count'] += 1
+
+            # PR handling
+            if pr_df is not None:
+                fname_pr = f"pr{filename_date}.csv"
+                _write_df(pr_df, fname_pr)
+                status = 'cached' if cached_pr and refresh_mode != 'force' else 'fetched'
+                downloads_summary['entries'].append({
+                    'date': nse_date_formatted,
+                    'type': 'pr',
+                    'status': status,
+                    'filename': fname_pr,
+                    'records': len(pr_df)
+                })
+                if status == 'cached':
+                    downloads_summary['cached_count'] += 1
+                else:
+                    downloads_summary['fetched_count'] += 1
+            else:
+                downloads_summary['entries'].append({
+                    'date': nse_date_formatted,
+                    'type': 'pr',
+                    'status': 'missing'
                 })
                 downloads_summary['failed_count'] += 1
         
@@ -1075,18 +1187,20 @@ def download_nse_range():
                 'start_date': start_date_str,
                 'end_date': end_date_str,
                 'type': 'range_download',
-                'total_files': downloads_summary['success_count']
+                'total_files': len(SCRAPE_SESSIONS[session_id]['files'])
             }
         
         return jsonify({
             'success': True,
             'session_id': session_id,
             'summary': {
-                'total_requested': len(trading_dates),
-                'successful': downloads_summary['success_count'],
-                'failed': downloads_summary['failed_count']
+                'total_requested': downloads_summary['total_requested'],
+                'cached': downloads_summary['cached_count'],
+                'fetched': downloads_summary['fetched_count'],
+                'failed': downloads_summary['failed_count'],
+                'refresh_mode': refresh_mode
             },
-            'files': downloads_summary['files'],
+            'entries': downloads_summary['entries'],
             'errors': downloads_summary['errors']
         }), 200
     

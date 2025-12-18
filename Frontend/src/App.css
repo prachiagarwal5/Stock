@@ -662,6 +662,11 @@ body {
     background: linear-gradient(135deg, rgba(231, 76, 60, 0.1), rgba(192, 57, 43, 0.1));
 }
 
+.stat.info {
+    border-left-color: #3498db;
+    background: linear-gradient(135deg, rgba(52, 152, 219, 0.1), rgba(41, 128, 185, 0.1));
+}
+
 .stat.total {
     border-left-color: #f39c12;
     background: linear-gradient(135deg, rgba(243, 156, 18, 0.1), rgba(230, 126, 34, 0.1));
@@ -699,6 +704,88 @@ body {
 .errors-list ul {
     list-style: none;
     margin-left: 0;
+}
+
+.pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.35rem 0.75rem;
+    border-radius: 999px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+}
+
+.pill-success {
+    background: #e8f8f2;
+    color: #1b8f5f;
+    border: 1px solid #b6e7d3;
+}
+
+.range-status-list ul,
+.files-list ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.range-status-item {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 0.5rem;
+    align-items: center;
+    padding: 0.75rem;
+    margin-bottom: 0.5rem;
+    background: #f9f9ff;
+    border-radius: 8px;
+    border-left: 4px solid #667eea;
+    font-size: 0.95rem;
+}
+
+.range-status-item .date {
+    font-weight: 700;
+    color: #333;
+}
+
+.range-status-item .type {
+    font-weight: 600;
+    color: #555;
+}
+
+.range-status-item .status {
+    text-transform: capitalize;
+    font-weight: 700;
+}
+
+.range-status-item .records {
+    color: #666;
+    font-size: 0.9rem;
+}
+
+.range-status-item.status-cached {
+    border-left-color: #27ae60;
+    background: #f3fbf6;
+    color: #1b8f5f;
+}
+
+.range-status-item.status-fetched {
+    border-left-color: #3498db;
+    background: #f1f7fd;
+    color: #2c7bb5;
+}
+
+.range-status-item.status-missing,
+.range-status-item.status-failed {
+    border-left-color: #e74c3c;
+    background: #fef3f2;
+    color: #c0392b;
+}
+
+@media (max-width: 720px) {
+    .progress-stats {
+        grid-template-columns: 1fr 1fr;
+    }
 }
 
 .files-list li {

@@ -149,9 +149,10 @@ function App() {
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
-                    start_date: rangeStartDate,
-                    end_date: rangeEndDate,
-                    save_to_file: true
+                    start_date: convertDateFormat(rangeStartDate),
+                    end_date: convertDateFormat(rangeEndDate),
+                    save_to_file: true,
+                    refresh_mode: 'missing_only'
                 })
             });
 
@@ -162,14 +163,17 @@ function App() {
 
             const data = await response.json();
             setRangeProgress({
-                success: data.summary.successful,
-                failed: data.summary.failed,
-                total: data.summary.total_requested,
-                files: data.files,
-                errors: data.errors
+                summary: data.summary,
+                entries: data.entries || [],
+                errors: data.errors || []
             });
 
-            const message = `✅ Downloaded ${data.summary.successful}/${data.summary.total_requested} files`;
+            const cached = data.summary.cached;
+            const fetched = data.summary.fetched;
+            const total = data.summary.total_requested;
+            const message = fetched === 0 && data.summary.failed === 0
+                ? `✅ All ${total} days served from cache`
+                : `✅ Ready: cached ${cached}, fetched ${fetched}, total ${total}`;
             setSuccess(message);
 
             setTimeout(() => {
@@ -340,7 +344,8 @@ function App() {
                 body: JSON.stringify({
                     start_date: convertDateFormat(rangeStartDate),
                     end_date: convertDateFormat(rangeEndDate),
-                    save_to_file: false  // Temp storage mode
+                    save_to_file: false,  // Temp storage mode
+                    refresh_mode: 'missing_only'
                 })
             });
 
@@ -354,17 +359,21 @@ function App() {
                 session_id: data.session_id,
                 type: 'range',
                 summary: data.summary,
-                files: data.files,
-                errors: data.errors
+                entries: data.entries || [],
+                errors: data.errors || []
             });
             setRangeProgress({
-                success: data.summary.successful,
-                failed: data.summary.failed,
-                total: data.summary.total_requested,
-                files: data.files,
-                errors: data.errors
+                summary: data.summary,
+                entries: data.entries || [],
+                errors: data.errors || []
             });
-            setSuccess(`✅ Downloaded ${data.summary.successful}/${data.summary.total_requested} files`);
+            const cached = data.summary.cached;
+            const fetched = data.summary.fetched;
+            const total = data.summary.total_requested;
+            const message = fetched === 0 && data.summary.failed === 0
+                ? `✅ All ${total} days served from cache`
+                : `✅ Ready: cached ${cached}, fetched ${fetched}, total ${total}`;
+            setSuccess(message);
         } catch (err) {
             setError(err.message);
         } finally {
@@ -744,9 +753,29 @@ function App() {
                                 <div className="scrape-session-panel">
                                     <h3>📋 Downloaded Data Range - Ready to Process</h3>
                                     <div className="session-info">
-                                        <p><strong>Files Downloaded:</strong> {scrapeSession.summary.successful}/{scrapeSession.summary.total_requested}</p>
-                                        <p><strong>Files Count:</strong> {scrapeSession.files.length}</p>
+                                        <p><strong>Cached:</strong> {scrapeSession.summary.cached}</p>
+                                        <p><strong>Fetched:</strong> {scrapeSession.summary.fetched}</p>
+                                        <p><strong>Failed:</strong> {scrapeSession.summary.failed}</p>
+                                        <p><strong>Total Requested:</strong> {scrapeSession.summary.total_requested}</p>
+                                        {scrapeSession.summary.fetched === 0 && scrapeSession.summary.failed === 0 && (
+                                            <div className="pill pill-success">All days served from cache</div>
+                                        )}
                                     </div>
+                                    {scrapeSession.entries && scrapeSession.entries.length > 0 && (
+                                        <div className="range-status-list">
+                                            <div className="range-status-header">Per-day status</div>
+                                            <ul>
+                                                {scrapeSession.entries.map((entry, idx) => (
+                                                    <li key={idx} className={`range-status-item status-${entry.status}`}>
+                                                        <span className="date">{entry.date}</span>
+                                                        <span className="type">{entry.type.toUpperCase()}</span>
+                                                        <span className="status">{entry.status}</span>
+                                                        {entry.records !== undefined && <span className="records">{entry.records} records</span>}
+                                                    </li>
+                                                ))}
+                                            </ul>
+                                        </div>
+                                    )}
                                     <div className="session-actions">
                                         <button
                                             className="btn btn-info"
@@ -804,38 +833,49 @@ function App() {
                                 </div>
                             )}
 
-                            {rangeProgress && (
+                            {rangeProgress && rangeProgress.summary && (
                                 <div className="progress-summary">
                                     <h4>Download Summary</h4>
                                     <div className="progress-stats">
                                         <div className="stat success">
-                                            <span className="stat-label">Successful</span>
-                                            <span className="stat-value">{rangeProgress.success}</span>
+                                            <span className="stat-label">Cached</span>
+                                            <span className="stat-value">{rangeProgress.summary.cached}</span>
+                                        </div>
+                                        <div className="stat info">
+                                            <span className="stat-label">Fetched</span>
+                                            <span className="stat-value">{rangeProgress.summary.fetched}</span>
                                         </div>
                                         <div className="stat failed">
                                             <span className="stat-label">Failed</span>
-                                            <span className="stat-value">{rangeProgress.failed}</span>
+                                            <span className="stat-value">{rangeProgress.summary.failed}</span>
                                         </div>
                                         <div className="stat total">
                                             <span className="stat-label">Total</span>
-                                            <span className="stat-value">{rangeProgress.total}</span>
+                                            <span className="stat-value">{rangeProgress.summary.total_requested}</span>
                                         </div>
                                     </div>
 
-                                    {rangeProgress.files.length > 0 && (
+                                    {rangeProgress.summary.fetched === 0 && rangeProgress.summary.failed === 0 && (
+                                        <div className="pill pill-success">All days served from cache</div>
+                                    )}
+
+                                    {rangeProgress.entries && rangeProgress.entries.length > 0 && (
                                         <div className="files-list">
-                                            <h5>Downloaded Files:</h5>
+                                            <h5>Per-day status:</h5>
                                             <ul>
-                                                {rangeProgress.files.map((file, idx) => (
-                                                    <li key={idx}>
-                                                        ✅ {file.filename} - {file.records} records ({file.date})
+                                                {rangeProgress.entries.map((entry, idx) => (
+                                                    <li key={idx} className={`range-status-item status-${entry.status}`}>
+                                                        <span className="date">{entry.date}</span>
+                                                        <span className="type">{entry.type.toUpperCase()}</span>
+                                                        <span className="status">{entry.status}</span>
+                                                        {entry.records !== undefined && <span className="records">{entry.records} records</span>}
                                                     </li>
                                                 ))}
                                             </ul>
                                         </div>
                                     )}
 
-                                    {rangeProgress.errors.length > 0 && (
+                                    {rangeProgress.errors && rangeProgress.errors.length > 0 && (
                                         <div className="errors-list">
                                             <h5>Failed Downloads:</h5>
                                             <ul>
