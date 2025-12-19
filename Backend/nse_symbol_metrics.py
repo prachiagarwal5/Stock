@@ -173,7 +173,7 @@ class SymbolMetricsFetcher:
 
         return rows, errors
 
-    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=10, chunk_size=100):
+    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=25, chunk_size=100):
         rows, errors = self.fetch_many(symbols, max_symbols=max_symbols, as_of=as_of, parallel=parallel, max_workers=max_workers, chunk_size=chunk_size)
 
         df = pd.DataFrame(rows)

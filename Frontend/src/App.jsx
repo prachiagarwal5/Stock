@@ -18,17 +18,14 @@ function App() {
     const [downloadDestination, setDownloadDestination] = useState('local');
     const [googleDriveStatus, setGoogleDriveStatus] = useState(null);
     const [googleDriveFiles, setGoogleDriveFiles] = useState([]);
-    // NEW: Scrape session states
-    const [scrapeSession, setScrapeSession] = useState(null);
-    const [scrapeSessionLoading, setScrapeSessionLoading] = useState(false);
-    const [scrapeSessionPreview, setScrapeSessionPreview] = useState(null);
-    const [scrapeDownloadDestination, setScrapeDownloadDestination] = useState('local');
     const [dashboardResult, setDashboardResult] = useState(null);
     const [dashboardLoading, setDashboardLoading] = useState(false);
     const [dashboardError, setDashboardError] = useState(null);
     const [dashboardLimit, setDashboardLimit] = useState(100);
     const [dashboardPage, setDashboardPage] = useState(1);
     const [dashboardPageSize, setDashboardPageSize] = useState(150);
+    const [indicesLoading, setIndicesLoading] = useState(false);
+    const [exportLoading, setExportLoading] = useState(false);
 
     // Fetch available NSE dates and Google Drive status on component mount
     React.useEffect(() => {
@@ -126,12 +123,12 @@ function App() {
             }
 
             const data = await response.json();
-            setSuccess(`✅ Downloaded: ${data.file} (${data.records_count} records)`);
-
-            // Clear uploaded files and add the new one conceptually
-            setTimeout(() => {
-                setActiveTab('upload');
-            }, 2000);
+            const mcapInfo = data.files?.mcap;
+            const prInfo = data.files?.pr;
+            const parts = [];
+            if (mcapInfo) parts.push(`MCAP ${mcapInfo.records || 0} rows`);
+            if (prInfo) parts.push(`PR ${prInfo.records || 0} rows`);
+            setSuccess(`✅ Saved ${parts.join(' & ')} for ${data.date}`);
         } catch (err) {
             setError(err.message);
         } finally {
@@ -196,6 +193,73 @@ function App() {
             setError(err.message);
         } finally {
             setRangeLoading(false);
+        }
+    };
+
+    const handleExportConsolidated = async (scope = 'date') => {
+        const payload = { file_type: 'both', fast_mode: false }; // persist averages to DB
+
+        if (scope === 'range') {
+            if (!rangeStartDate || !rangeEndDate) {
+                setError('Select a start and end date');
+                return;
+            }
+            payload.start_date = convertDateFormat(rangeStartDate);
+            payload.end_date = convertDateFormat(rangeEndDate);
+        } else {
+            if (!nseDate) {
+                setError('Select a date to export');
+                return;
+            }
+            payload.date = convertDateFormat(nseDate);
+        }
+
+        setExportLoading(true);
+        setError(null);
+        setSuccess(null);
+
+        try {
+            const response = await fetch('http://localhost:5000/api/consolidate-saved', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(payload)
+            });
+
+            const contentType = response.headers.get('content-type') || '';
+            if (!response.ok && contentType.includes('application/json')) {
+                const errData = await response.json();
+                throw new Error(errData.error || 'Export failed');
+            }
+            if (!response.ok) {
+                throw new Error('Export failed');
+            }
+
+            const blob = await response.blob();
+            const disposition = response.headers.get('content-disposition') || '';
+            let filename = 'Market_Data.zip';
+            const match = disposition.match(/filename="?([^";]+)"?/i);
+            if (match && match[1]) {
+                filename = match[1];
+            } else if (contentType.includes('sheet')) {
+                filename = 'Market_Cap.xlsx';
+            }
+
+            const url = window.URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            window.URL.revokeObjectURL(url);
+            document.body.removeChild(link);
+
+            setSuccess('✅ Excel export ready');
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            setExportLoading(false);
         }
     };
 
@@ -290,110 +354,6 @@ function App() {
         }
     };
 
-    // NEW: Handlers for scrape session (preview/download options)
-    const handleNSESingleDownloadSession = async () => {
-        if (!nseDate) {
-            setError('Please select a date');
-            return;
-        }
-
-        setScrapeSessionLoading(true);
-        setError(null);
-
-        try {
-            const formattedDate = convertDateFormat(nseDate);
-            const response = await fetch('http://localhost:5000/api/download-nse', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    date: formattedDate,
-                    save_to_file: false  // Temp storage mode
-                })
-            });
-
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Download failed');
-            }
-
-            const data = await response.json();
-            setScrapeSession({
-                session_id: data.session_id,
-                file: data.file,
-                date: data.date,
-                records_count: data.records_count,
-                type: 'single'
-            });
-            setSuccess(`✅ Downloaded: ${data.file} (${data.records_count} records)`);
-        } catch (err) {
-            setError(err.message);
-        } finally {
-            setScrapeSessionLoading(false);
-        }
-    };
-
-    const handleNSERangeDownloadSession = async () => {
-        if (!rangeStartDate || !rangeEndDate) {
-            setError('Please select both start and end dates');
-            return;
-        }
-
-        if (rangeStartDate > rangeEndDate) {
-            setError('Start date cannot be after end date');
-            return;
-        }
-
-        setScrapeSessionLoading(true);
-        setError(null);
-
-        try {
-            const response = await fetch('http://localhost:5000/api/download-nse-range', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    start_date: convertDateFormat(rangeStartDate),
-                    end_date: convertDateFormat(rangeEndDate),
-                    save_to_file: false,  // Temp storage mode
-                    refresh_mode: 'missing_only'
-                })
-            });
-
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Download failed');
-            }
-
-            const data = await response.json();
-            setScrapeSession({
-                session_id: data.session_id,
-                type: 'range',
-                summary: data.summary,
-                entries: data.entries || [],
-                errors: data.errors || []
-            });
-            setRangeProgress({
-                summary: data.summary,
-                entries: data.entries || [],
-                errors: data.errors || []
-            });
-            const cached = data.summary.cached;
-            const fetched = data.summary.fetched;
-            const total = data.summary.total_requested;
-            const message = fetched === 0 && data.summary.failed === 0
-                ? `✅ All ${total} days served from cache`
-                : `✅ Ready: cached ${cached}, fetched ${fetched}, total ${total}`;
-            setSuccess(message);
-        } catch (err) {
-            setError(err.message);
-        } finally {
-            setScrapeSessionLoading(false);
-        }
-    };
-
     const loadDashboardData = async (limit) => {
         setDashboardLoading(true);
         setDashboardError(null);
@@ -413,162 +373,37 @@ function App() {
         }
     };
 
-    const handlePreviewScrapeSession = async () => {
-        if (!scrapeSession) {
-            setError('No scrape session active');
-            return;
-        }
-
-        setScrapeSessionLoading(true);
+    const handleUpdateIndices = async () => {
+        setIndicesLoading(true);
         setError(null);
+        setSuccess(null);
 
         try {
-            const response = await fetch(`http://localhost:5000/api/scrape-session/${scrapeSession.session_id}/preview`);
-
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Preview failed');
-            }
+            const response = await fetch('http://localhost:5000/api/update-indices', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({})
+            });
 
             const data = await response.json();
-            setScrapeSessionPreview(data);
-            setSuccess('✅ Preview loaded');
+            if (!response.ok) {
+                throw new Error(data.error || 'Index update failed');
+            }
+
+            setSuccess(`✅ Indices updated for ${data.count} symbols`);
+            if (data.download_path) {
+                window.open(`http://localhost:5000${data.download_path}`, '_blank');
+            }
+
+            if (activeTab === 'mongo') {
+                await loadDashboardData(dashboardLimit);
+            }
         } catch (err) {
             setError(err.message);
         } finally {
-            setScrapeSessionLoading(false);
-        }
-    };
-
-    const handleDownloadSingleCSV = async (filename) => {
-        if (!scrapeSession) {
-            setError('No scrape session active');
-            return;
-        }
-
-        try {
-            const response = await fetch(
-                `http://localhost:5000/api/scrape-session/${scrapeSession.session_id}/download-csv?filename=${encodeURIComponent(filename)}`
-            );
-
-            if (!response.ok) {
-                throw new Error('Download failed');
-            }
-
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = filename;
-            document.body.appendChild(link);
-            link.click();
-            window.URL.revokeObjectURL(url);
-            document.body.removeChild(link);
-
-            setSuccess(`✅ Downloaded: ${filename}`);
-        } catch (err) {
-            setError(err.message);
-        }
-    };
-
-    const handleConsolidateScrapeSession = async () => {
-        if (!scrapeSession) {
-            setError('No scrape session active');
-            return;
-        }
-
-        setScrapeSessionLoading(true);
-        setError(null);
-
-        try {
-            const response = await fetch(
-                `http://localhost:5000/api/scrape-session/${scrapeSession.session_id}/consolidate`,
-                {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        download_destination: scrapeDownloadDestination,
-                        file_type: 'both'  // Request both mcap and pr files
-                    })
-                }
-            );
-
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Consolidation failed');
-            }
-
-            if (scrapeDownloadDestination === 'google_drive') {
-                const data = await response.json();
-                let successMsg = '✅ Files uploaded to Google Drive!\n';
-
-                // Show both file types if available
-                if (data.downloads && Array.isArray(data.downloads)) {
-                    data.downloads.forEach(file => {
-                        const fileType = file.type === 'mcap' ? '📊 Market Cap' : '📈 Net Traded Value';
-                        successMsg += `\n${fileType}: ${file.file_name}\n🔗 ${file.web_link}`;
-                    });
-                } else {
-                    successMsg += `📎 ${data.file_name}\n🔗 ${data.web_link}`;
-                }
-
-                setSuccess(successMsg);
-                fetchGoogleDriveFiles();
-            } else {
-                const blob = await response.blob();
-                const url = window.URL.createObjectURL(blob);
-                const link = document.createElement('a');
-                link.href = url;
-
-                // Detect if it's a zip or single Excel file
-                const contentType = response.headers.get('content-type');
-                const isZip = contentType && contentType.includes('zip');
-                link.download = isZip ? 'Market_Data.zip' : 'Market_Data.xlsx';
-
-                document.body.appendChild(link);
-                link.click();
-                window.URL.revokeObjectURL(url);
-                document.body.removeChild(link);
-
-                setSuccess(isZip ?
-                    '✅ Excel files downloaded successfully (zipped)!' :
-                    '✅ Excel file downloaded successfully!'
-                );
-            }
-
-            // Clear session after successful export
-            setScrapeSession(null);
-            setScrapeSessionPreview(null);
-        } catch (err) {
-            setError(err.message);
-        } finally {
-            setScrapeSessionLoading(false);
-        }
-    };
-
-    const handleCleanupScrapeSession = async () => {
-        if (!scrapeSession) {
-            setError('No scrape session active');
-            return;
-        }
-
-        try {
-            const response = await fetch(
-                `http://localhost:5000/api/scrape-session/${scrapeSession.session_id}/cleanup`,
-                {
-                    method: 'POST'
-                }
-            );
-
-            if (response.ok) {
-                setScrapeSession(null);
-                setScrapeSessionPreview(null);
-                setSuccess('✅ Session cleaned up');
-            }
-        } catch (err) {
-            setError(err.message);
+            setIndicesLoading(false);
         }
     };
 
@@ -581,31 +416,22 @@ function App() {
     };
 
     const handleBuildDashboard = async () => {
-        const topNInput = window.prompt('Enter top N symbols by MCAP average (leave blank for all symbols):', '1000');
-        if (topNInput === null) {
-            return; // user cancelled
-        }
-
         const payload = {
             save_to_file: true,
-            page: dashboardPage,
-            page_size: dashboardPageSize
+            page: 1,
+            page_size: 1000,
+            top_n: 1000,
+            top_n_by: 'mcap',
+            parallel_workers: 25,
+            chunk_size: 100
         };
-
-        const topNVal = parseInt(topNInput, 10);
-        if (!Number.isNaN(topNVal) && topNVal > 0) {
-            payload.top_n = topNVal;
-            payload.top_n_by = 'mcap';
-            payload.parallel_workers = 10;
-            payload.chunk_size = 100;
-        }
-
-        if (scrapeSession && scrapeSession.session_id) {
-            payload.session_id = scrapeSession.session_id;
+        if (rangeStartDate && rangeEndDate) {
+            payload.start_date = convertDateFormat(rangeStartDate);
+            payload.end_date = convertDateFormat(rangeEndDate);
         } else if (nseDate) {
             payload.date = convertDateFormat(nseDate);
         } else {
-            setError('No session or date selected for dashboard');
+            setError('Select a date or date range first');
             return;
         }
 
@@ -745,89 +571,30 @@ function App() {
 
                             <button
                                 className="btn btn-secondary btn-large"
-                                onClick={handleNSESingleDownloadSession}
-                                disabled={scrapeSessionLoading || !nseDate}
-                                title="Download and preview before consolidation - no permanent file storage"
+                                onClick={handleDownloadFromNSE}
+                                disabled={nseLoading || !nseDate}
+                                title="Download and save CSVs to backend storage"
                             >
-                                {scrapeSessionLoading ? '⏳ Downloading...' : '👁️ Preview & Process'}
+                                {nseLoading ? '⏳ Downloading...' : '⬇️ Download & Save CSV'}
                             </button>
 
-                            {scrapeSession && scrapeSession.type === 'single' && (
-                                <div className="scrape-session-panel">
-                                    <h3>📋 Downloaded Data - Ready to Process</h3>
-                                    <div className="session-info">
-                                        <p><strong>File:</strong> {scrapeSession.file}</p>
-                                        <p><strong>Date:</strong> {scrapeSession.date}</p>
-                                        <p><strong>Records:</strong> {scrapeSession.records_count}</p>
-                                    </div>
-                                    <div className="session-actions">
-                                        <button
-                                            className="btn btn-info"
-                                            onClick={handlePreviewScrapeSession}
-                                            disabled={scrapeSessionLoading}
-                                        >
-                                            👁️ Preview Data
-                                        </button>
-                                        <button
-                                            className="btn btn-outline"
-                                            onClick={handleBuildDashboard}
-                                            disabled={scrapeSessionLoading || dashboardLoading}
-                                        >
-                                            {dashboardLoading ? '⏳ Building...' : '📊 Build Dashboard'}
-                                        </button>
-                                        <button
-                                            className="btn btn-warning"
-                                            onClick={() => handleDownloadSingleCSV(scrapeSession.file)}
-                                            disabled={scrapeSessionLoading}
-                                        >
-                                            📥 Download CSV
-                                        </button>
-                                        <button
-                                            className="btn btn-success"
-                                            onClick={handleConsolidateScrapeSession}
-                                            disabled={scrapeSessionLoading}
-                                        >
-                                            ✅ Export to Excel
-                                        </button>
-                                        <button
-                                            className="btn btn-danger"
-                                            onClick={handleCleanupScrapeSession}
-                                        >
-                                            🗑️ Cancel
-                                        </button>
-                                    </div>
-                                </div>
-                            )}
+                            <button
+                                className="btn btn-success btn-large"
+                                onClick={() => handleExportConsolidated('date')}
+                                disabled={exportLoading || !nseDate}
+                                title="Build Excel (MCAP + PR) from saved CSVs for the selected date"
+                            >
+                                {exportLoading ? '⏳ Exporting...' : '📑 Export Excel'}
+                            </button>
 
-                            {scrapeSessionPreview && (
-                                <div className="scrape-preview-panel">
-                                    <h3>📊 Data Preview</h3>
-                                    {scrapeSessionPreview.previews.map((preview, idx) => (
-                                        <div key={idx} className="file-preview">
-                                            <h4>{preview.filename}</h4>
-                                            <p>{preview.total_records} total records</p>
-                                            <table>
-                                                <thead>
-                                                    <tr>
-                                                        {preview.columns.map((col, i) => (
-                                                            <th key={i}>{col}</th>
-                                                        ))}
-                                                    </tr>
-                                                </thead>
-                                                <tbody>
-                                                    {preview.preview.map((row, rowIdx) => (
-                                                        <tr key={rowIdx}>
-                                                            {row.map((cell, colIdx) => (
-                                                                <td key={colIdx}>{cell}</td>
-                                                            ))}
-                                                        </tr>
-                                                    ))}
-                                                </tbody>
-                                            </table>
-                                        </div>
-                                    ))}
-                                </div>
-                            )}
+                            <button
+                                className="btn btn-outline btn-large"
+                                onClick={handleBuildDashboard}
+                                disabled={dashboardLoading || !nseDate}
+                                title="Build symbol dashboard (uses saved MCAP files)"
+                            >
+                                {dashboardLoading ? '⏳ Building...' : '📊 Build Dashboard'}
+                            </button>
 
                             {dashboardResult && (
                                 <div className="dashboard-panel">
@@ -971,30 +738,48 @@ function App() {
 
                             <button
                                 className="btn btn-secondary btn-large"
-                                onClick={handleNSERangeDownloadSession}
-                                disabled={scrapeSessionLoading || !rangeStartDate || !rangeEndDate}
-                                title="Download and preview before consolidation - no permanent file storage"
+                                onClick={handleDownloadRangeFromNSE}
+                                disabled={rangeLoading || !rangeStartDate || !rangeEndDate}
+                                title="Download and save all CSVs to backend storage"
                             >
-                                {scrapeSessionLoading ? '⏳ Downloading...' : '👁️ Preview & Process'}
+                                {rangeLoading ? '⏳ Downloading...' : '⬇️ Download Range'}
                             </button>
 
-                            {scrapeSession && scrapeSession.type === 'range' && (
+                            <button
+                                className="btn btn-success btn-large"
+                                onClick={() => handleExportConsolidated('range')}
+                                disabled={exportLoading || !rangeStartDate || !rangeEndDate}
+                                title="Build Excel (MCAP + PR) from saved CSVs in the selected range"
+                            >
+                                {exportLoading ? '⏳ Exporting...' : '📑 Export Range Excel'}
+                            </button>
+
+                            <button
+                                className="btn btn-outline btn-large"
+                                onClick={handleBuildDashboard}
+                                disabled={dashboardLoading || !rangeStartDate || !rangeEndDate}
+                                title="Build symbol dashboard from saved MCAP files in the selected range"
+                            >
+                                {dashboardLoading ? '⏳ Building...' : '📊 Build Range Dashboard'}
+                            </button>
+
+                            {rangeProgress && (
                                 <div className="scrape-session-panel">
-                                    <h3>📋 Downloaded Data Range - Ready to Process</h3>
+                                    <h3>📋 Range Download Summary</h3>
                                     <div className="session-info">
-                                        <p><strong>Cached:</strong> {scrapeSession.summary.cached}</p>
-                                        <p><strong>Fetched:</strong> {scrapeSession.summary.fetched}</p>
-                                        <p><strong>Failed:</strong> {scrapeSession.summary.failed}</p>
-                                        <p><strong>Total Requested:</strong> {scrapeSession.summary.total_requested}</p>
-                                        {scrapeSession.summary.fetched === 0 && scrapeSession.summary.failed === 0 && (
+                                        <p><strong>Cached:</strong> {rangeProgress.summary.cached}</p>
+                                        <p><strong>Fetched:</strong> {rangeProgress.summary.fetched}</p>
+                                        <p><strong>Failed:</strong> {rangeProgress.summary.failed}</p>
+                                        <p><strong>Total Requested:</strong> {rangeProgress.summary.total_requested}</p>
+                                        {rangeProgress.summary.fetched === 0 && rangeProgress.summary.failed === 0 && (
                                             <div className="pill pill-success">All days served from cache</div>
                                         )}
                                     </div>
-                                    {scrapeSession.entries && scrapeSession.entries.length > 0 && (
+                                    {rangeProgress.entries && rangeProgress.entries.length > 0 && (
                                         <div className="range-status-list">
                                             <div className="range-status-header">Per-day status</div>
                                             <ul>
-                                                {scrapeSession.entries.map((entry, idx) => (
+                                                {rangeProgress.entries.map((entry, idx) => (
                                                     <li key={idx} className={`range-status-item status-${entry.status}`}>
                                                         <span className="date">{entry.date}</span>
                                                         <span className="type">{entry.type.toUpperCase()}</span>
@@ -1005,67 +790,6 @@ function App() {
                                             </ul>
                                         </div>
                                     )}
-                                    <div className="session-actions">
-                                        <button
-                                            className="btn btn-info"
-                                            onClick={handlePreviewScrapeSession}
-                                            disabled={scrapeSessionLoading}
-                                        >
-                                            👁️ Preview All Data
-                                        </button>
-                                        <button
-                                            className="btn btn-outline"
-                                            onClick={handleBuildDashboard}
-                                            disabled={scrapeSessionLoading || dashboardLoading}
-                                        >
-                                            {dashboardLoading ? '⏳ Building...' : '📊 Build Dashboard'}
-                                        </button>
-                                        <button
-                                            className="btn btn-success"
-                                            onClick={handleConsolidateScrapeSession}
-                                            disabled={scrapeSessionLoading}
-                                        >
-                                            ✅ Export to Excel
-                                        </button>
-                                        <button
-                                            className="btn btn-danger"
-                                            onClick={handleCleanupScrapeSession}
-                                        >
-                                            🗑️ Cancel
-                                        </button>
-                                    </div>
-                                </div>
-                            )}
-
-                            {scrapeSessionPreview && scrapeSession.type === 'range' && (
-                                <div className="scrape-preview-panel">
-                                    <h3>📊 Data Preview - Range</h3>
-                                    {scrapeSessionPreview.previews.map((preview, idx) => (
-                                        <div key={idx} className="file-preview">
-                                            <h4>{preview.filename}</h4>
-                                            <p>{preview.total_records} total records</p>
-                                            <table style={{ fontSize: '0.8em' }}>
-                                                <thead>
-                                                    <tr>
-                                                        {preview.columns.slice(0, 5).map((col, i) => (
-                                                            <th key={i}>{col}</th>
-                                                        ))}
-                                                        {preview.columns.length > 5 && <th>...</th>}
-                                                    </tr>
-                                                </thead>
-                                                <tbody>
-                                                    {preview.preview.slice(0, 5).map((row, rowIdx) => (
-                                                        <tr key={rowIdx}>
-                                                            {row.slice(0, 5).map((cell, colIdx) => (
-                                                                <td key={colIdx}>{typeof cell === 'number' ? cell.toLocaleString() : cell}</td>
-                                                            ))}
-                                                            {row.length > 5 && <td>...</td>}
-                                                        </tr>
-                                                    ))}
-                                                </tbody>
-                                            </table>
-                                        </div>
-                                    ))}
                                 </div>
                             )}
 
@@ -1304,6 +1028,13 @@ function App() {
                                 <button className="btn btn-outline" onClick={() => loadDashboardData(dashboardLimit)} disabled={dashboardLoading}>
                                     {dashboardLoading ? '⏳ Loading...' : '🔄 Refresh'}
                                 </button>
+                                <button
+                                    className="btn btn-primary"
+                                    onClick={handleUpdateIndices}
+                                    disabled={indicesLoading}
+                                >
+                                    {indicesLoading ? '⏳ Updating...' : '🧭 Update Indices'}
+                                </button>
                             </div>
                         </div>
 
@@ -1403,7 +1134,7 @@ function App() {
                                                         <td>{row.symbol}</td>
                                                         <td>{row.companyName || row.company_name}</td>
                                                         <td>{row.series}</td>
-                                                        <td>{Array.isArray(row.indexList) ? row.indexList.slice(0, 2).join(', ') : (row.index || '')}</td>
+                                                        <td>{row.primary_index || (Array.isArray(row.indexList) ? row.indexList.slice(0, 2).join(', ') : (row.index || ''))}</td>
                                                         <td>{formatNumber(row.impact_cost)}</td>
                                                         <td>{formatNumber(row.free_float_mcap)}</td>
                                                         <td>{formatNumber(row.total_market_cap)}</td>

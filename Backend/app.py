@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import glob
 import json
+import csv
 from datetime import datetime, timedelta
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -14,11 +15,11 @@ import tempfile
 import shutil
 from pathlib import Path
 import requests
-from io import BytesIO
+from io import BytesIO, StringIO
 import zipfile
 from dateutil import parser as date_parser
 import numpy as np
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 from bson.binary import Binary
 import dotenv
 import base64
@@ -26,6 +27,7 @@ import math
 from google_drive_service import GoogleDriveService
 from consolidate_marketcap import MarketCapConsolidator
 from nse_symbol_metrics import SymbolMetricsFetcher
+from urllib.parse import quote_plus
 
 app = Flask(__name__)
 CORS(app)
@@ -70,6 +72,9 @@ try:
 except Exception as e:
     print(f"⚠️ Google Drive initialization warning: {e}")
 
+# Cache for generated index files (download endpoint)
+INDEX_FILES = {}
+
 # Custom JSON encoder to handle NaN and Inf values
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -98,6 +103,98 @@ def convert_nan_to_none(obj):
     elif isinstance(obj, pd.DataFrame):
         return obj.where(pd.notna(obj), None).values.tolist()
     return obj
+
+
+# ===== Index utilities =====
+def _make_session(user_agent=None):
+    sess = requests.Session()
+    if user_agent:
+        sess.headers.update({'User-Agent': user_agent})
+    return sess
+
+
+def _prime_cookies(session, headers):
+    try:
+        session.get('https://www.nseindia.com', headers=headers, timeout=10)
+    except Exception as exc:  # best-effort warmup
+        print(f"⚠️ NSE cookie warmup failed (indices): {exc}")
+
+
+def fetch_index_constituents(index_name, session, headers):
+    url = f"https://www.nseindia.com/api/equity-stock?index={quote_plus(index_name)}"
+    resp = session.get(url, headers=headers, timeout=20)
+    if resp.status_code != 200:
+        raise ValueError(f"Index fetch failed {resp.status_code} for {index_name}")
+    try:
+        data = resp.json() if resp.content else {}
+    except Exception:
+        raise ValueError(f"Invalid JSON for index {index_name}")
+    rows = data.get('data') or []
+    symbols = []
+    for row in rows:
+        sym = row.get('symbol') or row.get('symbolName') or row.get('securitySymbol')
+        if sym:
+            symbols.append(str(sym).strip())
+    return symbols
+
+
+def build_symbol_index_map(index_list):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'Accept': 'application/json,text/plain,*/*',
+        'Connection': 'keep-alive',
+        'Referer': 'https://www.nseindia.com/market-data/live-market-indices'
+    }
+    sess = _make_session()
+    _prime_cookies(sess, headers)
+    mapping = {}
+    errors = []
+    for idx in index_list:
+        try:
+            syms = fetch_index_constituents(idx, sess, headers)
+            for sym in syms:
+                if sym not in mapping:  # primary index only
+                    mapping[sym] = idx
+        except Exception as exc:
+            errors.append({'index': idx, 'error': str(exc)})
+    return mapping, errors
+
+
+def primary_index_map_from_db(symbols):
+    """Return latest primary_index per symbol from Mongo (no external calls)."""
+    if symbol_metrics_collection is None or not symbols:
+        return {}
+    mapping = {}
+    try:
+        cursor = symbol_metrics_collection.find(
+            {'symbol': {'$in': symbols}},
+            {
+                'symbol': 1,
+                'primary_index': 1,
+                'index': 1,
+                'indexList': 1,
+                'updated_at': 1,
+                'as_on': 1
+            }
+        ).sort([
+            ('updated_at', -1),
+            ('as_on', -1)
+        ])
+
+        for doc in cursor:
+            sym = doc.get('symbol')
+            if not sym or sym in mapping:
+                continue
+            idx = doc.get('primary_index') or doc.get('index')
+            if not idx:
+                idx_list = doc.get('indexList')
+                if isinstance(idx_list, (list, tuple)) and idx_list:
+                    idx = idx_list[0]
+            if idx:
+                mapping[sym] = idx
+    except Exception as exc:
+        print(f"⚠️ Failed to build primary index map: {exc}")
+    return mapping
 
 
 def _safe_float(val):
@@ -317,53 +414,8 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 
-# Session management for scraped CSV files
-SCRAPE_SESSIONS = {}  # {session_id: {'folder': path, 'files': [filenames], 'metadata': {...}, 'created_at': datetime}}
-
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def create_scrape_session():
-    """Create a new session for storing scraped CSV files"""
-    import uuid
-    session_id = str(uuid.uuid4())
-    session_folder = os.path.join(tempfile.gettempdir(), f'scrape_session_{session_id}')
-    os.makedirs(session_folder, exist_ok=True)
-    
-    SCRAPE_SESSIONS[session_id] = {
-        'folder': session_folder,
-        'files': [],
-        'metadata': {},
-        'created_at': datetime.now()
-    }
-    
-    return session_id
-
-def cleanup_scrape_session(session_id):
-    """Clean up temporary files for a session"""
-    if session_id in SCRAPE_SESSIONS:
-        session = SCRAPE_SESSIONS[session_id]
-        folder = session['folder']
-        if os.path.exists(folder):
-            shutil.rmtree(folder)
-        del SCRAPE_SESSIONS[session_id]
-        print(f"✅ Cleaned up session: {session_id}")
-
-def cleanup_old_sessions(max_age_hours=24):
-    """Clean up sessions older than max_age_hours (default 24 hours)"""
-    now = datetime.now()
-    sessions_to_delete = []
-    
-    for session_id, session in SCRAPE_SESSIONS.items():
-        age = (now - session['created_at']).total_seconds() / 3600
-        if age > max_age_hours:
-            sessions_to_delete.append(session_id)
-    
-    for session_id in sessions_to_delete:
-        cleanup_scrape_session(session_id)
-        print(f"⏱️ Auto-cleaned old session: {session_id}")
-    
-    return len(sessions_to_delete)
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -372,19 +424,6 @@ def health():
         'status': 'ok',
         'message': 'Market Cap Consolidation Service is running'
     }), 200
-
-@app.route('/api/cleanup-old-sessions', methods=['POST'])
-def cleanup_old_sessions_endpoint():
-    """Clean up scrape sessions older than 24 hours"""
-    try:
-        cleaned_count = cleanup_old_sessions(max_age_hours=24)
-        return jsonify({
-            'success': True,
-            'sessions_cleaned': cleaned_count,
-            'active_sessions': len(SCRAPE_SESSIONS)
-        }), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 def save_excel_to_database(excel_path, filename, metadata):
     """Save Excel file to MongoDB"""
@@ -485,23 +524,12 @@ def preview():
 def download_nse_data():
     """
     Download market cap data from NSE website
-    Expected payload: {
-        "date": "03-Dec-2025",  # Format: DD-Mon-YYYY
-        "save_to_file": true/false  # If true, saves to permanent storage; if false, temp stores
-    }
-    Returns: {
-        "success": true,
-        "session_id": "...",  # Temp session ID for preview/download
-        "file": "mcapDDMMYYYY.csv",
-        "date": "03-Dec-2025",
-        "records_count": 5000,
-        "columns": [...]
-    }
+    Expected payload: {"date": "03-Dec-2025"}
+    Always saves files to nosubject and returns metadata (no sessions).
     """
     try:
         data = request.get_json()
         nse_date = data.get('date', '')  # Format: "03-Dec-2025"
-        save_to_file = data.get('save_to_file', False)
         
         if not nse_date:
             return jsonify({'error': 'Date is required in format DD-Mon-YYYY'}), 400
@@ -621,87 +649,38 @@ def download_nse_data():
                         print(f"Warning: Error reading PR file: {str(e)}")
                         pr_df = None
                 
-                if save_to_file:
-                    # Save to permanent storage
-                    output_path_mcap = os.path.join(
-                        os.path.dirname(__file__),
-                        'nosubject',
-                        mcap_filename
-                    )
-                    os.makedirs(os.path.dirname(output_path_mcap), exist_ok=True)
-                    
-                    if mcap_df is not None:
-                        mcap_df.to_csv(output_path_mcap, index=False)
-                        print(f"Saved MCAP to: {output_path_mcap}")
-                    
-                    output_path_pr = None
-                    if pr_df is not None:
-                        output_path_pr = os.path.join(
-                            os.path.dirname(__file__),
-                            'nosubject',
-                            pr_filename
-                        )
-                        pr_df.to_csv(output_path_pr, index=False)
-                        print(f"Saved PR to: {output_path_pr}")
-                    
-                    return jsonify({
-                        'success': True,
-                        'message': f'Files downloaded and saved',
-                        'files': {
-                            'mcap': {
-                                'filename': mcap_filename,
-                                'records': len(mcap_df) if mcap_df is not None else 0,
-                                'columns': mcap_df.columns.tolist() if mcap_df is not None else []
-                            },
-                            'pr': {
-                                'filename': pr_filename if pr_df is not None else None,
-                                'records': len(pr_df) if pr_df is not None else 0,
-                                'columns': pr_df.columns.tolist() if pr_df is not None else []
-                            } if pr_df is not None else None
+                # Always save to permanent storage
+                output_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
+                os.makedirs(output_dir, exist_ok=True)
+
+                output_path_mcap = os.path.join(output_dir, mcap_filename)
+                if mcap_df is not None:
+                    mcap_df.to_csv(output_path_mcap, index=False)
+                    print(f"Saved MCAP to: {output_path_mcap}")
+                
+                output_path_pr = None
+                if pr_df is not None:
+                    output_path_pr = os.path.join(output_dir, pr_filename)
+                    pr_df.to_csv(output_path_pr, index=False)
+                    print(f"Saved PR to: {output_path_pr}")
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Files downloaded and saved',
+                    'files': {
+                        'mcap': {
+                            'filename': mcap_filename,
+                            'records': len(mcap_df) if mcap_df is not None else 0,
+                            'columns': mcap_df.columns.tolist() if mcap_df is not None else []
                         },
-                        'date': nse_date_formatted
-                    }), 200
-                else:
-                    # Create temporary session and store CSVs
-                    session_id = create_scrape_session()
-                    
-                    temp_path_mcap = os.path.join(SCRAPE_SESSIONS[session_id]['folder'], mcap_filename)
-                    if mcap_df is not None:
-                        mcap_df.to_csv(temp_path_mcap, index=False)
-                        SCRAPE_SESSIONS[session_id]['files'].append(mcap_filename)
-                    
-                    temp_path_pr = None
-                    if pr_df is not None:
-                        temp_path_pr = os.path.join(SCRAPE_SESSIONS[session_id]['folder'], pr_filename)
-                        pr_df.to_csv(temp_path_pr, index=False)
-                        SCRAPE_SESSIONS[session_id]['files'].append(pr_filename)
-                    
-                    SCRAPE_SESSIONS[session_id]['metadata'] = {
-                        'date': nse_date_formatted,
-                        'type': 'single_download',
-                        'has_mcap': mcap_df is not None,
-                        'has_pr': pr_df is not None,
-                        'mcap_records': len(mcap_df) if mcap_df is not None else 0,
-                        'pr_records': len(pr_df) if pr_df is not None else 0
-                    }
-                    
-                    print(f"Stored in temp session {session_id}")
-                    
-                    return jsonify({
-                        'success': True,
-                        'session_id': session_id,
-                        'files': {
-                            'mcap': {
-                                'filename': mcap_filename,
-                                'records': len(mcap_df) if mcap_df is not None else 0
-                            },
-                            'pr': {
-                                'filename': pr_filename if pr_df is not None else None,
-                                'records': len(pr_df) if pr_df is not None else 0
-                            } if pr_df is not None else None
-                        },
-                        'date': nse_date_formatted
-                    }), 200
+                        'pr': {
+                            'filename': pr_filename if pr_df is not None else None,
+                            'records': len(pr_df) if pr_df is not None else 0,
+                            'columns': pr_df.columns.tolist() if pr_df is not None else []
+                        } if pr_df is not None else None
+                    },
+                    'date': nse_date_formatted
+                }), 200
         
         except zipfile.BadZipFile:
             return jsonify({'error': 'Invalid ZIP file received from NSE'}), 400
@@ -746,390 +725,6 @@ def get_nse_dates():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ==================== SCRAPED CSV SESSION ENDPOINTS ====================
-
-@app.route('/api/scrape-session/<session_id>/preview', methods=['GET'])
-def preview_scrape_session(session_id):
-    """
-    Preview data from a scrape session (show first 10 rows of each CSV)
-    """
-    try:
-        if session_id not in SCRAPE_SESSIONS:
-            return jsonify({'error': 'Session not found or expired'}), 404
-        
-        session = SCRAPE_SESSIONS[session_id]
-        preview_data = []
-        
-        # Get preview from each CSV in session
-        for filename in session['files']:
-            filepath = os.path.join(session['folder'], filename)
-            if os.path.exists(filepath):
-                try:
-                    df = pd.read_csv(filepath)
-                    preview_rows = df.head(10).values.tolist()
-                    columns = df.columns.tolist()
-                    
-                    preview_data.append({
-                        'filename': filename,
-                        'total_records': len(df),
-                        'columns': columns,
-                        'preview': preview_rows
-                    })
-                except Exception as e:
-                    preview_data.append({
-                        'filename': filename,
-                        'error': str(e)
-                    })
-        
-        return jsonify({
-            'success': True,
-            'session_id': session_id,
-            'metadata': session['metadata'],
-            'file_count': len(session['files']),
-            'previews': preview_data
-        }), 200
-    
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/scrape-session/<session_id>/download-csv', methods=['GET'])
-def download_scrape_csv(session_id):
-    """
-    Download a specific CSV from scrape session
-    Query param: filename
-    """
-    try:
-        if session_id not in SCRAPE_SESSIONS:
-            return jsonify({'error': 'Session not found or expired'}), 404
-        
-        filename = request.args.get('filename', '')
-        if not filename:
-            return jsonify({'error': 'Filename parameter required'}), 400
-        
-        session = SCRAPE_SESSIONS[session_id]
-        
-        if filename not in session['files']:
-            return jsonify({'error': 'File not found in session'}), 404
-        
-        filepath = os.path.join(session['folder'], filename)
-        
-        if not os.path.exists(filepath):
-            return jsonify({'error': 'File not found'}), 404
-        
-        return send_file(
-            filepath,
-            mimetype='text/csv',
-            as_attachment=True,
-            download_name=filename
-        )
-    
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/scrape-session/<session_id>/consolidate', methods=['POST'])
-def consolidate_scrape_session(session_id):
-    """
-    Consolidate all CSVs in a scrape session into separate Excel files (one for mcap, one for pr)
-    Expected payload: {
-        "download_destination": "local" or "google_drive"  # Optional, defaults to local
-        "file_type": "mcap" or "pr" or "both"  # Which file to consolidate, default "both"
-    }
-    """
-    global google_drive_service
-    
-    try:
-        if session_id not in SCRAPE_SESSIONS:
-            return jsonify({'error': 'Session not found or expired'}), 404
-        
-        session = SCRAPE_SESSIONS[session_id]
-        download_destination = request.json.get('download_destination', 'local') if request.json else 'local'
-        file_type = request.json.get('file_type', 'both') if request.json else 'both'
-        
-        if download_destination not in ['local', 'google_drive']:
-            return jsonify({'error': 'Invalid download_destination'}), 400
-        
-        if file_type not in ['mcap', 'pr', 'both']:
-            return jsonify({'error': 'Invalid file_type (mcap, pr, or both)'}), 400
-        
-        # Separate mcap and pr files
-        mcap_files = [f for f in session['files'] if f.startswith('mcap')]
-        pr_files = [f for f in session['files'] if f.startswith('pr')]
-        
-        print(f"\n🔍 Session folder: {session['folder']}")
-        print(f"   All files in session: {session['files']}")
-        print(f"   MCAP files detected: {mcap_files}")
-        print(f"   PR files detected: {pr_files}")
-        
-        # Verify files actually exist
-        for f in session['files']:
-            file_path = os.path.join(session['folder'], f)
-            exists = os.path.exists(file_path)
-            size = os.path.getsize(file_path) if exists else 0
-            print(f"   - {f}: exists={exists}, size={size} bytes")
-        
-        # Create temporary folder for consolidation
-        consolidate_folder = tempfile.mkdtemp()
-        
-        # Copy files to consolidation folder
-        for f in session['files']:
-            src = os.path.join(session['folder'], f)
-            dst = os.path.join(consolidate_folder, f)
-            if os.path.exists(src):
-                shutil.copy2(src, dst)
-        
-        results = {
-            'success': True,
-            'files': {},
-            'downloads': []
-        }
-        
-        print(f"\n🔍 Consolidating session {session_id}")
-        print(f"   MCAP files found: {len(mcap_files)} - {mcap_files}")
-        print(f"   PR files found: {len(pr_files)} - {pr_files}")
-        print(f"   File type requested: {file_type}")
-        
-        # Process MCAP files
-        if file_type in ['mcap', 'both'] and mcap_files:
-            try:
-                # Create temporary folder with only mcap files
-                mcap_temp_folder = tempfile.mkdtemp()
-                for f in mcap_files:
-                    src = os.path.join(session['folder'], f)
-                    dst = os.path.join(mcap_temp_folder, f)
-                    if os.path.exists(src):
-                        shutil.copy2(src, dst)
-                
-                # Consolidate mcap data
-                consolidator_mcap = MarketCapConsolidator(mcap_temp_folder, file_type='mcap')
-                companies_count, dates_count = consolidator_mcap.load_and_consolidate_data()
-                
-                # Create output file
-                mcap_output_path = os.path.join(session['folder'], 'Market_Cap.xlsx')
-                consolidator_mcap.format_excel_output(mcap_output_path)
-
-                # Persist per-symbol values and averages
-                persist_consolidated_results(consolidator_mcap, 'mcap', source='scrape_session')
-                
-                # Prepare metadata
-                mcap_metadata = {
-                    'companies_count': companies_count,
-                    'dates_count': dates_count,
-                    'files_consolidated': len(mcap_files),
-                    'source': 'scrape_session',
-                    'data_type': 'market_cap',
-                    'consolidated_at': datetime.now().isoformat()
-                }
-                
-                results['files']['mcap'] = {
-                    'filename': 'Market_Cap.xlsx',
-                    'companies': companies_count,
-                    'dates': dates_count
-                }
-                
-                # Handle download for MCAP
-                if download_destination == 'google_drive':
-                    try:
-                        if google_drive_service is None or not google_drive_service.is_authenticated():
-                            return jsonify({'error': 'Google Drive not authenticated'}), 401
-                        
-                        file_id = google_drive_service.upload_file(
-                            mcap_output_path,
-                            'Market_Cap.xlsx',
-                            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                        )
-                        
-                        web_link = google_drive_service.get_file_link(file_id)
-                        excel_file_id = save_excel_to_database(mcap_output_path, 'Market_Cap.xlsx', mcap_metadata)
-                        
-                        results['downloads'].append({
-                            'type': 'mcap',
-                            'file_name': 'Market_Cap.xlsx',
-                            'file_id': file_id,
-                            'web_link': web_link,
-                            'database_id': str(excel_file_id)
-                        })
-                    except Exception as e:
-                        results['files']['mcap']['error'] = str(e)
-                
-                # Cleanup temp mcap folder
-                shutil.rmtree(mcap_temp_folder, ignore_errors=True)
-                print(f"✅ MCAP file created: {mcap_output_path}")
-                
-            except Exception as e:
-                print(f"❌ Error processing MCAP: {str(e)}")
-                results['files']['mcap'] = {'error': str(e)}
-        
-        # Process PR files
-        if file_type in ['pr', 'both'] and pr_files:
-            print(f"\n📊 Processing PR files...")
-            try:
-                # Create temporary folder with pr files and copy mcap files for cross-lookup filtering
-                pr_temp_folder = tempfile.mkdtemp()
-                for f in pr_files:
-                    src = os.path.join(session['folder'], f)
-                    dst = os.path.join(pr_temp_folder, f)
-                    if os.path.exists(src):
-                        shutil.copy2(src, dst)
-
-                # Also copy MCAP files so PR consolidator can filter by overlap
-                for f in mcap_files:
-                    src = os.path.join(session['folder'], f)
-                    dst = os.path.join(pr_temp_folder, f)
-                    if os.path.exists(src):
-                        shutil.copy2(src, dst)
-                
-                # Consolidate pr data (NET_TRDVAL)
-                consolidator_pr = MarketCapConsolidator(pr_temp_folder, file_type='pr')
-                companies_count_pr, dates_count_pr = consolidator_pr.load_and_consolidate_data()
-                
-                # Create output file
-                pr_output_path = os.path.join(session['folder'], 'Net_Traded_Value.xlsx')
-                consolidator_pr.format_excel_output(pr_output_path)
-
-                # Persist per-symbol values and averages
-                persist_consolidated_results(consolidator_pr, 'pr', source='scrape_session')
-                
-                # Prepare metadata
-                pr_metadata = {
-                    'companies_count': companies_count_pr,
-                    'dates_count': dates_count_pr,
-                    'files_consolidated': len(pr_files),
-                    'source': 'scrape_session',
-                    'data_type': 'net_traded_value',
-                    'consolidated_at': datetime.now().isoformat()
-                }
-                
-                results['files']['pr'] = {
-                    'filename': 'Net_Traded_Value.xlsx',
-                    'companies': companies_count_pr,
-                    'dates': dates_count_pr
-                }
-                
-                # Handle download for PR
-                if download_destination == 'google_drive':
-                    try:
-                        if google_drive_service is None or not google_drive_service.is_authenticated():
-                            return jsonify({'error': 'Google Drive not authenticated'}), 401
-                        
-                        file_id = google_drive_service.upload_file(
-                            pr_output_path,
-                            'Net_Traded_Value.xlsx',
-                            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                        )
-                        
-                        web_link = google_drive_service.get_file_link(file_id)
-                        excel_file_id = save_excel_to_database(pr_output_path, 'Net_Traded_Value.xlsx', pr_metadata)
-                        
-                        results['downloads'].append({
-                            'type': 'pr',
-                            'file_name': 'Net_Traded_Value.xlsx',
-                            'file_id': file_id,
-                            'web_link': web_link,
-                            'database_id': str(excel_file_id)
-                        })
-                    except Exception as e:
-                        results['files']['pr']['error'] = str(e)
-                
-                # Cleanup temp pr folder
-                shutil.rmtree(pr_temp_folder, ignore_errors=True)
-                print(f"✅ PR file created: {pr_output_path}")
-                
-            except Exception as e:
-                print(f"❌ Error processing PR: {str(e)}")
-                results['files']['pr'] = {'error': str(e)}
-        
-        # Handle local download (create zip if both files exist)
-        if download_destination == 'local':
-            mcap_output_path = os.path.join(session['folder'], 'Market_Cap.xlsx')
-            pr_output_path = os.path.join(session['folder'], 'Net_Traded_Value.xlsx')
-            mcap_avg_path = mcap_output_path.replace('.xlsx', '_Averages.xlsx')
-            pr_avg_path = pr_output_path.replace('.xlsx', '_Averages.xlsx')
-            
-            print(f"\n📦 Local download mode")
-            print(f"   MCAP file exists: {os.path.exists(mcap_output_path)}")
-            print(f"   PR file exists: {os.path.exists(pr_output_path)}")
-            
-            # If both files exist, create a zip
-            if os.path.exists(mcap_output_path) and os.path.exists(pr_output_path):
-                import zipfile as zf
-                zip_path = os.path.join(session['folder'], 'Market_Data.zip')
-                with zf.ZipFile(zip_path, 'w') as zipf:
-                    zipf.write(mcap_output_path, arcname='Market_Cap.xlsx')
-                    zipf.write(pr_output_path, arcname='Net_Traded_Value.xlsx')
-                    if os.path.exists(mcap_avg_path):
-                        zipf.write(mcap_avg_path, arcname='Market_Cap_Averages.xlsx')
-                    if os.path.exists(pr_avg_path):
-                        zipf.write(pr_avg_path, arcname='Net_Traded_Value_Averages.xlsx')
-                
-                # Save both to MongoDB
-                save_excel_to_database(mcap_output_path, 'Market_Cap.xlsx', {'type': 'market_cap'})
-                save_excel_to_database(pr_output_path, 'Net_Traded_Value.xlsx', {'type': 'net_traded_value'})
-                
-                # Return zip file
-                response = send_file(
-                    zip_path,
-                    mimetype='application/zip',
-                    as_attachment=True,
-                    download_name='Market_Data.zip'
-                )
-                cleanup_scrape_session(session_id)
-                shutil.rmtree(consolidate_folder, ignore_errors=True)
-                return response, 200
-            
-            # If only mcap file exists
-            elif os.path.exists(mcap_output_path):
-                save_excel_to_database(mcap_output_path, 'Market_Cap.xlsx', {'type': 'market_cap'})
-                response = send_file(
-                    mcap_output_path,
-                    mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    as_attachment=True,
-                    download_name='Market_Cap.xlsx'
-                )
-                cleanup_scrape_session(session_id)
-                shutil.rmtree(consolidate_folder, ignore_errors=True)
-                return response, 200
-            
-            # If only pr file exists
-            elif os.path.exists(pr_output_path):
-                save_excel_to_database(pr_output_path, 'Net_Traded_Value.xlsx', {'type': 'net_traded_value'})
-                response = send_file(
-                    pr_output_path,
-                    mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    as_attachment=True,
-                    download_name='Net_Traded_Value.xlsx'
-                )
-                cleanup_scrape_session(session_id)
-                shutil.rmtree(consolidate_folder, ignore_errors=True)
-                return response, 200
-        
-        # Cleanup after successful export
-        cleanup_scrape_session(session_id)
-        shutil.rmtree(consolidate_folder, ignore_errors=True)
-        
-        return jsonify(results), 200
-    
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/scrape-session/<session_id>/cleanup', methods=['POST'])
-def cleanup_session(session_id):
-    """
-    Manually cleanup/delete a scrape session
-    """
-    try:
-        if session_id not in SCRAPE_SESSIONS:
-            return jsonify({'error': 'Session not found'}), 404
-        
-        cleanup_scrape_session(session_id)
-        
-        return jsonify({
-            'success': True,
-            'message': f'Session {session_id} cleaned up'
-        }), 200
-    
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/api/download-nse-range', methods=['POST'])
 def download_nse_range():
     """
@@ -1137,21 +732,14 @@ def download_nse_range():
     Expected payload: {
         "start_date": "01-Dec-2025",  # Format: DD-Mon-YYYY
         "end_date": "05-Dec-2025",    # Format: DD-Mon-YYYY
-        "save_to_file": true/false,   # If false, temp stores; if true, saves permanently
         "refresh_mode": "missing_only" or "force"  # Optional, default missing_only
     }
-    Returns: {
-        "success": true,
-        "session_id": "...",  # If save_to_file is false
-        "summary": {...},       # counts and status per date/type
-        "entries": [...]        # per-day, per-type status
-    }
+    Returns summary and entries (no sessions; files saved to nosubject).
     """
     try:
         data = request.get_json()
         start_date_str = data.get('start_date', '')
         end_date_str = data.get('end_date', '')
-        save_to_file = data.get('save_to_file', True)
         refresh_mode = data.get('refresh_mode', 'missing_only')  # missing_only | force
 
         if refresh_mode not in ['missing_only', 'force']:
@@ -1182,11 +770,6 @@ def download_nse_range():
         
         if not trading_dates:
             return jsonify({'error': 'No trading days found in the selected range'}), 400
-        
-        # Create temporary session if not saving to file
-        session_id = None
-        if not save_to_file:
-            session_id = create_scrape_session()
         
         downloads_summary = {
             'total_requested': len(trading_dates),
@@ -1298,15 +881,9 @@ def download_nse_range():
             def _write_df(df, fname):
                 if df is None:
                     return False
-                if save_to_file:
-                    output_path = os.path.join(os.path.dirname(__file__), 'nosubject', fname)
-                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                    df.to_csv(output_path, index=False)
-                else:
-                    temp_path = os.path.join(SCRAPE_SESSIONS[session_id]['folder'], fname)
-                    df.to_csv(temp_path, index=False)
-                    if fname not in SCRAPE_SESSIONS[session_id]['files']:
-                        SCRAPE_SESSIONS[session_id]['files'].append(fname)
+                output_path = os.path.join(os.path.dirname(__file__), 'nosubject', fname)
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                df.to_csv(output_path, index=False)
                 return True
 
             # MCAP handling
@@ -1357,18 +934,8 @@ def download_nse_range():
                 })
                 downloads_summary['failed_count'] += 1
         
-        # Update session metadata if temp storage
-        if session_id:
-            SCRAPE_SESSIONS[session_id]['metadata'] = {
-                'start_date': start_date_str,
-                'end_date': end_date_str,
-                'type': 'range_download',
-                'total_files': len(SCRAPE_SESSIONS[session_id]['files'])
-            }
-        
         return jsonify({
             'success': True,
-            'session_id': session_id,
             'summary': {
                 'total_requested': downloads_summary['total_requested'],
                 'cached': downloads_summary['cached_count'],
@@ -1391,7 +958,6 @@ def nse_symbol_dashboard():
     Build a dashboard of impact cost, free float market cap, traded value, and index for symbols in MCAP files.
     Payload options:
     {
-        "session_id": "..."   # use in-memory scrape session mcap files
         "date": "03-Dec-2025" # use persisted nosubject/mcapDDMMYYYY.csv
         "start_date": "01-Dec-2025", "end_date": "05-Dec-2025" # optional range scan in nosubject
         "symbols": ["ABB", ...],  # optional explicit list
@@ -1400,39 +966,26 @@ def nse_symbol_dashboard():
     """
     try:
         data = request.get_json() or {}
-        session_id = data.get('session_id')
         date_str = data.get('date')
         start_date_str = data.get('start_date')
         end_date_str = data.get('end_date')
         save_to_file = data.get('save_to_file', True)
         provided_symbols = data.get('symbols') or []
-        top_n = data.get('top_n')
+        top_n = data.get('top_n', 1000)
         top_n_by = data.get('top_n_by') or 'mcap'
-        parallel_workers = data.get('parallel_workers', 10)
+        parallel_workers = data.get('parallel_workers', 25)
         chunk_size = data.get('chunk_size', 100)
         as_on = datetime.now().strftime('%Y-%m-%d')
         page = int(data.get('page', 1)) if str(data.get('page', '')).strip() != '' else 1
-        page_size = int(data.get('page_size', data.get('max_symbols', 150))) if str(data.get('page_size', '')).strip() != '' else int(data.get('max_symbols', 150))
-        page_size = max(10, min(page_size, 300))  # clamp to avoid huge calls
+        page_size = int(data.get('page_size', data.get('max_symbols', 1000))) if str(data.get('page_size', '')).strip() != '' else int(data.get('max_symbols', 1000))
+        page_size = max(10, min(page_size, 1000))  # allow up to 1000
 
         symbols = provided_symbols[:] if provided_symbols else []
         target_files = []
         output_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
         tag = None
 
-        if session_id:
-            if session_id not in SCRAPE_SESSIONS:
-                return jsonify({'error': 'Session not found or expired'}), 404
-            session_folder = SCRAPE_SESSIONS[session_id]['folder']
-            target_files = [
-                os.path.join(session_folder, f)
-                for f in os.listdir(session_folder)
-                if f.lower().startswith('mcap') and f.lower().endswith('.csv')
-            ]
-            output_dir = session_folder
-            tag = session_id[:8]
-
-        elif date_str:
+        if date_str:
             try:
                 date_obj = date_parser.parse(date_str)
             except Exception:
@@ -1457,11 +1010,11 @@ def nse_symbol_dashboard():
             symbols = collect_symbols_from_files(target_files)
 
         # Optionally limit to top N by averages from Mongo aggregates
-        if top_n and symbol_aggregates_collection is not None:
+        if symbol_aggregates_collection is not None:
             try:
-                top_n_val = int(top_n)
+                top_n_val = int(top_n) if str(top_n).strip() != '' else 1000
             except Exception:
-                top_n_val = None
+                top_n_val = 1000
             if top_n_val and top_n_val > 0:
                 try:
                     agg_docs = list(symbol_aggregates_collection.find({'type': top_n_by}).sort('average', -1).limit(top_n_val))
@@ -1501,6 +1054,9 @@ def nse_symbol_dashboard():
 
         fetcher = SymbolMetricsFetcher()
 
+        # Fetch primary_index from DB for the slice (no external calls for indices)
+        index_map = primary_index_map_from_db(symbols_slice)
+
         excel_path = None
         download_name = None
         if save_to_file:
@@ -1512,9 +1068,9 @@ def nse_symbol_dashboard():
 
         # Run in parallel batches to speed up large symbol lists
         try:
-            workers = int(parallel_workers) if str(parallel_workers).strip() != '' else 10
+            workers = int(parallel_workers) if str(parallel_workers).strip() != '' else 25
         except Exception:
-            workers = 10
+            workers = 25
         try:
             chunk_val = int(chunk_size) if str(chunk_size).strip() != '' else 100
         except Exception:
@@ -1536,14 +1092,15 @@ def nse_symbol_dashboard():
         for row in result.get('rows', []):
             row = dict(row)
             row['as_on'] = row.get('as_on') or as_on
+            sym = row.get('symbol')
+            # Prefer DB-sourced primary_index if available
+            if sym in index_map:
+                row['primary_index'] = index_map[sym]
             upsert_symbol_metrics(row, source='symbol_dashboard')
 
         download_url = None
         if excel_path and download_name:
-            if session_id:
-                download_url = f"/api/nse-symbol-dashboard/download?file={download_name}&session_id={session_id}"
-            else:
-                download_url = f"/api/nse-symbol-dashboard/download?file={download_name}"
+            download_url = f"/api/nse-symbol-dashboard/download?file={download_name}"
 
         return jsonify({
             'success': True,
@@ -1567,19 +1124,13 @@ def nse_symbol_dashboard():
 @app.route('/api/nse-symbol-dashboard/download', methods=['GET'])
 def download_symbol_dashboard():
     file_name = request.args.get('file')
-    session_id = request.args.get('session_id')
 
     if not file_name:
         return jsonify({'error': 'file parameter is required'}), 400
 
     safe_name = secure_filename(file_name)
 
-    if session_id:
-        if session_id not in SCRAPE_SESSIONS:
-            return jsonify({'error': 'Session not found'}), 404
-        base_dir = SCRAPE_SESSIONS[session_id]['folder']
-    else:
-        base_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
+    base_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
 
     file_path = os.path.join(base_dir, safe_name)
 
@@ -1631,6 +1182,102 @@ def dashboard_data():
     except Exception as e:
         print(f"Error fetching dashboard data: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/update-indices', methods=['POST'])
+def update_indices():
+    if symbol_metrics_collection is None:
+        return jsonify({'error': 'Database not connected'}), 500
+
+    try:
+        # Build primary index map only from existing Mongo data (no NSE API calls)
+        symbol_index_map = {}
+        cursor = symbol_metrics_collection.find({}, {
+            'symbol': 1,
+            'primary_index': 1,
+            'index': 1,
+            'indexList': 1,
+            'updated_at': 1,
+            'as_on': 1
+        }).sort([
+            ('updated_at', -1),
+            ('as_on', -1)
+        ])
+
+        for doc in cursor:
+            sym = doc.get('symbol')
+            if not sym or sym in symbol_index_map:
+                continue
+            idx = doc.get('primary_index') or doc.get('index')
+            if not idx:
+                idx_list = doc.get('indexList')
+                if isinstance(idx_list, (list, tuple)) and idx_list:
+                    idx = idx_list[0]
+            if idx:
+                symbol_index_map[sym] = idx
+
+        if not symbol_index_map:
+            return jsonify({'error': 'No index data found in database'}), 404
+
+        bulk_ops = [
+            UpdateOne(
+                {'symbol': symbol},
+                {'$set': {'primary_index': primary_index, 'updated_at': datetime.now().isoformat()}},
+                upsert=True
+            )
+            for symbol, primary_index in symbol_index_map.items()
+        ]
+
+        if bulk_ops:
+            symbol_metrics_collection.bulk_write(bulk_ops, ordered=False)
+
+        csv_buffer = StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerow(['symbol', 'primary_index'])
+        for sym, idx in sorted(symbol_index_map.items()):
+            writer.writerow([sym, idx])
+        csv_content = csv_buffer.getvalue()
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        file_name = f'indices_{timestamp}.csv'
+        INDEX_FILES['latest'] = {'name': file_name, 'content': csv_content}
+
+        # Optional persistent log to disk for history
+        try:
+            output_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
+            os.makedirs(output_dir, exist_ok=True)
+            file_path = os.path.join(output_dir, file_name)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(csv_content)
+        except Exception as log_exc:
+            print(f"⚠️ Failed to persist indices CSV: {log_exc}")
+
+        return jsonify({
+            'message': 'Indices updated from DB',
+            'count': len(symbol_index_map),
+            'errors': [],
+            'download_path': '/api/download-indices',
+            'file_saved': file_name
+        }), 200
+    except Exception as e:
+        print(f"Error in update_indices: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/download-indices', methods=['GET'])
+def download_indices():
+    cached = INDEX_FILES.get('latest')
+    if not cached:
+        return jsonify({'error': 'No index file available. Run update first.'}), 404
+    buf = BytesIO()
+    buf.write(cached['content'].encode('utf-8'))
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name=cached['name']
+    )
 
 @app.route('/api/excel-results', methods=['GET'])
 def get_excel_results():
@@ -1901,6 +1548,174 @@ def consolidate():
             if os.path.exists(request_folder):
                 shutil.rmtree(request_folder)
     
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/consolidate-saved', methods=['POST'])
+def consolidate_saved():
+    """
+    Consolidate saved NSE CSVs from Backend/nosubject into Excel.
+
+    Payload (JSON):
+    {
+        "date": "03-Dec-2025"  # optional, single date
+        "start_date": "01-Dec-2025", "end_date": "05-Dec-2025"  # optional range
+        "file_type": "both" | "mcap" | "pr"  # default both
+        "fast_mode": true/false  # default true, skip DB writes when true
+    }
+
+    Response: Excel file (zip when both MCAP and PR are produced).
+    """
+    try:
+        payload = request.get_json() or {}
+        date_str = payload.get('date')
+        start_date_str = payload.get('start_date')
+        end_date_str = payload.get('end_date')
+        file_type = payload.get('file_type', 'both')
+        # Default to persistence on (fast_mode=False) so aggregates for MCAP/PR get stored
+        fast_mode = payload.get('fast_mode', False)
+
+        if file_type not in ['mcap', 'pr', 'both']:
+            return jsonify({'error': 'Invalid file_type (mcap, pr, or both)'}), 400
+
+        # Parse date filters
+        date_dt = None
+        start_dt = None
+        end_dt = None
+        try:
+            if date_str:
+                date_dt = date_parser.parse(date_str)
+            if start_date_str and end_date_str:
+                start_dt = date_parser.parse(start_date_str)
+                end_dt = date_parser.parse(end_date_str)
+                if start_dt > end_dt:
+                    return jsonify({'error': 'start_date cannot be after end_date'}), 400
+        except Exception:
+            return jsonify({'error': 'Invalid date format. Use DD-Mon-YYYY (e.g., 03-Dec-2025)'}), 400
+
+        base_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
+        os.makedirs(base_dir, exist_ok=True)
+
+        def _file_dt(path):
+            name = os.path.basename(path)
+            match = re.search(r'(?:mcap|pr)(\d{2})(\d{2})(\d{4})', name, re.IGNORECASE)
+            if not match:
+                return None
+            day, month, year = match.groups()
+            try:
+                return datetime(int(year), int(month), int(day))
+            except Exception:
+                return None
+
+        def _in_scope(path):
+            dt = _file_dt(path)
+            if dt is None:
+                return False
+            if date_dt and dt.date() != date_dt.date():
+                return False
+            if start_dt and end_dt and not (start_dt.date() <= dt.date() <= end_dt.date()):
+                return False
+            return True
+
+        mcap_files = [p for p in glob.glob(os.path.join(base_dir, 'mcap*.csv')) if _in_scope(p)]
+        pr_files = [p for p in glob.glob(os.path.join(base_dir, 'pr*.csv')) if _in_scope(p)]
+
+        if file_type in ['mcap', 'both'] and not mcap_files:
+            return jsonify({'error': 'No MCAP CSV files found for the selected date(s)'}), 404
+        if file_type in ['pr', 'both'] and not pr_files:
+            return jsonify({'error': 'No PR CSV files found for the selected date(s)'}), 404
+
+        work_dir = tempfile.mkdtemp()
+
+        def _copy_selected(paths):
+            for src in paths:
+                dst = os.path.join(work_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+
+        if file_type in ['mcap', 'both']:
+            _copy_selected(mcap_files)
+        if file_type in ['pr', 'both']:
+            _copy_selected(pr_files)
+
+        results = {}
+
+        # Process MCAP
+        mcap_output_path = None
+        if file_type in ['mcap', 'both'] and mcap_files:
+            try:
+                consolidator_mcap = MarketCapConsolidator(work_dir, file_type='mcap')
+                companies_count, dates_count = consolidator_mcap.load_and_consolidate_data()
+                mcap_output_path = os.path.join(work_dir, 'Market_Cap.xlsx')
+                consolidator_mcap.format_excel_output(mcap_output_path)
+                if not fast_mode:
+                    persist_consolidated_results(consolidator_mcap, 'mcap', source='saved_files')
+                results['mcap'] = {
+                    'companies': companies_count,
+                    'dates': dates_count,
+                    'files': len(mcap_files)
+                }
+                # keep a copy in nosubject for future reuse
+                shutil.copy2(mcap_output_path, os.path.join(base_dir, 'Market_Cap.xlsx'))
+            except Exception as exc:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                return jsonify({'error': f'Failed to consolidate MCAP: {exc}'}), 500
+
+        # Process PR
+        pr_output_path = None
+        if file_type in ['pr', 'both'] and pr_files:
+            try:
+                consolidator_pr = MarketCapConsolidator(work_dir, file_type='pr')
+                companies_count_pr, dates_count_pr = consolidator_pr.load_and_consolidate_data()
+                pr_output_path = os.path.join(work_dir, 'Net_Traded_Value.xlsx')
+                consolidator_pr.format_excel_output(pr_output_path)
+                if not fast_mode:
+                    persist_consolidated_results(consolidator_pr, 'pr', source='saved_files')
+                results['pr'] = {
+                    'companies': companies_count_pr,
+                    'dates': dates_count_pr,
+                    'files': len(pr_files)
+                }
+                shutil.copy2(pr_output_path, os.path.join(base_dir, 'Net_Traded_Value.xlsx'))
+            except Exception as exc:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                return jsonify({'error': f'Failed to consolidate PR: {exc}'}), 500
+
+        # Prepare response
+        response = None
+        if mcap_output_path and pr_output_path:
+            zip_path = os.path.join(work_dir, 'Market_Data.zip')
+            with zipfile.ZipFile(zip_path, 'w') as zipf:
+                zipf.write(mcap_output_path, arcname='Market_Cap.xlsx')
+                zipf.write(pr_output_path, arcname='Net_Traded_Value.xlsx')
+            response = send_file(
+                zip_path,
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name='Market_Data.zip'
+            )
+        elif mcap_output_path:
+            response = send_file(
+                mcap_output_path,
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                as_attachment=True,
+                download_name='Market_Cap.xlsx'
+            )
+        elif pr_output_path:
+            response = send_file(
+                pr_output_path,
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                as_attachment=True,
+                download_name='Net_Traded_Value.xlsx'
+            )
+        else:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            return jsonify({'error': 'No output generated'}), 500
+
+        # ensure temp cleanup after response is sent
+        response.call_on_close(lambda: shutil.rmtree(work_dir, ignore_errors=True))
+        return response
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
