@@ -28,6 +28,7 @@ from google_drive_service import GoogleDriveService
 from consolidate_marketcap import MarketCapConsolidator
 from nse_symbol_metrics import SymbolMetricsFetcher
 from urllib.parse import quote_plus
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 CORS(app)
@@ -637,7 +638,8 @@ def download_nse_data():
                 if pr_file:
                     try:
                         csv_content = zip_ref.read(pr_file)
-                        pr_df = pd.read_csv(BytesIO(csv_content))
+                        # Some PR files have inconsistent columns; be lenient and skip bad lines.
+                        pr_df = pd.read_csv(BytesIO(csv_content), on_bad_lines='skip', engine='python')
                         pr_df.columns = pr_df.columns.str.strip()
                         print(f"PR CSV loaded. Columns: {pr_df.columns.tolist()}")
                         print(f"PR Total records: {len(pr_df)}")
@@ -741,6 +743,7 @@ def download_nse_range():
         start_date_str = data.get('start_date', '')
         end_date_str = data.get('end_date', '')
         refresh_mode = data.get('refresh_mode', 'missing_only')  # missing_only | force
+        parallel_workers = int(data.get('parallel_workers', 10) or 10)
 
         if refresh_mode not in ['missing_only', 'force']:
             return jsonify({'error': 'Invalid refresh_mode. Use missing_only or force'}), 400
@@ -780,12 +783,20 @@ def download_nse_range():
             'errors': []
         }
 
-        print(f"Downloading NSE data for {len(trading_dates)} trading days (mode={refresh_mode})...")
+        print(f"Downloading NSE data for {len(trading_dates)} trading days (mode={refresh_mode}, workers={parallel_workers})...")
 
-        for trade_date in trading_dates:
+        def process_trade_date(index, trade_date):
             nse_date_formatted = trade_date.strftime('%d-%b-%Y')
             filename_date = trade_date.strftime('%d%m%Y')
             date_iso = _normalize_iso_date(trade_date)
+
+            result = {
+                'entries': [],
+                'errors': [],
+                'cached_count': 0,
+                'fetched_count': 0,
+                'failed_count': 0
+            }
 
             cached_mcap = None if refresh_mode == 'force' else get_cached_csv(date_iso, 'mcap')
             cached_pr = None if refresh_mode == 'force' else get_cached_csv(date_iso, 'pr')
@@ -796,7 +807,6 @@ def download_nse_range():
             mcap_df = cached_mcap['df'] if cached_mcap else None
             pr_df = cached_pr['df'] if cached_pr else None
 
-            # Download only if any missing or force
             if need_mcap or need_pr:
                 try:
                     api_url = "https://www.nseindia.com/api/reports"
@@ -818,12 +828,12 @@ def download_nse_range():
 
                     response = requests.get(api_url, params=params, headers=headers, timeout=30)
                     if response.status_code != 200:
-                        downloads_summary['errors'].append({
+                        result['errors'].append({
                             'date': nse_date_formatted,
                             'error': f'NSE API error: {response.status_code}'
                         })
-                        downloads_summary['failed_count'] += 1
-                        continue
+                        result['failed_count'] += 1
+                        return index, result
 
                     zip_data = BytesIO(response.content)
                     with zipfile.ZipFile(zip_data, 'r') as zip_ref:
@@ -837,7 +847,6 @@ def download_nse_range():
                             if file.lower().startswith('pr') and file.lower().endswith('.csv'):
                                 pr_file = file
 
-                        # fallback: bhavcopy as mcap
                         if not mcap_file:
                             for file in file_list:
                                 if file.lower().endswith('.csv') and ('bhav' in file.lower() or file.lower().startswith('bh')):
@@ -851,7 +860,7 @@ def download_nse_range():
                                 mcap_df.columns = mcap_df.columns.str.strip()
                                 put_cached_csv(date_iso, 'mcap', mcap_df, source='nse')
                             except Exception as e:
-                                downloads_summary['errors'].append({
+                                result['errors'].append({
                                     'date': nse_date_formatted,
                                     'type': 'mcap',
                                     'error': f'Error reading MCAP: {e}'
@@ -860,24 +869,24 @@ def download_nse_range():
                         if need_pr and pr_file:
                             try:
                                 csv_content = zip_ref.read(pr_file)
-                                pr_df = pd.read_csv(BytesIO(csv_content))
+                                # Some PR files have inconsistent columns; be lenient and skip bad lines.
+                                pr_df = pd.read_csv(BytesIO(csv_content), on_bad_lines='skip', engine='python')
                                 pr_df.columns = pr_df.columns.str.strip()
                                 put_cached_csv(date_iso, 'pr', pr_df, source='nse')
                             except Exception as e:
-                                downloads_summary['errors'].append({
+                                result['errors'].append({
                                     'date': nse_date_formatted,
                                     'type': 'pr',
                                     'error': f'Error reading PR: {e}'
                                 })
                 except Exception as e:
-                    downloads_summary['errors'].append({
+                    result['errors'].append({
                         'date': nse_date_formatted,
                         'error': f'Error fetching ZIP: {str(e)}'
                     })
-                    downloads_summary['failed_count'] += 1
-                    continue
+                    result['failed_count'] += 1
+                    return index, result
 
-            # Write files from cache/download to storage or session
             def _write_df(df, fname):
                 if df is None:
                     return False
@@ -886,12 +895,11 @@ def download_nse_range():
                 df.to_csv(output_path, index=False)
                 return True
 
-            # MCAP handling
             if mcap_df is not None:
                 fname_mcap = f"mcap{filename_date}.csv"
                 _write_df(mcap_df, fname_mcap)
                 status = 'cached' if cached_mcap and refresh_mode != 'force' else 'fetched'
-                downloads_summary['entries'].append({
+                result['entries'].append({
                     'date': nse_date_formatted,
                     'type': 'mcap',
                     'status': status,
@@ -899,23 +907,22 @@ def download_nse_range():
                     'records': len(mcap_df)
                 })
                 if status == 'cached':
-                    downloads_summary['cached_count'] += 1
+                    result['cached_count'] += 1
                 else:
-                    downloads_summary['fetched_count'] += 1
+                    result['fetched_count'] += 1
             else:
-                downloads_summary['entries'].append({
+                result['entries'].append({
                     'date': nse_date_formatted,
                     'type': 'mcap',
                     'status': 'missing'
                 })
-                downloads_summary['failed_count'] += 1
+                result['failed_count'] += 1
 
-            # PR handling
             if pr_df is not None:
                 fname_pr = f"pr{filename_date}.csv"
                 _write_df(pr_df, fname_pr)
                 status = 'cached' if cached_pr and refresh_mode != 'force' else 'fetched'
-                downloads_summary['entries'].append({
+                result['entries'].append({
                     'date': nse_date_formatted,
                     'type': 'pr',
                     'status': status,
@@ -923,17 +930,52 @@ def download_nse_range():
                     'records': len(pr_df)
                 })
                 if status == 'cached':
-                    downloads_summary['cached_count'] += 1
+                    result['cached_count'] += 1
                 else:
-                    downloads_summary['fetched_count'] += 1
+                    result['fetched_count'] += 1
             else:
-                downloads_summary['entries'].append({
+                result['entries'].append({
                     'date': nse_date_formatted,
                     'type': 'pr',
                     'status': 'missing'
                 })
-                downloads_summary['failed_count'] += 1
-        
+                result['failed_count'] += 1
+
+            return index, result
+
+        futures = {}
+        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            for idx, trade_date in enumerate(trading_dates):
+                futures[executor.submit(process_trade_date, idx, trade_date)] = idx
+
+            results_by_index = {}
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    idx, res = future.result()
+                    results_by_index[idx] = res
+                except Exception as exc:
+                    results_by_index[idx] = {
+                        'entries': [],
+                        'errors': [{
+                            'date': trading_dates[idx].strftime('%d-%b-%Y'),
+                            'error': f'Worker error: {exc}'
+                        }],
+                        'cached_count': 0,
+                        'fetched_count': 0,
+                        'failed_count': 1
+                    }
+
+        for idx in range(len(trading_dates)):
+            res = results_by_index.get(idx, None)
+            if res is None:
+                continue
+            downloads_summary['cached_count'] += res['cached_count']
+            downloads_summary['fetched_count'] += res['fetched_count']
+            downloads_summary['failed_count'] += res['failed_count']
+            downloads_summary['entries'].extend(res['entries'])
+            downloads_summary['errors'].extend(res['errors'])
+
         return jsonify({
             'success': True,
             'summary': {
@@ -941,7 +983,8 @@ def download_nse_range():
                 'cached': downloads_summary['cached_count'],
                 'fetched': downloads_summary['fetched_count'],
                 'failed': downloads_summary['failed_count'],
-                'refresh_mode': refresh_mode
+                'refresh_mode': refresh_mode,
+                'parallel_workers': parallel_workers
             },
             'entries': downloads_summary['entries'],
             'errors': downloads_summary['errors']
