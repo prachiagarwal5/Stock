@@ -1,6 +1,8 @@
 import time
 import requests
 import pandas as pd
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 
 class SymbolMetricsFetcher:
@@ -8,18 +10,25 @@ class SymbolMetricsFetcher:
     HOME_URL = "https://www.nseindia.com"
 
     def __init__(self, user_agent=None, timeout=10):
-        self.session = requests.Session()
+        self.session = self._make_session(user_agent)
         self.timeout = timeout
         self.headers = {
             'User-Agent': user_agent or 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
             'Accept': 'application/json,text/plain,*/*',
             'Connection': 'keep-alive'
         }
-        self._prime_cookies()
+        self._prime_cookies(self.session)
 
-    def _prime_cookies(self):
+    def _make_session(self, user_agent=None):
+        sess = requests.Session()
+        if user_agent:
+            sess.headers.update({'User-Agent': user_agent})
+        return sess
+
+    def _prime_cookies(self, session=None):
+        sess = session or self.session
         try:
-            self.session.get(self.HOME_URL, headers=self.headers, timeout=10)
+            sess.get(self.HOME_URL, headers=self.headers, timeout=10)
         except Exception as exc:  # pragma: no cover - best effort warmup
             print(f"⚠️ NSE cookie warmup failed: {exc}")
 
@@ -31,14 +40,15 @@ class SymbolMetricsFetcher:
         except Exception:
             return None
 
-    def _call_symbol(self, symbol, series):
+    def _call_symbol(self, symbol, series, session=None):
+        sess = session or self.session
         params = {
             'functionName': 'getSymbolData',
             'marketType': 'N',
             'series': series,
             'symbol': symbol
         }
-        resp = self.session.get(self.BASE_URL, params=params, headers=self.headers, timeout=self.timeout)
+        resp = sess.get(self.BASE_URL, params=params, headers=self.headers, timeout=self.timeout)
         if resp.status_code != 200:
             raise ValueError(f"NSE getSymbolData error {resp.status_code} for {symbol} ({series})")
         try:
@@ -51,14 +61,18 @@ class SymbolMetricsFetcher:
             raise ValueError(f"{message} for {symbol} ({series})")
         return equity_list[0] or {}
 
-    def fetch_symbol_data(self, symbol, series='EQ'):
+    def fetch_symbol_data(self, symbol, series='EQ', as_of=None, session=None):
+        as_on = as_of or datetime.now().strftime('%Y-%m-%d')
+        if isinstance(as_on, datetime):
+            as_on = as_on.strftime('%Y-%m-%d')
+
         fallback_series = [series] + [s for s in ['BE', 'BZ', 'SM', 'ST', 'E1', 'E2'] if s != series]
         last_exc = None
         data = None
         used_series = series
         for ser in fallback_series:
             try:
-                data = self._call_symbol(symbol, ser)
+                data = self._call_symbol(symbol, ser, session=session)
                 used_series = ser
                 break
             except ValueError as exc:
@@ -114,21 +128,42 @@ class SymbolMetricsFetcher:
             'last_price': self._to_float(data.get('lastPrice') or trade_info.get('lastPrice')),
             'listingDate': sec_info.get('listingDate'),
             'basicIndustry': sec_info.get('basicIndustry') or data.get('industryInfo'),
-            'applicableMargin': data.get('applicableMargin') or trade_info.get('applicableMargin')
+            'applicableMargin': data.get('applicableMargin') or trade_info.get('applicableMargin'),
+            'as_on': as_on
         }
         return result
 
-    def fetch_many(self, symbols, sleep_between=0.05, max_symbols=None):
+    def fetch_many(self, symbols, sleep_between=0.05, max_symbols=None, as_of=None, parallel=True, max_workers=10, chunk_size=100):
         rows = []
         errors = []
         capped_symbols = symbols[:max_symbols] if max_symbols else symbols
-        for sym in capped_symbols:
-            try:
-                rows.append(self.fetch_symbol_data(sym))
-            except Exception as exc:
-                errors.append({'symbol': sym, 'error': str(exc)})
-            if sleep_between:
-                time.sleep(sleep_between)
+
+        if parallel and max_workers and max_workers > 1:
+            def _worker(sym):
+                # Fresh session per thread to avoid session locking
+                sess = self._make_session()
+                self._prime_cookies(sess)
+                try:
+                    return ('ok', self.fetch_symbol_data(sym, as_of=as_of, session=sess))
+                except Exception as exc:
+                    return ('err', {'symbol': sym, 'error': str(exc)})
+
+            for i in range(0, len(capped_symbols), chunk_size or len(capped_symbols)):
+                batch = capped_symbols[i:i + (chunk_size or len(capped_symbols))]
+                with ThreadPoolExecutor(max_workers=min(max_workers, len(batch))) as executor:
+                    for status, payload in executor.map(_worker, batch):
+                        if status == 'ok':
+                            rows.append(payload)
+                        else:
+                            errors.append(payload)
+        else:
+            for sym in capped_symbols:
+                try:
+                    rows.append(self.fetch_symbol_data(sym, as_of=as_of))
+                except Exception as exc:
+                    errors.append({'symbol': sym, 'error': str(exc)})
+                if sleep_between:
+                    time.sleep(sleep_between)
 
         if max_symbols and len(symbols) > max_symbols:
             errors.append({
@@ -138,8 +173,8 @@ class SymbolMetricsFetcher:
 
         return rows, errors
 
-    def build_dashboard(self, symbols, excel_path=None, max_symbols=None):
-        rows, errors = self.fetch_many(symbols, max_symbols=max_symbols)
+    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=10, chunk_size=100):
+        rows, errors = self.fetch_many(symbols, max_symbols=max_symbols, as_of=as_of, parallel=parallel, max_workers=max_workers, chunk_size=chunk_size)
 
         df = pd.DataFrame(rows)
         numeric_fields = ['impact_cost', 'free_float_mcap', 'total_market_cap', 'total_traded_value', 'last_price']

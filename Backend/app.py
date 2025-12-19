@@ -40,12 +40,18 @@ try:
     db = mongo_client['Stocks']
     excel_results_collection = db['excel_results']
     bhavcache_collection = db['bhavcache']
+    symbol_daily_collection = db['symbol_daily']  # per-symbol, per-date values (mcap/pr)
+    symbol_aggregates_collection = db['symbol_aggregates']  # per-symbol averages
+    symbol_metrics_collection = db['symbol_metrics']  # Symbol dashboard metrics
     print("✅ MongoDB connected successfully")
 except Exception as e:
     print(f"⚠️ MongoDB connection failed: {e}")
     db = None
     excel_results_collection = None
     bhavcache_collection = None
+    symbol_daily_collection = None
+    symbol_aggregates_collection = None
+    symbol_metrics_collection = None
 
 # Initialize Google Drive Service
 google_drive_service = None
@@ -92,6 +98,123 @@ def convert_nan_to_none(obj):
     elif isinstance(obj, pd.DataFrame):
         return obj.where(pd.notna(obj), None).values.tolist()
     return obj
+
+
+def _safe_float(val):
+    try:
+        if val in (None, '', 'NA', 'NaN'):
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def upsert_symbol_daily(symbol, company_name, date_iso, data_type, value, source='consolidation', extra=None):
+    if symbol_daily_collection is None or not date_iso:
+        return
+    try:
+        payload = {
+            'symbol': symbol,
+            'company_name': company_name,
+            'date': date_iso,
+            'type': data_type,
+            'value': _safe_float(value),
+            'source': source,
+            'updated_at': datetime.now().isoformat()
+        }
+        if extra:
+            payload.update(extra)
+        symbol_daily_collection.update_one(
+            {'symbol': symbol, 'date': date_iso, 'type': data_type},
+            {'$set': payload},
+            upsert=True
+        )
+    except Exception as exc:
+        print(f"⚠️ Failed to upsert symbol_daily for {symbol} {date_iso} {data_type}: {exc}")
+
+
+def upsert_symbol_aggregate(symbol, company_name, data_type, days_with_data, average_value, date_range=None, source='consolidation'):
+    if symbol_aggregates_collection is None:
+        return
+    try:
+        payload = {
+            'symbol': symbol,
+            'company_name': company_name,
+            'type': data_type,
+            'days_with_data': int(days_with_data or 0),
+            'average': _safe_float(average_value),
+            'date_range': date_range,
+            'source': source,
+            'updated_at': datetime.now().isoformat()
+        }
+        symbol_aggregates_collection.update_one(
+            {'symbol': symbol, 'type': data_type, 'date_range': date_range},
+            {'$set': payload},
+            upsert=True
+        )
+    except Exception as exc:
+        print(f"⚠️ Failed to upsert symbol_aggregate for {symbol} {data_type}: {exc}")
+
+
+def upsert_symbol_metrics(row, source='nse_symbol_metrics'):
+    if symbol_metrics_collection is None:
+        return
+    try:
+        symbol = str(row.get('symbol') or '').strip()
+        if not symbol:
+            return
+        payload = dict(row)
+        as_on = payload.get('as_on') or payload.get('date') or datetime.now().strftime('%Y-%m-%d')
+        if isinstance(as_on, datetime):
+            as_on = as_on.strftime('%Y-%m-%d')
+        payload['as_on'] = as_on
+        payload['source'] = source
+        payload['updated_at'] = datetime.now().isoformat()
+        symbol_metrics_collection.update_one(
+            {'symbol': symbol, 'as_on': as_on},
+            {'$set': payload},
+            upsert=True
+        )
+    except Exception as exc:
+        print(f"⚠️ Failed to upsert symbol_metrics for {row.get('symbol')}: {exc}")
+
+
+def persist_consolidated_results(consolidator, data_type, source='consolidation'):
+    """Store per-symbol per-date values and averages into MongoDB."""
+    if consolidator is None:
+        return
+    try:
+        date_cols = [d[0] for d in consolidator.dates_list]
+        date_range = None
+        if date_cols:
+            try:
+                start_iso = datetime.strptime(date_cols[0], '%d-%m-%Y').strftime('%Y-%m-%d')
+                end_iso = datetime.strptime(date_cols[-1], '%d-%m-%Y').strftime('%Y-%m-%d')
+                date_range = {'start': start_iso, 'end': end_iso}
+            except Exception:
+                date_range = None
+
+        for _, row in consolidator.df_consolidated.iterrows():
+            symbol = str(row.get('Symbol') or '').strip()
+            company_name = str(row.get('Company Name') or '').strip()
+            if not symbol:
+                continue
+
+            avg_val = row.get(consolidator.avg_col)
+            days_val = row.get(consolidator.days_col)
+            upsert_symbol_aggregate(symbol, company_name, data_type, days_val, avg_val, date_range, source=source)
+
+            for date_str in date_cols:
+                val = row.get(date_str)
+                if val in (None, ''):
+                    continue
+                try:
+                    date_iso = datetime.strptime(date_str, '%d-%m-%Y').strftime('%Y-%m-%d')
+                except Exception:
+                    date_iso = None
+                upsert_symbol_daily(symbol, company_name, date_iso, data_type, val, source=source)
+    except Exception as exc:
+        print(f"⚠️ Failed to persist consolidated results for {data_type}: {exc}")
 
 
 def _parse_mcap_date_from_filename(filename):
@@ -783,6 +906,9 @@ def consolidate_scrape_session(session_id):
                 # Create output file
                 mcap_output_path = os.path.join(session['folder'], 'Market_Cap.xlsx')
                 consolidator_mcap.format_excel_output(mcap_output_path)
+
+                # Persist per-symbol values and averages
+                persist_consolidated_results(consolidator_mcap, 'mcap', source='scrape_session')
                 
                 # Prepare metadata
                 mcap_metadata = {
@@ -859,6 +985,9 @@ def consolidate_scrape_session(session_id):
                 # Create output file
                 pr_output_path = os.path.join(session['folder'], 'Net_Traded_Value.xlsx')
                 consolidator_pr.format_excel_output(pr_output_path)
+
+                # Persist per-symbol values and averages
+                persist_consolidated_results(consolidator_pr, 'pr', source='scrape_session')
                 
                 # Prepare metadata
                 pr_metadata = {
@@ -1277,6 +1406,11 @@ def nse_symbol_dashboard():
         end_date_str = data.get('end_date')
         save_to_file = data.get('save_to_file', True)
         provided_symbols = data.get('symbols') or []
+        top_n = data.get('top_n')
+        top_n_by = data.get('top_n_by') or 'mcap'
+        parallel_workers = data.get('parallel_workers', 10)
+        chunk_size = data.get('chunk_size', 100)
+        as_on = datetime.now().strftime('%Y-%m-%d')
         page = int(data.get('page', 1)) if str(data.get('page', '')).strip() != '' else 1
         page_size = int(data.get('page_size', data.get('max_symbols', 150))) if str(data.get('page_size', '')).strip() != '' else int(data.get('max_symbols', 150))
         page_size = max(10, min(page_size, 300))  # clamp to avoid huge calls
@@ -1322,6 +1456,21 @@ def nse_symbol_dashboard():
         if not symbols:
             symbols = collect_symbols_from_files(target_files)
 
+        # Optionally limit to top N by averages from Mongo aggregates
+        if top_n and symbol_aggregates_collection is not None:
+            try:
+                top_n_val = int(top_n)
+            except Exception:
+                top_n_val = None
+            if top_n_val and top_n_val > 0:
+                try:
+                    agg_docs = list(symbol_aggregates_collection.find({'type': top_n_by}).sort('average', -1).limit(top_n_val))
+                    agg_symbols = [doc.get('symbol') for doc in agg_docs if doc.get('symbol')]
+                    if agg_symbols:
+                        symbols = agg_symbols
+                except Exception as exc:
+                    print(f"⚠️ Unable to fetch top {top_n_val} symbols by {top_n_by}: {exc}")
+
         if not symbols:
             return jsonify({'error': 'No symbols found. Provide symbols or download MCAP first.'}), 400
 
@@ -1332,6 +1481,18 @@ def nse_symbol_dashboard():
         if total_symbols == 0:
             return jsonify({'error': 'No symbols found. Provide symbols or download MCAP first.'}), 400
 
+        # If top_n provided, override pagination to fetch that many symbols in one batch
+        if top_n:
+            try:
+                top_n_val = int(top_n)
+            except Exception:
+                top_n_val = None
+            if top_n_val and top_n_val > 0:
+                symbols = symbols[:top_n_val]
+                total_symbols = len(symbols)
+                page = 1
+                page_size = max(page_size, top_n_val)
+        
         total_pages = max(1, math.ceil(total_symbols / page_size))
         page = max(1, min(page, total_pages))
         start_idx = (page - 1) * page_size
@@ -1347,7 +1508,35 @@ def nse_symbol_dashboard():
             download_name = f"Symbol_Dashboard_{tag or 'latest'}.xlsx"
             excel_path = os.path.join(output_dir, download_name)
 
-        result = fetcher.build_dashboard(symbols_slice, excel_path=excel_path, max_symbols=None)
+        print(f"[symbol-dashboard] symbols_total={total_symbols} slice={len(symbols_slice)} top_n={top_n} by={top_n_by} workers={parallel_workers} chunk={chunk_size}")
+
+        # Run in parallel batches to speed up large symbol lists
+        try:
+            workers = int(parallel_workers) if str(parallel_workers).strip() != '' else 10
+        except Exception:
+            workers = 10
+        try:
+            chunk_val = int(chunk_size) if str(chunk_size).strip() != '' else 100
+        except Exception:
+            chunk_val = 100
+
+        result = fetcher.build_dashboard(
+            symbols_slice,
+            excel_path=excel_path,
+            max_symbols=None,
+            as_of=as_on,
+            parallel=True,
+            max_workers=max(1, min(workers, 32)),
+            chunk_size=max(1, chunk_val)
+        )
+
+        print(f"[symbol-dashboard] completed fetch rows={len(result.get('rows', []))} errors={len(result.get('errors', []))}")
+
+        # Persist symbol metrics
+        for row in result.get('rows', []):
+            row = dict(row)
+            row['as_on'] = row.get('as_on') or as_on
+            upsert_symbol_metrics(row, source='symbol_dashboard')
 
         download_url = None
         if excel_path and download_name:
@@ -1403,6 +1592,45 @@ def download_symbol_dashboard():
         as_attachment=True,
         download_name=safe_name
     )
+
+
+@app.route('/api/dashboard-data', methods=['GET'])
+def dashboard_data():
+    """Return consolidated dashboard data from Mongo (aggregates + symbol metrics)."""
+    if symbol_aggregates_collection is None or symbol_metrics_collection is None:
+        return jsonify({'error': 'Database not connected'}), 500
+
+    try:
+        limit = int(request.args.get('limit', 100))
+        limit = max(1, min(limit, 500))
+
+        def _clean(doc):
+            doc = dict(doc)
+            doc.pop('file_data', None)
+            if '_id' in doc:
+                doc['_id'] = str(doc['_id'])
+            if isinstance(doc.get('updated_at'), datetime):
+                doc['updated_at'] = doc['updated_at'].isoformat()
+            if isinstance(doc.get('as_on'), datetime):
+                doc['as_on'] = doc['as_on'].isoformat()
+            return doc
+
+        agg_mcap = list(symbol_aggregates_collection.find({'type': 'mcap'}).sort('average', -1).limit(limit))
+        agg_pr = list(symbol_aggregates_collection.find({'type': 'pr'}).sort('average', -1).limit(limit))
+        metrics = list(symbol_metrics_collection.find({}).sort([('as_on', -1), ('symbol', 1)]).limit(limit))
+
+        return jsonify({
+            'success': True,
+            'aggregates': {
+                'mcap': [_clean(x) for x in agg_mcap],
+                'pr': [_clean(x) for x in agg_pr]
+            },
+            'metrics': [_clean(x) for x in metrics],
+            'limit': limit
+        }), 200
+    except Exception as e:
+        print(f"Error fetching dashboard data: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/excel-results', methods=['GET'])
 def get_excel_results():
@@ -1600,6 +1828,9 @@ def consolidate():
             # Create output file
             output_path = os.path.join(request_folder, 'Finished_Product.xlsx')
             consolidator.format_excel_output(output_path)
+
+            # Persist per-symbol values and averages (uploaded files consolidation)
+            persist_consolidated_results(consolidator, 'mcap', source='upload_consolidation')
             
             # Prepare metadata
             metadata = {

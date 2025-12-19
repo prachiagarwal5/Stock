@@ -25,6 +25,8 @@ function App() {
     const [scrapeDownloadDestination, setScrapeDownloadDestination] = useState('local');
     const [dashboardResult, setDashboardResult] = useState(null);
     const [dashboardLoading, setDashboardLoading] = useState(false);
+    const [dashboardError, setDashboardError] = useState(null);
+    const [dashboardLimit, setDashboardLimit] = useState(100);
     const [dashboardPage, setDashboardPage] = useState(1);
     const [dashboardPageSize, setDashboardPageSize] = useState(150);
 
@@ -33,6 +35,13 @@ function App() {
         fetchAvailableDates();
         checkGoogleDriveStatus();
     }, []);
+
+    // Load dashboard data when tab is active
+    React.useEffect(() => {
+        if (activeTab === 'dashboard') {
+            loadDashboardData(dashboardLimit);
+        }
+    }, [activeTab, dashboardLimit]);
 
     const fetchAvailableDates = async () => {
         try {
@@ -385,6 +394,25 @@ function App() {
         }
     };
 
+    const loadDashboardData = async (limit) => {
+        setDashboardLoading(true);
+        setDashboardError(null);
+        try {
+            const response = await fetch(`http://localhost:5000/api/dashboard-data?limit=${limit}`);
+            if (!response.ok) {
+                const err = await response.json();
+                throw new Error(err.error || 'Failed to load dashboard data');
+            }
+            const data = await response.json();
+            setDashboardResult(data);
+        } catch (err) {
+            setDashboardError(err.message);
+            setDashboardResult(null);
+        } finally {
+            setDashboardLoading(false);
+        }
+    };
+
     const handlePreviewScrapeSession = async () => {
         if (!scrapeSession) {
             setError('No scrape session active');
@@ -553,11 +581,24 @@ function App() {
     };
 
     const handleBuildDashboard = async () => {
+        const topNInput = window.prompt('Enter top N symbols by MCAP average (leave blank for all symbols):', '1000');
+        if (topNInput === null) {
+            return; // user cancelled
+        }
+
         const payload = {
             save_to_file: true,
             page: dashboardPage,
             page_size: dashboardPageSize
         };
+
+        const topNVal = parseInt(topNInput, 10);
+        if (!Number.isNaN(topNVal) && topNVal > 0) {
+            payload.top_n = topNVal;
+            payload.top_n_by = 'mcap';
+            payload.parallel_workers = 10;
+            payload.chunk_size = 100;
+        }
 
         if (scrapeSession && scrapeSession.session_id) {
             payload.session_id = scrapeSession.session_id;
@@ -583,15 +624,18 @@ function App() {
 
             if (!response.ok) {
                 const errorData = await response.json();
+                console.error('[dashboard] failed status', response.status, errorData);
                 throw new Error(errorData.error || 'Dashboard build failed');
             }
 
             const data = await response.json();
+            console.log('[dashboard] success', data);
             setDashboardResult(data);
             const start = data.range?.start || 1;
             const end = data.range?.end || data.symbols_used || data.count || 0;
             setSuccess(`✅ Dashboard ready for symbols ${start}-${end} of ${data.total_symbols || data.symbols_used || data.count || 0}`);
         } catch (err) {
+            console.error('[dashboard] error', err);
             setError(err.message);
         } finally {
             setDashboardLoading(false);
@@ -657,6 +701,12 @@ function App() {
                         onClick={() => setActiveTab('preview')}
                     >
                         👁️ Preview
+                    </button>
+                    <button
+                        className={`tab-btn ${activeTab === 'mongo' ? 'active' : ''}`}
+                        onClick={() => setActiveTab('mongo')}
+                    >
+                        🗄️ Mongo Dashboard
                     </button>
                 </div>
 
@@ -1229,6 +1279,145 @@ function App() {
                             >
                                 {loading ? '⏳ Processing...' : downloadDestination === 'local' ? '⬇️ Download Excel' : '☁️ Upload to Drive'}
                             </button>
+                        </div>
+                    </section>
+                )}
+
+                {activeTab === 'mongo' && (
+                    <section className="section">
+                        <div className="section-header">
+                            <div>
+                                <h2>🗄️ Mongo Data Dashboard</h2>
+                                <p className="section-hint">Live view of stored aggregates and symbol metrics from MongoDB</p>
+                            </div>
+                            <div className="mongo-actions">
+                                <label className="form-inline">
+                                    Limit
+                                    <input
+                                        type="number"
+                                        min="10"
+                                        max="500"
+                                        value={dashboardLimit}
+                                        onChange={(e) => setDashboardLimit(Number(e.target.value) || 100)}
+                                    />
+                                </label>
+                                <button className="btn btn-outline" onClick={() => loadDashboardData(dashboardLimit)} disabled={dashboardLoading}>
+                                    {dashboardLoading ? '⏳ Loading...' : '🔄 Refresh'}
+                                </button>
+                            </div>
+                        </div>
+
+                        {dashboardError && <div className="alert alert-error">{dashboardError}</div>}
+
+                        <div className="mongo-grid">
+                            <div className="mongo-card">
+                                <div className="mongo-card-head">
+                                    <h3>Market Cap Averages</h3>
+                                    <span className="pill pill-info">mcap</span>
+                                </div>
+                                <div className="table-wrap">
+                                    <table className="mongo-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Symbol</th>
+                                                <th>Company</th>
+                                                <th>Days</th>
+                                                <th>Average</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {dashboardResult?.aggregates?.mcap?.length ? (
+                                                dashboardResult.aggregates.mcap.map((row, idx) => (
+                                                    <tr key={idx}>
+                                                        <td>{row.symbol}</td>
+                                                        <td>{row.company_name}</td>
+                                                        <td>{row.days_with_data}</td>
+                                                        <td>{formatNumber(row.average)}</td>
+                                                    </tr>
+                                                ))
+                                            ) : (
+                                                <tr><td colSpan="4" className="empty">No data</td></tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+
+                            <div className="mongo-card">
+                                <div className="mongo-card-head">
+                                    <h3>Net Traded Value Averages</h3>
+                                    <span className="pill pill-info">pr</span>
+                                </div>
+                                <div className="table-wrap">
+                                    <table className="mongo-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Symbol</th>
+                                                <th>Company</th>
+                                                <th>Days</th>
+                                                <th>Average</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {dashboardResult?.aggregates?.pr?.length ? (
+                                                dashboardResult.aggregates.pr.map((row, idx) => (
+                                                    <tr key={idx}>
+                                                        <td>{row.symbol}</td>
+                                                        <td>{row.company_name}</td>
+                                                        <td>{row.days_with_data}</td>
+                                                        <td>{formatNumber(row.average)}</td>
+                                                    </tr>
+                                                ))
+                                            ) : (
+                                                <tr><td colSpan="4" className="empty">No data</td></tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+
+                            <div className="mongo-card wide">
+                                <div className="mongo-card-head">
+                                    <h3>Symbol Metrics</h3>
+                                    <span className="pill pill-info">nse metrics</span>
+                                </div>
+                                <div className="table-wrap">
+                                    <table className="mongo-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Symbol</th>
+                                                <th>Company</th>
+                                                <th>Series</th>
+                                                <th>Index</th>
+                                                <th>Impact Cost</th>
+                                                <th>FF Mcap</th>
+                                                <th>Total Mcap</th>
+                                                <th>Traded Value</th>
+                                                <th>Last Price</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {dashboardResult?.metrics?.length ? (
+                                                dashboardResult.metrics.map((row, idx) => (
+                                                    <tr key={idx}>
+                                                        <td>{row.symbol}</td>
+                                                        <td>{row.companyName || row.company_name}</td>
+                                                        <td>{row.series}</td>
+                                                        <td>{Array.isArray(row.indexList) ? row.indexList.slice(0, 2).join(', ') : (row.index || '')}</td>
+                                                        <td>{formatNumber(row.impact_cost)}</td>
+                                                        <td>{formatNumber(row.free_float_mcap)}</td>
+                                                        <td>{formatNumber(row.total_market_cap)}</td>
+                                                        <td>{formatNumber(row.total_traded_value)}</td>
+                                                        <td>{formatNumber(row.last_price)}</td>
+                                                    </tr>
+                                                ))
+                                            ) : (
+                                                <tr><td colSpan="9" className="empty">No data</td></tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
                         </div>
                     </section>
                 )}
