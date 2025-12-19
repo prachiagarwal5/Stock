@@ -26,11 +26,15 @@ class MarketCapConsolidator:
             self.symbol_col = 'SECURITY'
             self.value_col = 'NET_TRDVAL'
             self.name_col = 'SECURITY'  # Use SECURITY for company name in PR files
+            self.avg_col = 'Average Net Traded Value'
         else:
             # MCAP files use: Symbol, Market Cap(Rs.)
             self.symbol_col = 'Symbol'
             self.value_col = 'Market Cap(Rs.)'
             self.name_col = 'Security Name'
+            self.avg_col = 'Average Market Cap'
+
+        self.days_col = 'Days With Data'
     
     def _load_corporate_actions(self):
         """Load corporate actions configuration"""
@@ -128,6 +132,11 @@ class MarketCapConsolidator:
         company_names = {}  # Store company names
         self.dates_list = []
 
+        # Filter out non-company summary rows
+        skip_symbols = {
+            'TOTAL', 'LISTED', 'TOTAL LISTED', 'LISTED TOTAL'
+        }
+
         # For PR files, pre-load MCAP security names to filter down to only overlapping entries
         mcap_lookup = {}
         if self.file_type == 'pr':
@@ -166,6 +175,10 @@ class MarketCapConsolidator:
                 value = row.get(self.value_col, '')
                 company_name = str(row.get(self.name_col, raw_symbol)).strip()
 
+                # Skip summary rows like TOTAL/LISTED
+                if raw_symbol.upper() in skip_symbols:
+                    continue
+
                 if self.file_type == 'pr' and mcap_lookup:
                     lookup_key = self._normalize_name(company_name)
                     symbol_key = self._normalize_name(raw_symbol)
@@ -202,6 +215,18 @@ class MarketCapConsolidator:
                 'Company Name': company_names.get(symbol, symbol)
             }
             
+            # Compute totals/averages only for days with data
+            values_with_data = [
+                consolidated_data[symbol].get(date_str)
+                for date_str in sorted_dates
+                if consolidated_data[symbol].get(date_str) is not None
+            ]
+            days_with_data = len(values_with_data)
+            average_value = sum(values_with_data) / days_with_data if days_with_data > 0 else None
+
+            row[self.days_col] = days_with_data
+            row[self.avg_col] = average_value
+
             # Add values for each date
             for date_str in sorted_dates:
                 row[date_str] = consolidated_data[symbol].get(date_str, None)
@@ -209,6 +234,15 @@ class MarketCapConsolidator:
             data_for_df.append(row)
         
         self.df_consolidated = pd.DataFrame(data_for_df)
+
+        # Ensure consistent column order
+        columns_order = ['Symbol', 'Company Name', self.days_col, self.avg_col] + sorted_dates
+        self.df_consolidated = self.df_consolidated[columns_order]
+
+        # Sort by average (descending), keep rows without averages at the end
+        self.df_consolidated = self.df_consolidated.sort_values(
+            by=self.avg_col, ascending=False, na_position='last'
+        ).reset_index(drop=True)
         companies_count = len(self.df_consolidated)
         dates_count = len(sorted_dates)
         print(f"\nConsolidated data: {companies_count} companies across {dates_count} dates")
@@ -291,6 +325,9 @@ class MarketCapConsolidator:
             ws.title = "Net Traded Value"
         else:
             ws.title = "Market Cap Data"
+
+        # Secondary sheet for averages only
+        avg_ws = wb.create_sheet(title="Averages")
         
         # Header styling
         header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
@@ -303,7 +340,7 @@ class MarketCapConsolidator:
             bottom=Side(style='thin')
         )
         
-        # Write headers
+        # Write headers for main sheet
         headers = df.columns.tolist()
         for col_num, header in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col_num)
@@ -320,15 +357,18 @@ class MarketCapConsolidator:
         for row_num, row in enumerate(df.values, 2):
             for col_num, value in enumerate(row, 1):
                 cell = ws.cell(row=row_num, column=col_num)
-                
-                if col_num <= 2:  # Symbol and Company Name columns
-                    # Convert to string
+                header = headers[col_num - 1]
+
+                if header in ['Symbol', 'Company Name']:
                     cell.value = str(value) if value is not None else ""
                     cell.alignment = Alignment(horizontal="left", vertical="center")
-                else:  # Date columns with values
+                elif header == self.days_col:
+                    cell.value = int(value) if value not in (None, "") else None
+                    cell.alignment = data_alignment
+                    cell.number_format = '0'
+                else:  # Average column or date columns with values
                     if value is not None and value != "" and not (isinstance(value, float) and pd.isna(value)):
                         try:
-                            # Try to convert to float for numeric values
                             numeric_value = float(value)
                             cell.value = numeric_value
                             cell.number_format = number_format
@@ -338,21 +378,112 @@ class MarketCapConsolidator:
                             cell.alignment = data_alignment
                     else:
                         cell.value = None
-                
+
                 cell.border = border
         
         # Adjust column widths
         ws.column_dimensions['A'].width = 15  # Symbol
         ws.column_dimensions['B'].width = 30  # Company Name
+        ws.column_dimensions['C'].width = 15  # Days with data
+        ws.column_dimensions['D'].width = 20  # Average
         
-        for col_num in range(3, len(headers) + 1):
+        for col_num in range(5, len(headers) + 1):
             ws.column_dimensions[get_column_letter(col_num)].width = 18
         
         # Freeze panes (first row and first two columns)
         ws.freeze_panes = "C2"
+
+        # Populate averages sheet (Symbol, Company Name, Days, Average)
+        avg_headers = ['Symbol', 'Company Name', self.days_col, self.avg_col]
+        for col_num, header in enumerate(avg_headers, 1):
+            cell = avg_ws.cell(row=1, column=col_num)
+            cell.value = str(header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_alignment
+            cell.border = border
+
+        for row_num, (_, row) in enumerate(self.df_consolidated[avg_headers].iterrows(), 2):
+            for col_num, header in enumerate(avg_headers, 1):
+                value = row[header]
+                cell = avg_ws.cell(row=row_num, column=col_num)
+                if header in ['Symbol', 'Company Name']:
+                    cell.value = str(value) if value is not None else ""
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                elif header == self.days_col:
+                    cell.value = int(value) if value not in (None, "") else None
+                    cell.number_format = '0'
+                    cell.alignment = data_alignment
+                else:
+                    if value is not None and value != "" and not (isinstance(value, float) and pd.isna(value)):
+                        try:
+                            numeric_value = float(value)
+                            cell.value = numeric_value
+                            cell.number_format = number_format
+                            cell.alignment = data_alignment
+                        except (ValueError, TypeError):
+                            cell.value = value
+                            cell.alignment = data_alignment
+                    else:
+                        cell.value = None
+                cell.border = border
+
+        avg_ws.column_dimensions['A'].width = 15
+        avg_ws.column_dimensions['B'].width = 30
+        avg_ws.column_dimensions['C'].width = 15
+        avg_ws.column_dimensions['D'].width = 20
+        avg_ws.freeze_panes = "C2"
         
         wb.save(self.output_file)
         print(f"✓ Excel file created: {self.output_file}")
+
+        # Save averages-only workbook as a separate file
+        avg_only_path = self.output_file.replace('.xlsx', '_Averages.xlsx')
+        avg_only_wb = Workbook()
+        avg_only_ws = avg_only_wb.active
+        avg_only_ws.title = "Averages"
+
+        for col_num, header in enumerate(avg_headers, 1):
+            cell = avg_only_ws.cell(row=1, column=col_num)
+            cell.value = str(header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_alignment
+            cell.border = border
+
+        for row_num, (_, row) in enumerate(self.df_consolidated[avg_headers].iterrows(), 2):
+            for col_num, header in enumerate(avg_headers, 1):
+                value = row[header]
+                cell = avg_only_ws.cell(row=row_num, column=col_num)
+                if header in ['Symbol', 'Company Name']:
+                    cell.value = str(value) if value is not None else ""
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                elif header == self.days_col:
+                    cell.value = int(value) if value not in (None, "") else None
+                    cell.number_format = '0'
+                    cell.alignment = data_alignment
+                else:
+                    if value is not None and value != "" and not (isinstance(value, float) and pd.isna(value)):
+                        try:
+                            numeric_value = float(value)
+                            cell.value = numeric_value
+                            cell.number_format = number_format
+                            cell.alignment = data_alignment
+                        except (ValueError, TypeError):
+                            cell.value = value
+                            cell.alignment = data_alignment
+                    else:
+                        cell.value = None
+                cell.border = border
+
+        avg_only_ws.column_dimensions['A'].width = 15
+        avg_only_ws.column_dimensions['B'].width = 30
+        avg_only_ws.column_dimensions['C'].width = 15
+        avg_only_ws.column_dimensions['D'].width = 20
+        avg_only_ws.freeze_panes = "C2"
+
+        avg_only_wb.save(avg_only_path)
+        print(f"✓ Averages-only file created: {avg_only_path}")
         
         # Cleanup temp file
         if os.path.exists(temp_csv):

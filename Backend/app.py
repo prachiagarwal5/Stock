@@ -913,6 +913,8 @@ def consolidate_scrape_session(session_id):
         if download_destination == 'local':
             mcap_output_path = os.path.join(session['folder'], 'Market_Cap.xlsx')
             pr_output_path = os.path.join(session['folder'], 'Net_Traded_Value.xlsx')
+            mcap_avg_path = mcap_output_path.replace('.xlsx', '_Averages.xlsx')
+            pr_avg_path = pr_output_path.replace('.xlsx', '_Averages.xlsx')
             
             print(f"\n📦 Local download mode")
             print(f"   MCAP file exists: {os.path.exists(mcap_output_path)}")
@@ -925,6 +927,10 @@ def consolidate_scrape_session(session_id):
                 with zf.ZipFile(zip_path, 'w') as zipf:
                     zipf.write(mcap_output_path, arcname='Market_Cap.xlsx')
                     zipf.write(pr_output_path, arcname='Net_Traded_Value.xlsx')
+                    if os.path.exists(mcap_avg_path):
+                        zipf.write(mcap_avg_path, arcname='Market_Cap_Averages.xlsx')
+                    if os.path.exists(pr_avg_path):
+                        zipf.write(pr_avg_path, arcname='Net_Traded_Value_Averages.xlsx')
                 
                 # Save both to MongoDB
                 save_excel_to_database(mcap_output_path, 'Market_Cap.xlsx', {'type': 'market_cap'})
