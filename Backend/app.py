@@ -84,6 +84,41 @@ try:
 except Exception as e:
     print(f"⚠️ Google Drive initialization warning: {e}")
 
+HEATMAP_INDICES = [
+    'NIFTY 50',
+    'NIFTY NEXT 50',
+    'NIFTY MIDCAP 50',
+    'NIFTY MIDCAP 100',
+    'NIFTY MIDCAP 150',
+    'NIFTY SMALLCAP 50',
+    'NIFTY SMALLCAP 100',
+    'NIFTY SMALLCAP 250',
+    'NIFTY MIDSMALLCAP 400',
+    'NIFTY 100',
+    'NIFTY 200',
+    'NIFTY500 MULTICAP 50:25:25',
+    'NIFTY LARGEMIDCAP 250',
+    'NIFTY MIDCAP SELECT'
+]
+
+HEATMAP_TYPE_MAP = {
+    # All of these are broad-market baskets on NSE heatmap
+    'NIFTY 50': 'Broad Market Indices',
+    'NIFTY NEXT 50': 'Broad Market Indices',
+    'NIFTY MIDCAP 50': 'Broad Market Indices',
+    'NIFTY MIDCAP 100': 'Broad Market Indices',
+    'NIFTY MIDCAP 150': 'Broad Market Indices',
+    'NIFTY SMALLCAP 50': 'Broad Market Indices',
+    'NIFTY SMALLCAP 100': 'Broad Market Indices',
+    'NIFTY SMALLCAP 250': 'Broad Market Indices',
+    'NIFTY MIDSMALLCAP 400': 'Broad Market Indices',
+    'NIFTY 100': 'Broad Market Indices',
+    'NIFTY 200': 'Broad Market Indices',
+    'NIFTY500 MULTICAP 50:25:25': 'Broad Market Indices',
+    'NIFTY LARGEMIDCAP 250': 'Broad Market Indices',
+    'NIFTY MIDCAP SELECT': 'Broad Market Indices'
+}
+
 # Cache for generated index files (download endpoint)
 INDEX_FILES = {}
 
@@ -2012,6 +2047,133 @@ def google_drive_status():
             'error': str(e),
             'authenticated': False
         }), 500
+
+
+@app.route('/api/heatmap', methods=['GET'])
+def heatmap_view():
+    """
+    Return live index constituents for building an NSE-style heatmap.
+    
+    Query params:
+        - index: Name of index (default: 'NIFTY 50')
+    
+    Example: /api/heatmap?index=NIFTY%20MIDCAP%2050
+    """
+    try:
+        index_name = request.args.get('index', 'NIFTY 50')
+        if index_name not in HEATMAP_INDICES:
+            return jsonify({
+                'error': 'Unsupported index',
+                'available_indices': HEATMAP_INDICES
+            }), 400
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json,text/plain,*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Referer': 'https://www.nseindia.com/market-data/live-market-indices'
+        }
+
+        sess = _make_session()
+        _prime_cookies(sess, headers)
+
+        type_name = HEATMAP_TYPE_MAP.get(index_name, 'Broad Market Indices')
+        heatmap_url = f"https://www.nseindia.com/api/heatmap-symbols?type={quote_plus(type_name)}&indices={quote_plus(index_name)}"
+        
+        print(f"[heatmap] Fetching: {heatmap_url}")
+        resp = sess.get(heatmap_url, headers=headers, timeout=20)
+
+        # Fallback to equity-stockIndices if heatmap-symbols fails
+        used_fallback = False
+        data_list = None
+        if resp.status_code == 200:
+            try:
+                data_list = resp.json()
+                if isinstance(data_list, list) and len(data_list) > 0:
+                    print(f"[heatmap] Got {len(data_list)} symbols from heatmap-symbols API")
+            except Exception as e:
+                print(f"[heatmap] Failed to parse JSON: {e}")
+                data_list = None
+
+        if data_list is None or (isinstance(data_list, list) and len(data_list) == 0):
+            used_fallback = True
+            fallback_url = f"https://www.nseindia.com/api/equity-stockIndices?index={quote_plus(index_name)}"
+            print(f"[heatmap] Fallback to: {fallback_url}")
+            resp = sess.get(fallback_url, headers=headers, timeout=20)
+            if resp.status_code != 200:
+                return jsonify({'error': f'NSE responded with {resp.status_code}'}), resp.status_code
+            try:
+                data_obj = resp.json() if resp.content else {}
+                rows = data_obj.get('data') or []
+                print(f"[heatmap] Got {len(rows)} symbols from fallback API")
+            except Exception:
+                return jsonify({'error': 'Invalid response from NSE'}), 502
+            data_list = rows
+
+        constituents = []
+        for row in data_list:
+            sym = row.get('symbol') or row.get('symbolName') or row.get('identifier') or row.get('securitySymbol')
+            if not sym:
+                continue
+            
+            # Handle both heatmap-symbols and equity-stockIndices response formats
+            last_price = row.get('lastPrice') or row.get('last')
+            p_change = row.get('pChange') or row.get('perChange')
+            change_val = row.get('change')
+            high_val = row.get('high') or row.get('dayHigh')
+            low_val = row.get('low') or row.get('dayLow')
+            volume = row.get('totalTradedVolume') or row.get('tradedQuantity')
+            traded_value = row.get('quantityTraded') or row.get('totalTradedValue') or row.get('turnoverinlacs')
+            vwap = row.get('vwap')
+            
+            constituents.append({
+                'symbol': sym,
+                'series': row.get('series'),
+                'lastPrice': _safe_float(last_price),
+                'pChange': _safe_float(p_change),
+                'change': _safe_float(change_val),
+                'previousClose': _safe_float(row.get('previousClose')),
+                'open': _safe_float(row.get('open')),
+                'high': _safe_float(high_val),
+                'low': _safe_float(low_val),
+                'totalTradedVolume': _safe_float(volume),
+                'totalTradedValue': _safe_float(traded_value),
+                'vwap': _safe_float(vwap),
+                'lastUpdatedTime': row.get('lastUpdatedTime')
+            })
+
+        # Derive advances/declines from constituents
+        advances = {'advances': 0, 'declines': 0, 'unchanged': 0}
+        for item in constituents:
+            pc = item.get('pChange')
+            if pc is None:
+                advances['unchanged'] += 1
+                continue
+            if pc > 0:
+                advances['advances'] += 1
+            elif pc < 0:
+                advances['declines'] += 1
+            else:
+                advances['unchanged'] += 1
+
+        payload = {
+            'success': True,
+            'index': index_name,
+            'timestamp': constituents[0].get('lastUpdatedTime') if constituents else None,
+            'count': len(constituents),
+            'advances': advances,
+            'constituents': constituents,
+            'available_indices': HEATMAP_INDICES,
+            'source': 'heatmap-symbols' if not used_fallback else 'equity-stockIndices'
+        }
+        return jsonify(convert_nan_to_none(payload)), 200
+
+    except Exception as exc:
+        print(f"[heatmap] Error: {exc}")
+        return jsonify({'error': str(exc)}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

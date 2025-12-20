@@ -1326,3 +1326,305 @@ body {
 .file-preview tr:hover {
     background: #f0f0f0;
 }
+
+/* Heatmap */
+.heatmap-section {
+    background: white;
+}
+
+.heatmap-layout {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    gap: 1.5rem;
+    align-items: flex-start;
+}
+
+.heatmap-sidebar {
+    background: #f8f9ff;
+    border: 1px solid #e0e7ff;
+    border-radius: 10px;
+    padding: 1rem;
+    position: sticky;
+    top: 1rem;
+}
+
+.heatmap-sidebar-title {
+    font-weight: 700;
+    color: #334155;
+    margin-bottom: 0.75rem;
+}
+
+.heatmap-index-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.heatmap-index-btn {
+    width: 100%;
+    text-align: left;
+    padding: 0.65rem 0.8rem;
+    border-radius: 8px;
+    border: 1px solid #e5e7eb;
+    background: #fff;
+    cursor: pointer;
+    font-weight: 600;
+    color: #0f172a;
+    transition: all 0.2s ease;
+}
+
+.heatmap-index-btn:hover {
+    border-color: #667eea;
+    background: #eef2ff;
+}
+
+.heatmap-index-btn.active {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border-color: transparent;
+    box-shadow: 0 6px 18px rgba(102, 126, 234, 0.35);
+}
+
+.heatmap-refresh {
+    margin-top: 1rem;
+    width: 100%;
+}
+
+.heatmap-content {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.heatmap-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+}
+
+.heatmap-advances {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.heatmap-loading,
+.heatmap-empty {
+    padding: 1.25rem;
+    border: 1px dashed #cbd5e1;
+    border-radius: 10px;
+    color: #475569;
+    text-align: center;
+}
+
+.heatmap-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 0.75rem;
+}
+
+.heatmap-card {
+    border-radius: 10px;
+    padding: 0.9rem;
+    box-shadow: 0 8px 16px rgba(0, 0, 0, 0.06);
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    min-height: 110px;
+}
+
+.heatmap-symbol {
+    font-weight: 800;
+    font-size: 1rem;
+    letter-spacing: 0.3px;
+}
+
+.heatmap-price {
+    font-size: 1.15rem;
+    font-weight: 700;
+}
+
+.heatmap-change {
+    font-weight: 700;
+    font-size: 0.95rem;
+}
+
+@media (max-width: 900px) {
+    .heatmap-layout {
+        grid-template-columns: 1fr;
+    }
+
+    .heatmap-sidebar {
+        position: relative;
+        top: auto;
+    }
+}
+
+.pill-warning {
+    background: #fff5f5;
+    color: #c53030;
+    border: 1px solid #feb2b2;
+}
+
+.pill-info {
+    background: #e0f2fe;
+    color: #0369a1;
+    border: 1px solid #bae6fd;
+}
+
+/* Stock Popup Styles */
+.stock-popup-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.3);
+    z-index: 1000;
+}
+
+.stock-popup {
+    background: #ffffff;
+    border-radius: 12px;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.25);
+    min-width: 280px;
+    max-width: 320px;
+    z-index: 1001;
+    overflow: hidden;
+    animation: popupFadeIn 0.15s ease-out;
+}
+
+@keyframes popupFadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.stock-popup-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px;
+    border-bottom: 1px solid #e2e8f0;
+    background: #f8fafc;
+}
+
+.stock-popup-symbol {
+    font-weight: 700;
+    font-size: 1.05rem;
+    color: #1e293b;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.stock-popup-symbol::before {
+    content: '';
+    width: 4px;
+    height: 18px;
+    background: #16a34a;
+    border-radius: 2px;
+}
+
+.stock-popup-tabs {
+    display: flex;
+    gap: 8px;
+}
+
+.stock-popup-tab {
+    font-size: 0.85rem;
+    color: #64748b;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.stock-popup-tab:hover {
+    color: #1e293b;
+    background: #e2e8f0;
+}
+
+.stock-popup-tab.active {
+    color: #1e293b;
+    font-weight: 600;
+    text-decoration: underline;
+    text-underline-offset: 4px;
+}
+
+.stock-popup-body {
+    padding: 8px 0;
+}
+
+.stock-popup-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 16px;
+    border-bottom: 1px solid #f1f5f9;
+}
+
+.stock-popup-row:last-child {
+    border-bottom: none;
+}
+
+.stock-popup-label {
+    font-size: 0.9rem;
+    color: #475569;
+}
+
+.stock-popup-value {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #1e293b;
+}
+
+.stock-popup-value.positive {
+    color: #16a34a;
+}
+
+.stock-popup-value.negative {
+    color: #dc2626;
+}
+
+.stock-popup-close {
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    background: transparent;
+    border: none;
+    font-size: 1.4rem;
+    color: #94a3b8;
+    cursor: pointer;
+    padding: 4px 8px;
+    line-height: 1;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.stock-popup-close:hover {
+    color: #475569;
+    background: #e2e8f0;
+}
+
+/* Heatmap card hover effect */
+.heatmap-card {
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.heatmap-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 12px 24px rgba(0, 0, 0, 0.15);
+}
