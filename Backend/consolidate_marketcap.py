@@ -194,7 +194,7 @@ class MarketCapConsolidator:
                     if symbol not in consolidated_data:
                         consolidated_data[symbol] = {}
                     
-                    # Convert value to float
+                    # Convert value to float (retain original units)
                     try:
                         value_float = float(value)
                         consolidated_data[symbol][date_str] = value_float
@@ -351,7 +351,8 @@ class MarketCapConsolidator:
             cell.border = border
         
         # Write data
-        number_format = '#,##0.00'
+        # Indian grouping for financial values
+        number_format = '#,##,##0.00'
         data_alignment = Alignment(horizontal="right", vertical="center")
         
         for row_num, row in enumerate(df.values, 2):

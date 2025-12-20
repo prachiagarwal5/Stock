@@ -21,6 +21,7 @@ from dateutil import parser as date_parser
 import numpy as np
 from pymongo import MongoClient, UpdateOne
 from bson.binary import Binary
+from bson import ObjectId
 import dotenv
 import base64
 import math
@@ -46,6 +47,16 @@ try:
     symbol_daily_collection = db['symbol_daily']  # per-symbol, per-date values (mcap/pr)
     symbol_aggregates_collection = db['symbol_aggregates']  # per-symbol averages
     symbol_metrics_collection = db['symbol_metrics']  # Symbol dashboard metrics
+    # speed-critical indexes
+    symbol_daily_collection.create_index(
+        [('symbol', 1), ('type', 1), ('date', 1)], name='symbol_type_date', unique=True
+    )
+    symbol_daily_collection.create_index([('type', 1), ('date', 1)], name='type_date')
+    symbol_aggregates_collection.create_index(
+        [('symbol', 1), ('type', 1), ('date_range.start', 1), ('date_range.end', 1)],
+        name='symbol_type_range', unique=False
+    )
+    bhavcache_collection.create_index([('type', 1), ('date', 1)], name='type_date_cache')
     print("✅ MongoDB connected successfully")
 except Exception as e:
     print(f"⚠️ MongoDB connection failed: {e}")
@@ -407,6 +418,148 @@ def put_cached_csv(date_iso, data_type, df, source='nse'):
         print(f"⚠️ Failed to cache {data_type} for {date_iso}: {e}")
         return None
 
+
+def bulk_upsert_symbol_daily_from_df(df, date_iso, data_type, source='nse_download'):
+    """Fast upsert of per-symbol values into Mongo, avoids per-row round trips."""
+    if symbol_daily_collection is None or df is None or df.empty:
+        return
+    symbol_col = 'Symbol' if data_type == 'mcap' else 'SECURITY'
+    name_col = 'Security Name' if data_type == 'mcap' else 'SECURITY'
+    value_col = 'Market Cap(Rs.)' if data_type == 'mcap' else 'NET_TRDVAL'
+    ops = []
+    for _, row in df.iterrows():
+        symbol = str(row.get(symbol_col) or '').strip()
+        if not symbol:
+            continue
+        company_name = str(row.get(name_col) or symbol).strip()
+        raw_value = row.get(value_col)
+        value = pd.to_numeric(raw_value, errors='coerce')
+        if pd.isna(value):
+            continue
+        ops.append(UpdateOne(
+            {'symbol': symbol, 'type': data_type, 'date': date_iso},
+            {'$set': {
+                'symbol': symbol,
+                'company_name': company_name,
+                'type': data_type,
+                'date': date_iso,
+                'value': float(value),
+                'source': source,
+                'updated_at': datetime.now().isoformat()
+            }},
+            upsert=True
+        ))
+    if not ops:
+        return
+    # chunk to keep payload moderate
+    chunk_size = 1000
+    for i in range(0, len(ops), chunk_size):
+        try:
+            symbol_daily_collection.bulk_write(ops[i:i + chunk_size], ordered=False)
+        except Exception as exc:
+            print(f"⚠️ bulk upsert for {data_type} {date_iso} failed: {exc}")
+
+
+def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False, log_fn=None, allowed_symbols=None, symbol_name_map=None):
+    """Build consolidated dataframe directly from cached CSVs in Mongo (no filesystem).
+
+    allowed_symbols: filter rows to this set (used to align PR to MCAP symbols)
+    symbol_name_map: optional map symbol -> company name (used to carry MCAP names into PR)
+    """
+    frames = []
+    missing_dates = []
+    for date_iso in date_iso_list:
+        cached = get_cached_csv(date_iso, data_type)
+        if not cached or cached.get('df') is None:
+            missing_dates.append(date_iso)
+            continue
+        df = cached['df']
+        df.columns = df.columns.str.strip()
+        df['_date_iso'] = date_iso
+        frames.append(df)
+
+    if missing_dates:
+        msg = f"Missing cached {data_type.upper()} for: {', '.join(missing_dates)}"
+        if allow_missing:
+            if log_fn:
+                log_fn(msg)
+        else:
+            raise ValueError(msg)
+
+    if not frames:
+        raise ValueError(f"No cached {data_type.upper()} data available")
+
+    df_all = pd.concat(frames, ignore_index=True)
+
+    if data_type == 'pr':
+        symbol_col = 'SECURITY'
+        value_col = 'NET_TRDVAL'
+        name_col = 'SECURITY'
+        avg_col = 'Average Net Traded Value'
+    else:
+        symbol_col = 'Symbol'
+        value_col = 'Market Cap(Rs.)'
+        name_col = 'Security Name'
+        avg_col = 'Average Market Cap'
+
+    df_all[symbol_col] = df_all[symbol_col].astype(str).str.strip()
+    df_all[name_col] = df_all[name_col].astype(str).str.strip()
+    df_all[value_col] = pd.to_numeric(df_all[value_col], errors='coerce')
+
+    if allowed_symbols is not None:
+        allowed_set = set(allowed_symbols)
+        df_all = df_all[df_all[symbol_col].isin(allowed_set)]
+        if df_all.empty:
+            raise ValueError(f"No {data_type.upper()} data available for requested symbols")
+
+    df_all['_date_str'] = pd.to_datetime(df_all['_date_iso']).dt.strftime('%d-%m-%Y')
+
+    pivot = df_all.pivot_table(
+        index=symbol_col,
+        columns='_date_str',
+        values=value_col,
+        aggfunc='last'
+    )
+
+    pivot.reset_index(inplace=True)
+    pivot.rename(columns={symbol_col: 'Symbol'}, inplace=True)
+
+    # If we were given an allowed_symbols set, reindex to include all of them (even if PR has gaps)
+    if allowed_symbols is not None:
+        allowed_order = list(allowed_symbols)
+        pivot = pivot.set_index('Symbol').reindex(allowed_order).reset_index()
+
+    if data_type == 'pr' and symbol_name_map:
+        # Prefer MCAP-sourced names when provided; fall back to PR names if missing
+        name_map = df_all.groupby('SECURITY')[name_col].agg('last').to_dict()
+        pivot['Company Name'] = pivot['Symbol'].map(symbol_name_map).fillna(pivot['Symbol'].map(name_map)).fillna(pivot['Symbol'])
+    else:
+        name_map = df_all.groupby('Symbol' if data_type != 'pr' else 'SECURITY')[name_col].agg('last')
+        pivot['Company Name'] = pivot['Symbol'].map(name_map.to_dict()).fillna(pivot['Symbol'])
+
+    # Compute metrics
+    date_cols = sorted(
+        [c for c in pivot.columns if re.match(r"\d{2}-\d{2}-\d{4}", str(c))],
+        key=lambda d: datetime.strptime(d, '%d-%m-%Y')
+    )
+    # Drop rows that have no PR/MCAP data in any requested date column (prevents empty rows after reindex)
+    if allowed_symbols is not None and date_cols:
+        pivot = pivot[~pivot[date_cols].isna().all(axis=1)].reset_index(drop=True)
+    pivot['Days With Data'] = pivot[date_cols].count(axis=1)
+    pivot[avg_col] = pivot[date_cols].mean(axis=1)
+
+    # Sort by average descending, NaN last
+    pivot = pivot.sort_values(by=avg_col, ascending=False, na_position='last').reset_index(drop=True)
+
+    # Order columns
+    ordered_cols = ['Symbol', 'Company Name', 'Days With Data', avg_col] + date_cols
+    pivot = pivot[ordered_cols]
+
+    # Build dates list for downstream formatting/persistence
+    dates_list = [(d, datetime.strptime(d, '%d-%m-%Y')) for d in date_cols]
+
+    return pivot, dates_list, avg_col
+
 # Configuration
 UPLOAD_FOLDER = tempfile.mkdtemp()
 ALLOWED_EXTENSIONS = {'csv'}
@@ -526,7 +679,7 @@ def download_nse_data():
     """
     Download market cap data from NSE website
     Expected payload: {"date": "03-Dec-2025"}
-    Always saves files to nosubject and returns metadata (no sessions).
+    Caches CSVs to Mongo and returns metadata (no sessions).
     """
     try:
         data = request.get_json()
@@ -651,24 +804,19 @@ def download_nse_data():
                         print(f"Warning: Error reading PR file: {str(e)}")
                         pr_df = None
                 
-                # Always save to permanent storage
-                output_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
-                os.makedirs(output_dir, exist_ok=True)
-
-                output_path_mcap = os.path.join(output_dir, mcap_filename)
+                # Persist to Mongo cache and symbol_daily for downstream consolidation
                 if mcap_df is not None:
-                    mcap_df.to_csv(output_path_mcap, index=False)
-                    print(f"Saved MCAP to: {output_path_mcap}")
-                
-                output_path_pr = None
+                    date_iso = date_obj.strftime('%Y-%m-%d')
+                    put_cached_csv(date_iso, 'mcap', mcap_df, source='nse')
+                    bulk_upsert_symbol_daily_from_df(mcap_df, date_iso, 'mcap', source='nse_download')
                 if pr_df is not None:
-                    output_path_pr = os.path.join(output_dir, pr_filename)
-                    pr_df.to_csv(output_path_pr, index=False)
-                    print(f"Saved PR to: {output_path_pr}")
+                    date_iso = date_obj.strftime('%Y-%m-%d')
+                    put_cached_csv(date_iso, 'pr', pr_df, source='nse')
+                    bulk_upsert_symbol_daily_from_df(pr_df, date_iso, 'pr', source='nse_download')
                 
                 return jsonify({
                     'success': True,
-                    'message': 'Files downloaded and saved',
+                    'message': 'Files downloaded and cached to Mongo',
                     'files': {
                         'mcap': {
                             'filename': mcap_filename,
@@ -736,7 +884,7 @@ def download_nse_range():
         "end_date": "05-Dec-2025",    # Format: DD-Mon-YYYY
         "refresh_mode": "missing_only" or "force"  # Optional, default missing_only
     }
-    Returns summary and entries (no sessions; files saved to nosubject).
+    Returns summary and entries (no sessions; files cached in Mongo).
     """
     try:
         data = request.get_json()
@@ -887,23 +1035,13 @@ def download_nse_range():
                     result['failed_count'] += 1
                     return index, result
 
-            def _write_df(df, fname):
-                if df is None:
-                    return False
-                output_path = os.path.join(os.path.dirname(__file__), 'nosubject', fname)
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                df.to_csv(output_path, index=False)
-                return True
-
             if mcap_df is not None:
-                fname_mcap = f"mcap{filename_date}.csv"
-                _write_df(mcap_df, fname_mcap)
+                bulk_upsert_symbol_daily_from_df(mcap_df, date_iso, 'mcap', source='nse_download')
                 status = 'cached' if cached_mcap and refresh_mode != 'force' else 'fetched'
                 result['entries'].append({
                     'date': nse_date_formatted,
                     'type': 'mcap',
                     'status': status,
-                    'filename': fname_mcap,
                     'records': len(mcap_df)
                 })
                 if status == 'cached':
@@ -919,14 +1057,12 @@ def download_nse_range():
                 result['failed_count'] += 1
 
             if pr_df is not None:
-                fname_pr = f"pr{filename_date}.csv"
-                _write_df(pr_df, fname_pr)
+                bulk_upsert_symbol_daily_from_df(pr_df, date_iso, 'pr', source='nse_download')
                 status = 'cached' if cached_pr and refresh_mode != 'force' else 'fetched'
                 result['entries'].append({
                     'date': nse_date_formatted,
                     'type': 'pr',
                     'status': status,
-                    'filename': fname_pr,
                     'records': len(pr_df)
                 })
                 if status == 'cached':
@@ -998,13 +1134,13 @@ def download_nse_range():
 @app.route('/api/nse-symbol-dashboard', methods=['POST'])
 def nse_symbol_dashboard():
     """
-    Build a dashboard of impact cost, free float market cap, traded value, and index for symbols in MCAP files.
+    Build a dashboard of impact cost, free float market cap, traded value, and index for symbols.
     Payload options:
     {
-        "date": "03-Dec-2025" # use persisted nosubject/mcapDDMMYYYY.csv
-        "start_date": "01-Dec-2025", "end_date": "05-Dec-2025" # optional range scan in nosubject
+        "date": "03-Dec-2025" # use cached MCAP/PR in Mongo
+        "start_date": "01-Dec-2025", "end_date": "05-Dec-2025" # optional range scan in Mongo cache
         "symbols": ["ABB", ...],  # optional explicit list
-        "save_to_file": true/false  # default true, saves Excel to same folder
+        "save_to_file": true/false  # default true, saves Excel to Mongo and returns download id
     }
     """
     try:
@@ -1025,7 +1161,6 @@ def nse_symbol_dashboard():
 
         symbols = provided_symbols[:] if provided_symbols else []
         target_files = []
-        output_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
         tag = None
 
         if date_str:
@@ -1033,10 +1168,7 @@ def nse_symbol_dashboard():
                 date_obj = date_parser.parse(date_str)
             except Exception:
                 return jsonify({'error': 'Invalid date format. Use DD-Mon-YYYY'}), 400
-            filename_date = date_obj.strftime('%d%m%Y')
-            tag = filename_date
-            mcap_path = os.path.join(output_dir, f"mcap{filename_date}.csv")
-            target_files = [mcap_path]
+            tag = date_obj.strftime('%d%m%Y')
 
         elif start_date_str and end_date_str:
             try:
@@ -1046,11 +1178,12 @@ def nse_symbol_dashboard():
                 return jsonify({'error': 'Invalid start/end date format. Use DD-Mon-YYYY'}), 400
             if start_dt > end_dt:
                 return jsonify({'error': 'start_date cannot be after end_date'}), 400
-            target_files = find_mcap_files_in_range(output_dir, start_dt, end_dt)
             tag = f"{start_dt.strftime('%d%m%Y')}_{end_dt.strftime('%d%m%Y')}"
 
-        if not symbols:
-            symbols = collect_symbols_from_files(target_files)
+        # If symbols not provided, fetch from Mongo aggregates (latest) to avoid filesystem reads
+        if not symbols and symbol_aggregates_collection is not None:
+            agg_symbols = list(symbol_aggregates_collection.distinct('symbol', {'type': 'mcap'}))
+            symbols = agg_symbols
 
         # Optionally limit to top N by averages from Mongo aggregates
         if symbol_aggregates_collection is not None:
@@ -1102,10 +1235,13 @@ def nse_symbol_dashboard():
 
         excel_path = None
         download_name = None
+        temp_file = None
+        db_id = None
         if save_to_file:
-            os.makedirs(output_dir, exist_ok=True)
             download_name = f"Symbol_Dashboard_{tag or 'latest'}.xlsx"
-            excel_path = os.path.join(output_dir, download_name)
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+            excel_path = temp_file.name
+            temp_file.close()
 
         print(f"[symbol-dashboard] symbols_total={total_symbols} slice={len(symbols_slice)} top_n={top_n} by={top_n_by} workers={parallel_workers} chunk={chunk_size}")
 
@@ -1143,7 +1279,21 @@ def nse_symbol_dashboard():
 
         download_url = None
         if excel_path and download_name:
-            download_url = f"/api/nse-symbol-dashboard/download?file={download_name}"
+            metadata = {
+                'tag': tag,
+                'symbols_used': len(symbols_slice),
+                'total_symbols': total_symbols,
+                'page': page,
+                'page_size': page_size,
+                'as_on': as_on
+            }
+            db_id = save_excel_to_database(excel_path, download_name, metadata)
+            try:
+                os.remove(excel_path)
+            except Exception:
+                pass
+            if db_id:
+                download_url = f"/api/nse-symbol-dashboard/download?id={db_id}"
 
         return jsonify({
             'success': True,
@@ -1151,6 +1301,7 @@ def nse_symbol_dashboard():
             'averages': result.get('averages', {}),
             'errors': result.get('errors', []),
             'file': download_name,
+            'file_id': str(db_id) if db_id else None,
             'download_url': download_url,
             'symbols_used': len(symbols_slice),
             'total_symbols': total_symbols,
@@ -1166,25 +1317,33 @@ def nse_symbol_dashboard():
 
 @app.route('/api/nse-symbol-dashboard/download', methods=['GET'])
 def download_symbol_dashboard():
-    file_name = request.args.get('file')
+    file_id = request.args.get('id')
 
-    if not file_name:
-        return jsonify({'error': 'file parameter is required'}), 400
+    if not file_id:
+        return jsonify({'error': 'id parameter is required'}), 400
 
-    safe_name = secure_filename(file_name)
+    if excel_results_collection is None:
+        return jsonify({'error': 'Database not connected'}), 500
 
-    base_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
+    try:
+        doc = excel_results_collection.find_one({'_id': ObjectId(file_id)})
+    except Exception:
+        return jsonify({'error': 'Invalid file id'}), 400
 
-    file_path = os.path.join(base_dir, safe_name)
+    if not doc:
+        return jsonify({'error': 'File not found'}), 404
 
-    if not os.path.exists(file_path):
-        return jsonify({'error': 'Dashboard file not found'}), 404
+    file_bytes = doc.get('file_data')
+    filename = doc.get('filename') or 'Symbol_Dashboard.xlsx'
+
+    if not file_bytes:
+        return jsonify({'error': 'File data missing'}), 404
 
     return send_file(
-        file_path,
+        BytesIO(file_bytes),
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         as_attachment=True,
-        download_name=safe_name
+        download_name=filename
     )
 
 
@@ -1284,16 +1443,6 @@ def update_indices():
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         file_name = f'indices_{timestamp}.csv'
         INDEX_FILES['latest'] = {'name': file_name, 'content': csv_content}
-
-        # Optional persistent log to disk for history
-        try:
-            output_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
-            os.makedirs(output_dir, exist_ok=True)
-            file_path = os.path.join(output_dir, file_name)
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(csv_content)
-        except Exception as log_exc:
-            print(f"⚠️ Failed to persist indices CSV: {log_exc}")
 
         return jsonify({
             'message': 'Indices updated from DB',
@@ -1598,7 +1747,7 @@ def consolidate():
 @app.route('/api/consolidate-saved', methods=['POST'])
 def consolidate_saved():
     """
-    Consolidate saved NSE CSVs from Backend/nosubject into Excel.
+    Consolidate cached NSE CSVs from Mongo into Excel.
 
     Payload (JSON):
     {
@@ -1611,151 +1760,179 @@ def consolidate_saved():
     Response: Excel file (zip when both MCAP and PR are produced).
     """
     try:
-        payload = request.get_json() or {}
-        date_str = payload.get('date')
-        start_date_str = payload.get('start_date')
-        end_date_str = payload.get('end_date')
-        file_type = payload.get('file_type', 'both')
-        # Default to persistence on (fast_mode=False) so aggregates for MCAP/PR get stored
-        fast_mode = payload.get('fast_mode', False)
-
-        if file_type not in ['mcap', 'pr', 'both']:
-            return jsonify({'error': 'Invalid file_type (mcap, pr, or both)'}), 400
-
-        # Parse date filters
-        date_dt = None
-        start_dt = None
-        end_dt = None
         try:
-            if date_str:
-                date_dt = date_parser.parse(date_str)
-            if start_date_str and end_date_str:
-                start_dt = date_parser.parse(start_date_str)
-                end_dt = date_parser.parse(end_date_str)
-                if start_dt > end_dt:
-                    return jsonify({'error': 'start_date cannot be after end_date'}), 400
-        except Exception:
-            return jsonify({'error': 'Invalid date format. Use DD-Mon-YYYY (e.g., 03-Dec-2025)'}), 400
+            payload = request.get_json() or {}
+            date_str = payload.get('date')
+            start_date_str = payload.get('start_date')
+            end_date_str = payload.get('end_date')
+            file_type = payload.get('file_type', 'both')
+            # Default to persistence on (fast_mode=False) so aggregates for MCAP/PR get stored
+            fast_mode = payload.get('fast_mode', False)
+            allow_missing = payload.get('allow_missing', True)
 
-        base_dir = os.path.join(os.path.dirname(__file__), 'nosubject')
-        os.makedirs(base_dir, exist_ok=True)
+            if file_type not in ['mcap', 'pr', 'both']:
+                return jsonify({'error': 'Invalid file_type (mcap, pr, or both)'}), 400
 
-        def _file_dt(path):
-            name = os.path.basename(path)
-            match = re.search(r'(?:mcap|pr)(\d{2})(\d{2})(\d{4})', name, re.IGNORECASE)
-            if not match:
-                return None
-            day, month, year = match.groups()
+            # Build date list
+            date_iso_list = []
             try:
-                return datetime(int(year), int(month), int(day))
+                if date_str:
+                    date_dt = date_parser.parse(date_str)
+                    date_iso_list = [date_dt.strftime('%Y-%m-%d')]
+                elif start_date_str and end_date_str:
+                    start_dt = date_parser.parse(start_date_str)
+                    end_dt = date_parser.parse(end_date_str)
+                    if start_dt > end_dt:
+                        return jsonify({'error': 'start_date cannot be after end_date'}), 400
+                    current = start_dt
+                    while current <= end_dt:
+                        if current.weekday() < 5:
+                            date_iso_list.append(current.strftime('%Y-%m-%d'))
+                        current += timedelta(days=1)
+                else:
+                    return jsonify({'error': 'Provide either date or start_date/end_date'}), 400
             except Exception:
-                return None
+                return jsonify({'error': 'Invalid date format. Use DD-Mon-YYYY (e.g., 03-Dec-2025)'}), 400
 
-        def _in_scope(path):
-            dt = _file_dt(path)
-            if dt is None:
-                return False
-            if date_dt and dt.date() != date_dt.date():
-                return False
-            if start_dt and end_dt and not (start_dt.date() <= dt.date() <= end_dt.date()):
-                return False
-            return True
+            logs = []
+            work_dir = tempfile.mkdtemp()
+            results = {}
 
-        mcap_files = [p for p in glob.glob(os.path.join(base_dir, 'mcap*.csv')) if _in_scope(p)]
-        pr_files = [p for p in glob.glob(os.path.join(base_dir, 'pr*.csv')) if _in_scope(p)]
+            def add_log(message):
+                logs.append(message)
 
-        if file_type in ['mcap', 'both'] and not mcap_files:
-            return jsonify({'error': 'No MCAP CSV files found for the selected date(s)'}), 404
-        if file_type in ['pr', 'both'] and not pr_files:
-            return jsonify({'error': 'No PR CSV files found for the selected date(s)'}), 404
+            def make_consolidator_from_cache(data_type, allowed_symbols=None, symbol_name_map=None):
+                df, dates_list, avg_col = build_consolidated_from_cache(
+                    date_iso_list, data_type, allow_missing=allow_missing, log_fn=add_log,
+                    allowed_symbols=allowed_symbols, symbol_name_map=symbol_name_map
+                )
+                if df is None or df.empty:
+                    raise ValueError(f"No {data_type.upper()} data available for requested dates")
+                add_log(f"{data_type.upper()} consolidated: {len(df)} companies across {len(dates_list)} dates")
+                cons = MarketCapConsolidator(work_dir, file_type=data_type)
+                cons.df_consolidated = df
+                cons.dates_list = dates_list
+                cons.avg_col = avg_col
+                cons.days_col = 'Days With Data'
+                return cons, len(df), len(dates_list)
 
-        work_dir = tempfile.mkdtemp()
+            mcap_output_path = None
+            mcap_avg_path = None
+            pr_output_path = None
+            pr_avg_path = None
+            mcap_symbols = None
 
-        def _copy_selected(paths):
-            for src in paths:
-                dst = os.path.join(work_dir, os.path.basename(src))
-                shutil.copy2(src, dst)
+            mcap_name_map = None
 
-        if file_type in ['mcap', 'both']:
-            _copy_selected(mcap_files)
-        if file_type in ['pr', 'both']:
-            _copy_selected(pr_files)
+            if file_type in ['mcap', 'both']:
+                try:
+                    consolidator_mcap, companies_count, dates_count = make_consolidator_from_cache('mcap')
+                    mcap_output_path = os.path.join(work_dir, 'Market_Cap.xlsx')
+                    add_log(f"Creating Excel file: {mcap_output_path}")
+                    consolidator_mcap.format_excel_output(mcap_output_path)
+                    add_log(f"✓ Excel file created: {mcap_output_path}")
+                    mcap_avg_path = mcap_output_path.replace('.xlsx', '_Averages.xlsx')
+                    mcap_symbols = set(consolidator_mcap.df_consolidated['Symbol'])
+                    mcap_name_map = dict(zip(
+                        consolidator_mcap.df_consolidated['Symbol'],
+                        consolidator_mcap.df_consolidated['Company Name']
+                    ))
+                    if not fast_mode:
+                        persist_consolidated_results(consolidator_mcap, 'mcap', source='cached_db')
+                    results['mcap'] = {
+                        'companies': companies_count,
+                        'dates': dates_count,
+                        'files': len(date_iso_list)
+                    }
+                except ValueError as exc:
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    return jsonify({'error': str(exc)}), 400
+                except Exception as exc:
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    return jsonify({'error': f'Failed to consolidate MCAP: {exc}'}), 500
 
-        results = {}
+            if file_type in ['pr', 'both']:
+                try:
+                    consolidator_pr, companies_count_pr, dates_count_pr = make_consolidator_from_cache(
+                        'pr', allowed_symbols=None, symbol_name_map=mcap_name_map
+                    )
+                    pr_output_path = os.path.join(work_dir, 'Net_Traded_Value.xlsx')
+                    add_log(f"Creating PR Excel file: {pr_output_path}")
+                    consolidator_pr.format_excel_output(pr_output_path)
+                    add_log(f"✓ PR Excel file created: {pr_output_path}")
+                    pr_avg_path = pr_output_path.replace('.xlsx', '_Averages.xlsx')
+                    if not fast_mode:
+                        persist_consolidated_results(consolidator_pr, 'pr', source='cached_db')
+                    results['pr'] = {
+                        'companies': companies_count_pr,
+                        'dates': dates_count_pr,
+                        'files': len(date_iso_list)
+                    }
+                except ValueError as exc:
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    return jsonify({'error': str(exc)}), 400
+                except Exception as exc:
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    return jsonify({'error': f'Failed to consolidate PR: {exc}'}), 500
 
-        # Process MCAP
-        mcap_output_path = None
-        if file_type in ['mcap', 'both'] and mcap_files:
-            try:
-                consolidator_mcap = MarketCapConsolidator(work_dir, file_type='mcap')
-                companies_count, dates_count = consolidator_mcap.load_and_consolidate_data()
-                mcap_output_path = os.path.join(work_dir, 'Market_Cap.xlsx')
-                consolidator_mcap.format_excel_output(mcap_output_path)
-                if not fast_mode:
-                    persist_consolidated_results(consolidator_mcap, 'mcap', source='saved_files')
-                results['mcap'] = {
-                    'companies': companies_count,
-                    'dates': dates_count,
-                    'files': len(mcap_files)
-                }
-                # keep a copy in nosubject for future reuse
-                shutil.copy2(mcap_output_path, os.path.join(base_dir, 'Market_Cap.xlsx'))
-            except Exception as exc:
+            if not mcap_output_path and not pr_output_path:
                 shutil.rmtree(work_dir, ignore_errors=True)
-                return jsonify({'error': f'Failed to consolidate MCAP: {exc}'}), 500
+                return jsonify({'error': 'No output generated'}), 500
 
-        # Process PR
-        pr_output_path = None
-        if file_type in ['pr', 'both'] and pr_files:
-            try:
-                consolidator_pr = MarketCapConsolidator(work_dir, file_type='pr')
-                companies_count_pr, dates_count_pr = consolidator_pr.load_and_consolidate_data()
-                pr_output_path = os.path.join(work_dir, 'Net_Traded_Value.xlsx')
-                consolidator_pr.format_excel_output(pr_output_path)
-                if not fast_mode:
-                    persist_consolidated_results(consolidator_pr, 'pr', source='saved_files')
-                results['pr'] = {
-                    'companies': companies_count_pr,
-                    'dates': dates_count_pr,
-                    'files': len(pr_files)
-                }
-                shutil.copy2(pr_output_path, os.path.join(base_dir, 'Net_Traded_Value.xlsx'))
-            except Exception as exc:
-                shutil.rmtree(work_dir, ignore_errors=True)
-                return jsonify({'error': f'Failed to consolidate PR: {exc}'}), 500
+            response = None
+            if mcap_output_path and pr_output_path:
+                zip_path = os.path.join(work_dir, 'Market_Data.zip')
+                add_log(f"Packaging files into zip: {zip_path}")
+                with zipfile.ZipFile(zip_path, 'w') as zipf:
+                    zipf.write(mcap_output_path, arcname='Market_Cap.xlsx')
+                    if mcap_avg_path and os.path.exists(mcap_avg_path):
+                        zipf.write(mcap_avg_path, arcname='Market_Cap_Averages.xlsx')
+                    zipf.write(pr_output_path, arcname='Net_Traded_Value.xlsx')
+                    if pr_avg_path and os.path.exists(pr_avg_path):
+                        zipf.write(pr_avg_path, arcname='Net_Traded_Value_Averages.xlsx')
+                response = send_file(
+                    zip_path,
+                    mimetype='application/zip',
+                    as_attachment=True,
+                    download_name='Market_Data.zip'
+                )
+            elif mcap_output_path:
+                zip_path = os.path.join(work_dir, 'Market_Cap.zip')
+                add_log(f"Packaging MCAP files into zip: {zip_path}")
+                with zipfile.ZipFile(zip_path, 'w') as zipf:
+                    zipf.write(mcap_output_path, arcname='Market_Cap.xlsx')
+                    if mcap_avg_path and os.path.exists(mcap_avg_path):
+                        zipf.write(mcap_avg_path, arcname='Market_Cap_Averages.xlsx')
+                response = send_file(
+                    zip_path,
+                    mimetype='application/zip',
+                    as_attachment=True,
+                    download_name='Market_Cap.zip'
+                )
+            elif pr_output_path:
+                zip_path = os.path.join(work_dir, 'Net_Traded_Value.zip')
+                add_log(f"Packaging PR files into zip: {zip_path}")
+                with zipfile.ZipFile(zip_path, 'w') as zipf:
+                    zipf.write(pr_output_path, arcname='Net_Traded_Value.xlsx')
+                    if pr_avg_path and os.path.exists(pr_avg_path):
+                        zipf.write(pr_avg_path, arcname='Net_Traded_Value_Averages.xlsx')
+                response = send_file(
+                    zip_path,
+                    mimetype='application/zip',
+                    as_attachment=True,
+                    download_name='Net_Traded_Value.zip'
+                )
+            if logs:
+                safe_log = ' | '.join(logs)
+                safe_log = safe_log.encode('ascii', errors='ignore').decode('ascii')
+                response.headers['X-Export-Log'] = safe_log
 
-        # Prepare response
-        response = None
-        if mcap_output_path and pr_output_path:
-            zip_path = os.path.join(work_dir, 'Market_Data.zip')
-            with zipfile.ZipFile(zip_path, 'w') as zipf:
-                zipf.write(mcap_output_path, arcname='Market_Cap.xlsx')
-                zipf.write(pr_output_path, arcname='Net_Traded_Value.xlsx')
-            response = send_file(
-                zip_path,
-                mimetype='application/zip',
-                as_attachment=True,
-                download_name='Market_Data.zip'
-            )
-        elif mcap_output_path:
-            response = send_file(
-                mcap_output_path,
-                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                as_attachment=True,
-                download_name='Market_Cap.xlsx'
-            )
-        elif pr_output_path:
-            response = send_file(
-                pr_output_path,
-                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                as_attachment=True,
-                download_name='Net_Traded_Value.xlsx'
-            )
-        else:
+            response.call_on_close(lambda: shutil.rmtree(work_dir, ignore_errors=True))
+            return response
+
+        except Exception as e:
             shutil.rmtree(work_dir, ignore_errors=True)
-            return jsonify({'error': 'No output generated'}), 500
-
-        # ensure temp cleanup after response is sent
+            return jsonify({'error': str(e)}), 500
         response.call_on_close(lambda: shutil.rmtree(work_dir, ignore_errors=True))
         return response
 

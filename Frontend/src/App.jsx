@@ -26,6 +26,7 @@ function App() {
     const [dashboardPageSize, setDashboardPageSize] = useState(150);
     const [indicesLoading, setIndicesLoading] = useState(false);
     const [exportLoading, setExportLoading] = useState(false);
+    const [exportLog, setExportLog] = useState([]);
 
     // Fetch available NSE dates and Google Drive status on component mount
     React.useEffect(() => {
@@ -185,10 +186,6 @@ function App() {
                 ? `✅ All ${total} days served from cache`
                 : `✅ Ready: cached ${cached}, fetched ${fetched}, total ${total}`;
             setSuccess(message);
-
-            setTimeout(() => {
-                setActiveTab('upload');
-            }, 3000);
         } catch (err) {
             setError(err.message);
         } finally {
@@ -198,10 +195,12 @@ function App() {
 
     const handleExportConsolidated = async (scope = 'date') => {
         const payload = { file_type: 'both', fast_mode: false }; // persist averages to DB
+        setExportLog(['Starting export...']);
 
         if (scope === 'range') {
             if (!rangeStartDate || !rangeEndDate) {
                 setError('Select a start and end date');
+                setExportLog([]);
                 return;
             }
             payload.start_date = convertDateFormat(rangeStartDate);
@@ -209,6 +208,7 @@ function App() {
         } else {
             if (!nseDate) {
                 setError('Select a date to export');
+                setExportLog([]);
                 return;
             }
             payload.date = convertDateFormat(nseDate);
@@ -226,6 +226,11 @@ function App() {
                 },
                 body: JSON.stringify(payload)
             });
+
+            const headerLog = response.headers.get('x-export-log');
+            if (headerLog) {
+                setExportLog(headerLog.split('\n'));
+            }
 
             const contentType = response.headers.get('content-type') || '';
             if (!response.ok && contentType.includes('application/json')) {
@@ -258,6 +263,7 @@ function App() {
             setSuccess('✅ Excel export ready');
         } catch (err) {
             setError(err.message);
+            setExportLog([]);
         } finally {
             setExportLoading(false);
         }
@@ -477,6 +483,11 @@ function App() {
         try {
             const response = await fetch(`http://localhost:5000${dashboardResult.download_url}`);
             if (!response.ok) {
+                const ct = response.headers.get('content-type') || '';
+                if (ct.includes('application/json')) {
+                    const errData = await response.json();
+                    throw new Error(errData.error || 'Dashboard download failed');
+                }
                 throw new Error('Dashboard download failed');
             }
 
@@ -586,6 +597,17 @@ function App() {
                             >
                                 {exportLoading ? '⏳ Exporting...' : '📑 Export Excel'}
                             </button>
+
+                            {exportLog.length > 0 && (
+                                <div className="log-panel">
+                                    <h4>Export progress</h4>
+                                    <ul>
+                                        {exportLog.map((line, idx) => (
+                                            <li key={idx}>{line}</li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            )}
 
                             <button
                                 className="btn btn-outline btn-large"
@@ -753,6 +775,17 @@ function App() {
                             >
                                 {exportLoading ? '⏳ Exporting...' : '📑 Export Range Excel'}
                             </button>
+
+                            {exportLog.length > 0 && (
+                                <div className="log-panel">
+                                    <h4>Export progress</h4>
+                                    <ul>
+                                        {exportLog.map((line, idx) => (
+                                            <li key={idx}>{line}</li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            )}
 
                             <button
                                 className="btn btn-outline btn-large"
