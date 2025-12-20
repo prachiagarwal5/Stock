@@ -18,6 +18,21 @@ class MarketCapConsolidator:
         self.file_type = file_type  # 'mcap' or 'pr'
         self.corporate_actions = self._load_corporate_actions()
         self._detect_columns()
+
+    def _is_summary_symbol(self, symbol):
+        """Return True for summary rows like Total/Listed (with variations/spaces)."""
+        if symbol is None:
+            return False
+        text = str(symbol).strip().upper()
+        if not text:
+            return False
+        normalized = re.sub(r'[^A-Z0-9]', '', text)
+        summary_tokens = {'TOTAL', 'LISTED', 'TOTALLISTED', 'LISTEDTOTAL'}
+        if normalized in summary_tokens:
+            return True
+        if text.startswith('TOTAL') or text.startswith('LISTED'):
+            return True
+        return False
     
     def _detect_columns(self):
         """Detect which columns to use based on file type"""
@@ -132,11 +147,6 @@ class MarketCapConsolidator:
         company_names = {}  # Store company names
         self.dates_list = []
 
-        # Filter out non-company summary rows
-        skip_symbols = {
-            'TOTAL', 'LISTED', 'TOTAL LISTED', 'LISTED TOTAL'
-        }
-
         # For PR files, pre-load MCAP security names to filter down to only overlapping entries
         mcap_lookup = {}
         if self.file_type == 'pr':
@@ -175,8 +185,8 @@ class MarketCapConsolidator:
                 value = row.get(self.value_col, '')
                 company_name = str(row.get(self.name_col, raw_symbol)).strip()
 
-                # Skip summary rows like TOTAL/LISTED
-                if raw_symbol.upper() in skip_symbols:
+                # Skip summary rows like TOTAL/LISTED (with variations/spaces)
+                if self._is_summary_symbol(raw_symbol):
                     continue
 
                 if self.file_type == 'pr' and mcap_lookup:
@@ -238,6 +248,11 @@ class MarketCapConsolidator:
         # Ensure consistent column order
         columns_order = ['Symbol', 'Company Name', self.days_col, self.avg_col] + sorted_dates
         self.df_consolidated = self.df_consolidated[columns_order]
+
+        # Drop any lingering summary rows that slipped through
+        self.df_consolidated = self.df_consolidated[
+            ~self.df_consolidated['Symbol'].apply(self._is_summary_symbol)
+        ]
 
         # Sort by average (descending), keep rows without averages at the end
         self.df_consolidated = self.df_consolidated.sort_values(

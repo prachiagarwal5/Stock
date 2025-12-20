@@ -117,6 +117,22 @@ def convert_nan_to_none(obj):
     return obj
 
 
+def is_summary_symbol(symbol):
+    """Detect summary rows such as Total/Listed (with spaces or punctuation)."""
+    if symbol is None:
+        return False
+    text = str(symbol).strip().upper()
+    if not text:
+        return False
+    normalized = re.sub(r'[^A-Z0-9]', '', text)
+    summary_tokens = {'TOTAL', 'LISTED', 'TOTALLISTED', 'LISTEDTOTAL'}
+    if normalized in summary_tokens:
+        return True
+    if text.startswith('TOTAL') or text.startswith('LISTED'):
+        return True
+    return False
+
+
 # ===== Index utilities =====
 def _make_session(user_agent=None):
     sess = requests.Session()
@@ -429,7 +445,7 @@ def bulk_upsert_symbol_daily_from_df(df, date_iso, data_type, source='nse_downlo
     ops = []
     for _, row in df.iterrows():
         symbol = str(row.get(symbol_col) or '').strip()
-        if not symbol:
+        if not symbol or is_summary_symbol(symbol):
             continue
         company_name = str(row.get(name_col) or symbol).strip()
         raw_value = row.get(value_col)
@@ -505,6 +521,9 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
     df_all[symbol_col] = df_all[symbol_col].astype(str).str.strip()
     df_all[name_col] = df_all[name_col].astype(str).str.strip()
     df_all[value_col] = pd.to_numeric(df_all[value_col], errors='coerce')
+
+    # Drop summary rows such as Total/Listed
+    df_all = df_all[~df_all[symbol_col].apply(is_summary_symbol)]
 
     if allowed_symbols is not None:
         allowed_set = set(allowed_symbols)
