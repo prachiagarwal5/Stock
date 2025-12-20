@@ -96,6 +96,51 @@ function App() {
         return `${day}-${months[date.getMonth()]}-${year}`;
     };
 
+    // Ask the user where to save a file; fall back to default downloads if picker is unavailable
+    const saveBlobToChosenLocation = async (blob, defaultName) => {
+        let pickerUsed = false;
+        if (window.showSaveFilePicker) {
+            try {
+                const handle = await window.showSaveFilePicker({
+                    suggestedName: defaultName,
+                    types: [
+                        {
+                            description: 'Excel or Zip',
+                            accept: {
+                                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
+                                'application/zip': ['.zip']
+                            }
+                        }
+                    ]
+                });
+                const writable = await handle.createWritable();
+                await writable.write(blob);
+                await writable.close();
+                pickerUsed = true;
+                return { filename: handle.name || defaultName, pickerUsed };
+            } catch (err) {
+                if (err?.name === 'AbortError') {
+                    throw new Error('Download cancelled');
+                }
+                console.warn('Save picker failed, using browser download fallback', err);
+            }
+        }
+
+        // Browser lacks picker (e.g., Safari/Firefox) or picker failed; inform user and fallback
+        const url = window.URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = defaultName;
+        document.body.appendChild(link);
+        link.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(link);
+        if (!pickerUsed) {
+            setSuccess(`Saved to browser default downloads. To choose a folder each time, use Chrome/Edge on HTTPS/localhost with downloads set to "Ask where to save each file".`);
+        }
+        return { filename: defaultName, pickerUsed };
+    };
+
     const handleDownloadFromNSE = async () => {
         if (!nseDate) {
             setError('Please select a date');
@@ -251,16 +296,10 @@ function App() {
                 filename = 'Market_Cap.xlsx';
             }
 
-            const url = window.URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = filename;
-            document.body.appendChild(link);
-            link.click();
-            window.URL.revokeObjectURL(url);
-            document.body.removeChild(link);
-
-            setSuccess('✅ Excel export ready');
+            const { filename: savedName, pickerUsed } = await saveBlobToChosenLocation(blob, filename);
+            if (pickerUsed) {
+                setSuccess(`✅ Excel export ready (${savedName})`);
+            }
         } catch (err) {
             setError(err.message);
             setExportLog([]);
@@ -342,16 +381,10 @@ function App() {
             } else {
                 // Local download - response is binary file
                 const blob = await response.blob();
-                const url = window.URL.createObjectURL(blob);
-                const link = document.createElement('a');
-                link.href = url;
-                link.download = 'Finished_Product.xlsx';
-                document.body.appendChild(link);
-                link.click();
-                window.URL.revokeObjectURL(url);
-                document.body.removeChild(link);
-
-                setSuccess('Excel file downloaded successfully!');
+                const { filename: savedName, pickerUsed } = await saveBlobToChosenLocation(blob, 'Finished_Product.xlsx');
+                if (pickerUsed) {
+                    setSuccess(`✅ Excel file saved as ${savedName}`);
+                }
             }
         } catch (err) {
             setError(err.message);
@@ -492,15 +525,10 @@ function App() {
             }
 
             const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = dashboardResult.file || 'Symbol_Dashboard.xlsx';
-            document.body.appendChild(link);
-            link.click();
-            window.URL.revokeObjectURL(url);
-            document.body.removeChild(link);
-            setSuccess('✅ Dashboard downloaded');
+            const { filename: savedName, pickerUsed } = await saveBlobToChosenLocation(blob, dashboardResult.file || 'Symbol_Dashboard.xlsx');
+            if (pickerUsed) {
+                setSuccess(`✅ Dashboard saved as ${savedName}`);
+            }
         } catch (err) {
             setError(err.message);
         }
