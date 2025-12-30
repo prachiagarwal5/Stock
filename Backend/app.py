@@ -307,8 +307,10 @@ def upsert_symbol_aggregate(symbol, company_name, data_type, days_with_data, ave
             'source': source,
             'updated_at': datetime.now().isoformat()
         }
+        # Use only symbol + type as the key to avoid duplicates across date ranges
+        # Each symbol will have exactly one MCAP record and one PR record
         symbol_aggregates_collection.update_one(
-            {'symbol': symbol, 'type': data_type, 'date_range': date_range},
+            {'symbol': symbol, 'type': data_type},
             {'$set': payload},
             upsert=True
         )
@@ -632,6 +634,49 @@ def health():
         'status': 'ok',
         'message': 'Market Cap Consolidation Service is running'
     }), 200
+
+
+@app.route('/api/consolidation-status', methods=['GET'])
+def consolidation_status():
+    """Check if consolidated MCAP/PR averages exist in the database."""
+    if symbol_aggregates_collection is None:
+        return jsonify({
+            'ready': False,
+            'mcap_count': 0,
+            'pr_count': 0,
+            'message': 'Database not connected'
+        }), 200
+
+    try:
+        mcap_count = symbol_aggregates_collection.count_documents({'type': 'mcap'})
+        pr_count = symbol_aggregates_collection.count_documents({'type': 'pr'})
+        
+        # Ready only if we have both MCAP and PR averages (at least 100 symbols each)
+        ready = mcap_count >= 100 and pr_count >= 100
+        
+        message = ''
+        if ready:
+            message = f'✅ Ready: {mcap_count} MCAP and {pr_count} PR symbol averages calculated'
+        elif mcap_count < 100 and pr_count < 100:
+            message = f'⚠️ Need to export Excel: Only {mcap_count} MCAP and {pr_count} PR averages found (need 100+ each)'
+        elif mcap_count < 100:
+            message = f'⚠️ MCAP averages incomplete: {mcap_count} found (need 100+)'
+        else:
+            message = f'⚠️ PR averages incomplete: {pr_count} found (need 100+)'
+        
+        return jsonify({
+            'ready': ready,
+            'mcap_count': mcap_count,
+            'pr_count': pr_count,
+            'message': message
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'ready': False,
+            'mcap_count': 0,
+            'pr_count': 0,
+            'message': f'Error checking status: {e}'
+        }), 200
 
 def save_excel_to_database(excel_path, filename, metadata):
     """Save Excel file to MongoDB"""
@@ -1217,6 +1262,9 @@ def nse_symbol_dashboard():
         target_files = []
         tag = None
 
+        # Build date_range filter for querying aggregates
+        date_range_filter = None
+        
         if date_str:
             try:
                 date_obj = date_parser.parse(date_str)
@@ -1233,10 +1281,22 @@ def nse_symbol_dashboard():
             if start_dt > end_dt:
                 return jsonify({'error': 'start_date cannot be after end_date'}), 400
             tag = f"{start_dt.strftime('%d%m%Y')}_{end_dt.strftime('%d%m%Y')}"
+            # Build date range filter to match overlapping ranges in aggregates
+            # Match documents where aggregates.date_range overlaps with requested range
+            requested_start = start_dt.strftime('%Y-%m-%d')
+            requested_end = end_dt.strftime('%Y-%m-%d')
+            date_range_filter = {
+                'date_range.start': {'$lte': requested_end},    # aggregate starts before or on requested end
+                'date_range.end': {'$gte': requested_start}      # aggregate ends after or on requested start
+            }
+            print(f"[symbol-dashboard] Using date range filter: {date_range_filter}")
 
         # If symbols not provided, fetch from Mongo aggregates (latest) to avoid filesystem reads
         if not symbols and symbol_aggregates_collection is not None:
-            agg_symbols = list(symbol_aggregates_collection.distinct('symbol', {'type': 'mcap'}))
+            query = {'type': 'mcap'}
+            if date_range_filter:
+                query.update(date_range_filter)
+            agg_symbols = list(symbol_aggregates_collection.distinct('symbol', query))
             symbols = agg_symbols
 
         # Optionally limit to top N by averages from Mongo aggregates
@@ -1247,10 +1307,14 @@ def nse_symbol_dashboard():
                 top_n_val = 1000
             if top_n_val and top_n_val > 0:
                 try:
-                    agg_docs = list(symbol_aggregates_collection.find({'type': top_n_by}).sort('average', -1).limit(top_n_val))
+                    query = {'type': top_n_by}
+                    if date_range_filter:
+                        query.update(date_range_filter)
+                    agg_docs = list(symbol_aggregates_collection.find(query).sort('average', -1).limit(top_n_val))
                     agg_symbols = [doc.get('symbol') for doc in agg_docs if doc.get('symbol')]
                     if agg_symbols:
                         symbols = agg_symbols
+                    print(f"[symbol-dashboard] Top {top_n_val} query returned {len(agg_symbols)} symbols")
                 except Exception as exc:
                     print(f"⚠️ Unable to fetch top {top_n_val} symbols by {top_n_by}: {exc}")
 
@@ -1299,6 +1363,64 @@ def nse_symbol_dashboard():
 
         print(f"[symbol-dashboard] symbols_total={total_symbols} slice={len(symbols_slice)} top_n={top_n} by={top_n_by} workers={parallel_workers} chunk={chunk_size}")
 
+        # Fetch PR data for % of traded days calculation
+        symbol_pr_data = {}
+        if symbol_aggregates_collection is not None:
+            try:
+                pr_query = {
+                    'symbol': {'$in': symbols_slice},
+                    'type': 'pr'
+                }
+                if date_range_filter:
+                    pr_query.update(date_range_filter)
+                pr_docs = list(symbol_aggregates_collection.find(pr_query))
+                for doc in pr_docs:
+                    sym = doc.get('symbol')
+                    if sym:
+                        # Get total trading days from date_range if available
+                        date_range = doc.get('date_range', {})
+                        days_with_data = doc.get('days_with_data', 0)
+                        # Calculate total trading days from range
+                        total_trading_days = days_with_data  # Default to days with data
+                        if date_range and date_range.get('start') and date_range.get('end'):
+                            try:
+                                start_dt = date_parser.parse(date_range['start'])
+                                end_dt = date_parser.parse(date_range['end'])
+                                # Count weekdays between dates
+                                total_trading_days = sum(1 for d in pd.date_range(start_dt, end_dt) if d.weekday() < 5)
+                            except Exception:
+                                pass
+                        symbol_pr_data[sym] = {
+                            'days_with_data': days_with_data,
+                            'total_trading_days': total_trading_days,
+                            'avg_pr': doc.get('average')
+                        }
+                print(f"[symbol-dashboard] Loaded PR data for {len(symbol_pr_data)} symbols")
+            except Exception as exc:
+                print(f"⚠️ Failed to fetch PR data: {exc}")
+
+        # Fetch MCAP data for ratio calculation
+        symbol_mcap_data = {}
+        if symbol_aggregates_collection is not None:
+            try:
+                mcap_query = {
+                    'symbol': {'$in': symbols_slice},
+                    'type': 'mcap'
+                }
+                if date_range_filter:
+                    mcap_query.update(date_range_filter)
+                mcap_docs = list(symbol_aggregates_collection.find(mcap_query))
+                for doc in mcap_docs:
+                    sym = doc.get('symbol')
+                    if sym:
+                        symbol_mcap_data[sym] = {
+                            'avg_mcap': doc.get('average'),
+                            'avg_free_float': None  # Will be calculated from metrics if available
+                        }
+                print(f"[symbol-dashboard] Loaded MCAP data for {len(symbol_mcap_data)} symbols")
+            except Exception as exc:
+                print(f"⚠️ Failed to fetch MCAP data: {exc}")
+
         # Run in parallel batches to speed up large symbol lists
         try:
             workers = int(parallel_workers) if str(parallel_workers).strip() != '' else 25
@@ -1316,7 +1438,9 @@ def nse_symbol_dashboard():
             as_of=as_on,
             parallel=True,
             max_workers=max(1, min(workers, 32)),
-            chunk_size=max(1, chunk_val)
+            chunk_size=max(1, chunk_val),
+            symbol_pr_data=symbol_pr_data,
+            symbol_mcap_data=symbol_mcap_data
         )
 
         print(f"[symbol-dashboard] completed fetch rows={len(result.get('rows', []))} errors={len(result.get('errors', []))}")

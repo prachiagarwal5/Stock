@@ -51,6 +51,21 @@ function App() {
     const [heatmapError, setHeatmapError] = useState(null);
     const [selectedStock, setSelectedStock] = useState(null);
     const [popupPosition, setPopupPosition] = useState({ x: 0, y: 0 });
+    const [consolidationReady, setConsolidationReady] = useState(false); // Track if MCAP/PR data is consolidated for current range
+    const [consolidationStatus, setConsolidationStatus] = useState(null); // Detailed status info
+    const [exportedRange, setExportedRange] = useState(null); // Track which range was exported
+
+    // Reset consolidation status when date range changes
+    React.useEffect(() => {
+        // If date range changes after export, reset the ready state
+        if (exportedRange) {
+            if (rangeStartDate !== exportedRange.start || rangeEndDate !== exportedRange.end) {
+                setConsolidationReady(false);
+                setConsolidationStatus(null);
+                setExportedRange(null);
+            }
+        }
+    }, [rangeStartDate, rangeEndDate, exportedRange]);
 
     // Fetch available NSE dates and Google Drive status on component mount
     React.useEffect(() => {
@@ -355,6 +370,16 @@ function App() {
             if (pickerUsed) {
                 setSuccess(`✅ Excel export ready (${savedName})`);
             }
+
+            // Only enable dashboard for range exports (not single date)
+            if (scope === 'range' && rangeStartDate && rangeEndDate) {
+                setConsolidationReady(true);
+                setExportedRange({ start: rangeStartDate, end: rangeEndDate });
+                setConsolidationStatus({
+                    ready: true,
+                    message: `Averages calculated for ${rangeStartDate} to ${rangeEndDate}`
+                });
+            }
         } catch (err) {
             setError(err.message);
             setExportLog([]);
@@ -531,6 +556,12 @@ function App() {
     };
 
     const handleBuildDashboard = async () => {
+        // Dashboard only available for date range (after MCAP/PR averages are calculated)
+        if (!rangeStartDate || !rangeEndDate) {
+            setError('Select a date range first (Start Date and End Date)');
+            return;
+        }
+
         const payload = {
             save_to_file: true,
             page: 1,
@@ -538,17 +569,10 @@ function App() {
             top_n: 1000,
             top_n_by: 'mcap',
             parallel_workers: 25,
-            chunk_size: 100
+            chunk_size: 100,
+            start_date: convertDateFormat(rangeStartDate),
+            end_date: convertDateFormat(rangeEndDate)
         };
-        if (rangeStartDate && rangeEndDate) {
-            payload.start_date = convertDateFormat(rangeStartDate);
-            payload.end_date = convertDateFormat(rangeEndDate);
-        } else if (nseDate) {
-            payload.date = convertDateFormat(nseDate);
-        } else {
-            setError('Select a date or date range first');
-            return;
-        }
 
         setDashboardLoading(true);
         setError(null);
@@ -719,101 +743,10 @@ function App() {
                                 </div>
                             )}
 
-                            <button
-                                className="btn btn-outline btn-large"
-                                onClick={handleBuildDashboard}
-                                disabled={dashboardLoading || !nseDate}
-                                title="Build symbol dashboard (uses saved MCAP files)"
-                            >
-                                {dashboardLoading ? '⏳ Building...' : '📊 Build Dashboard'}
-                            </button>
-
-                            {dashboardResult && (
-                                <div className="dashboard-panel">
-                                    <div className="dashboard-header">
-                                        <div>
-                                            <h3>📊 Symbol Dashboard</h3>
-                                            <p className="dashboard-sub">Page {dashboardResult.page} of {dashboardResult.total_pages} • Showing {dashboardResult.range?.start}–{dashboardResult.range?.end} of {dashboardResult.total_symbols || dashboardResult.symbols_used || 0}</p>
-                                        </div>
-                                        <div className="pill pill-info">{dashboardResult.symbols_used || dashboardResult.count || 0} symbols</div>
-                                    </div>
-
-                                    <div className="dashboard-controls">
-                                        <label>
-                                            Page
-                                            <input
-                                                type="number"
-                                                min="1"
-                                                value={dashboardPage}
-                                                onChange={(e) => setDashboardPage(Number(e.target.value) || 1)}
-                                            />
-                                        </label>
-                                        <label>
-                                            Page Size
-                                            <input
-                                                type="number"
-                                                min="10"
-                                                max="300"
-                                                value={dashboardPageSize}
-                                                onChange={(e) => setDashboardPageSize(Number(e.target.value) || 150)}
-                                            />
-                                        </label>
-                                        <button
-                                            className="btn btn-outline"
-                                            onClick={handleBuildDashboard}
-                                            disabled={dashboardLoading}
-                                        >
-                                            {dashboardLoading ? '⏳ Refreshing...' : '🔄 Refresh'}
-                                        </button>
-                                    </div>
-
-                                    <div className="dashboard-grid">
-                                        <div className="stat">
-                                            <span className="stat-label">Impact Cost (avg)</span>
-                                            <span className="stat-value">{formatNumber(dashboardResult.averages?.impact_cost)}</span>
-                                        </div>
-                                        <div className="stat">
-                                            <span className="stat-label">Free Float Mcap (avg)</span>
-                                            <span className="stat-value">{formatNumber(dashboardResult.averages?.free_float_mcap)}</span>
-                                        </div>
-                                        <div className="stat">
-                                            <span className="stat-label">Total Mcap (avg)</span>
-                                            <span className="stat-value">{formatNumber(dashboardResult.averages?.total_market_cap)}</span>
-                                        </div>
-                                        <div className="stat">
-                                            <span className="stat-label">Traded Value (avg)</span>
-                                            <span className="stat-value">{formatNumber(dashboardResult.averages?.total_traded_value)}</span>
-                                        </div>
-                                    </div>
-                                    <div className="dashboard-actions">
-                                        <button
-                                            className="btn btn-secondary"
-                                            onClick={handleDownloadDashboard}
-                                            disabled={!dashboardResult.download_url}
-                                        >
-                                            ⬇️ Download Dashboard Excel
-                                        </button>
-                                        {dashboardResult.errors && dashboardResult.errors.length > 0 && (
-                                            <span className="pill pill-warning">{dashboardResult.errors.length} symbols failed</span>
-                                        )}
-                                    </div>
-                                    {dashboardResult.errors && dashboardResult.errors.length > 0 && (
-                                        <div className="dashboard-errors">
-                                            <h5>Failed symbols</h5>
-                                            <ul>
-                                                {dashboardResult.errors.slice(0, 10).map((err, idx) => (
-                                                    <li key={idx}>
-                                                        {err.symbol}: {err.error}
-                                                    </li>
-                                                ))}
-                                                {dashboardResult.errors.length > 10 && (
-                                                    <li>...and {dashboardResult.errors.length - 10} more</li>
-                                                )}
-                                            </ul>
-                                        </div>
-                                    )}
-                                </div>
-                            )}
+                            <div className="info-box">
+                                <span className="info-icon">💡</span>
+                                <span>To build a Symbol Dashboard, use the <strong>Date Range Download</strong> tab. Dashboard requires multiple dates to calculate MCAP/PR averages.</span>
+                            </div>
 
                             <div className="download-info">
                                 <h4>How it works:</h4>
@@ -1046,13 +979,34 @@ function App() {
                                 </div>
                             )}
 
+                            <div className={`consolidation-status ${consolidationReady ? 'ready' : 'pending'}`}>
+                                {consolidationReady ? (
+                                    <div>
+                                        <span>✅ Averages calculated for {exportedRange?.start} to {exportedRange?.end}</span>
+                                        <div className="consolidation-details">
+                                            <span className="pill pill-success">Dashboard Ready</span>
+                                            <span className="consolidation-hint">Top 1000 companies by MCAP average</span>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <div>
+                                        <span>⚠️ To build dashboard:</span>
+                                        <ol className="consolidation-steps">
+                                            <li className={rangeStartDate && rangeEndDate ? 'done' : ''}>Select date range</li>
+                                            <li className={rangeProgress ? 'done' : ''}>Download Range (fetch MCAP/PR files)</li>
+                                            <li>Export Range Excel (calculates averages)</li>
+                                        </ol>
+                                    </div>
+                                )}
+                            </div>
+
                             <button
                                 className="btn btn-outline btn-large"
                                 onClick={handleBuildDashboard}
-                                disabled={dashboardLoading || !rangeStartDate || !rangeEndDate}
-                                title="Build symbol dashboard from saved MCAP files in the selected range"
+                                disabled={dashboardLoading || !consolidationReady || !rangeStartDate || !rangeEndDate}
+                                title={!rangeStartDate || !rangeEndDate ? "Select date range first" : (consolidationReady ? "Build symbol dashboard for top 1000 companies by Market Cap average" : "Export Excel first to calculate MCAP & PR averages")}
                             >
-                                {dashboardLoading ? '⏳ Building...' : '📊 Build Range Dashboard'}
+                                {dashboardLoading ? '⏳ Building...' : consolidationReady ? '📊 Build Dashboard (Top 1000 by MCAP Avg)' : '📊 Build Dashboard (Export First)'}
                             </button>
 
                             {rangeProgress && (
