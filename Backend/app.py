@@ -25,7 +25,6 @@ from bson import ObjectId
 import dotenv
 import base64
 import math
-from google_drive_service import GoogleDriveService
 from consolidate_marketcap import MarketCapConsolidator
 from nse_symbol_metrics import SymbolMetricsFetcher
 from urllib.parse import quote_plus
@@ -67,22 +66,6 @@ except Exception as e:
     symbol_aggregates_collection = None
     symbol_metrics_collection = None
 
-# Initialize Google Drive Service
-google_drive_service = None
-try:
-    credentials_path = os.getenv('GOOGLE_CREDENTIALS_PATH', 'credentials.json')
-    if os.path.exists(credentials_path):
-        google_drive_service = GoogleDriveService(credentials_path)
-        # Try to authenticate immediately
-        if google_drive_service.authenticate():
-            print("✅ Google Drive service initialized successfully")
-        else:
-            print("⚠️ Google Drive authentication will be attempted on first use")
-    else:
-        print(f"⚠️ Google credentials not found at {credentials_path}")
-        print("   Google Drive features will be unavailable until credentials.json is added")
-except Exception as e:
-    print(f"⚠️ Google Drive initialization warning: {e}")
 
 HEATMAP_INDICES = [
     'NIFTY 50',
@@ -1755,45 +1738,6 @@ def get_excel_info(file_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ==================== GOOGLE DRIVE ENDPOINTS ====================
-
-@app.route('/api/google-drive-auth', methods=['POST'])
-def google_drive_auth():
-    """
-    Authenticate with Google Drive
-    Returns authentication status and available actions
-    """
-    try:
-        global google_drive_service
-        
-        if google_drive_service is None:
-            credentials_path = os.getenv('GOOGLE_CREDENTIALS_PATH', 'credentials.json')
-            if not os.path.exists(credentials_path):
-                return jsonify({
-                    'authenticated': False,
-                    'error': 'Google credentials not found',
-                    'message': 'Please upload credentials.json to enable Google Drive integration'
-                }), 400
-            
-            google_drive_service = GoogleDriveService(credentials_path)
-        
-        if google_drive_service.authenticate():
-            return jsonify({
-                'authenticated': True,
-                'message': 'Successfully authenticated with Google Drive',
-                'automation_folder_id': google_drive_service.get_or_create_automation_folder()
-            }), 200
-        else:
-            return jsonify({
-                'authenticated': False,
-                'error': 'Authentication failed'
-            }), 400
-    
-    except Exception as e:
-        return jsonify({
-            'authenticated': False,
-            'error': str(e)
-        }), 500
 
 @app.route('/api/consolidate', methods=['POST'])
 def consolidate():
