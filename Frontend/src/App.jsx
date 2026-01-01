@@ -1,22 +1,17 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import './App.css';
-
-const HEATMAP_INDICES = [
-    'NIFTY 50',
-    'NIFTY NEXT 50',
-    'NIFTY MIDCAP 50',
-    'NIFTY MIDCAP 100',
-    'NIFTY MIDCAP 150',
-    'NIFTY SMALLCAP 50',
-    'NIFTY SMALLCAP 100',
-    'NIFTY SMALLCAP 250',
-    'NIFTY MIDSMALLCAP 400',
-    'NIFTY 100',
-    'NIFTY 200',
-    'NIFTY500 MULTICAP 50:25:25',
-    'NIFTY LARGEMIDCAP 250',
-    'NIFTY MIDCAP SELECT'
-];
+import {
+    Header,
+    Footer,
+    TabBar,
+    AlertMessages,
+    DownloadTab,
+    HeatmapTab,
+    RangeTab,
+    UploadTab,
+    PreviewTab,
+    MongoTab
+} from './components';
 
 function App() {
     const [uploadedFiles, setUploadedFiles] = useState([]);
@@ -32,7 +27,6 @@ function App() {
     const [rangeEndDate, setRangeEndDate] = useState('');
     const [rangeLoading, setRangeLoading] = useState(false);
     const [rangeProgress, setRangeProgress] = useState(null);
-    // Only local download
     const [downloadDestination] = useState('local');
     const [dashboardResult, setDashboardResult] = useState(null);
     const [dashboardLoading, setDashboardLoading] = useState(false);
@@ -50,13 +44,12 @@ function App() {
     const [heatmapError, setHeatmapError] = useState(null);
     const [selectedStock, setSelectedStock] = useState(null);
     const [popupPosition, setPopupPosition] = useState({ x: 0, y: 0 });
-    const [consolidationReady, setConsolidationReady] = useState(false); // Track if MCAP/PR data is consolidated for current range
-    const [consolidationStatus, setConsolidationStatus] = useState(null); // Detailed status info
-    const [exportedRange, setExportedRange] = useState(null); // Track which range was exported
+    const [consolidationReady, setConsolidationReady] = useState(false);
+    const [consolidationStatus, setConsolidationStatus] = useState(null);
+    const [exportedRange, setExportedRange] = useState(null);
 
     // Reset consolidation status when date range changes
-    React.useEffect(() => {
-        // If date range changes after export, reset the ready state
+    useEffect(() => {
         if (exportedRange) {
             if (rangeStartDate !== exportedRange.start || rangeEndDate !== exportedRange.end) {
                 setConsolidationReady(false);
@@ -67,18 +60,18 @@ function App() {
     }, [rangeStartDate, rangeEndDate, exportedRange]);
 
     // Fetch available NSE dates on component mount
-    React.useEffect(() => {
+    useEffect(() => {
         fetchAvailableDates();
     }, []);
 
     // Load dashboard data when tab is active
-    React.useEffect(() => {
+    useEffect(() => {
         if (activeTab === 'dashboard') {
             loadDashboardData(dashboardLimit);
         }
     }, [activeTab, dashboardLimit]);
 
-    React.useEffect(() => {
+    useEffect(() => {
         if (activeTab === 'heatmap') {
             fetchHeatmapData(heatmapIndex);
         }
@@ -492,35 +485,6 @@ function App() {
         }
     };
 
-    const formatNumber = (value) => {
-        if (value === null || value === undefined || Number.isNaN(value)) return 'N/A';
-        if (Math.abs(value) >= 1e6) {
-            return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
-        }
-        return Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
-    };
-
-    const formatPrice = (value) => {
-        if (value === null || value === undefined || Number.isNaN(value)) return '—';
-        return Number(value).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    };
-
-    const getHeatmapColor = (pChange) => {
-        if (pChange === null || pChange === undefined || Number.isNaN(pChange)) return '#e5e7eb';
-        const val = Number(pChange);
-        if (val >= 3.5) return '#087f3f';
-        if (val >= 2.5) return '#0b9950';
-        if (val >= 1.5) return '#16a34a';
-        if (val >= 0.5) return '#34d399';
-        if (val > 0) return '#b7e4c7';
-        if (val <= -3.5) return '#b91c1c';
-        if (val <= -2.5) return '#dc2626';
-        if (val <= -1.5) return '#ef4444';
-        if (val <= -0.5) return '#f87171';
-        if (val < 0) return '#fecdd3';
-        return '#e5e7eb';
-    };
-
     const handleBuildDashboard = async () => {
         // Dashboard only available for date range (after MCAP/PR averages are calculated)
         if (!rangeStartDate || !rangeEndDate) {
@@ -602,810 +566,96 @@ function App() {
 
     return (
         <div className="app">
-            <header className="header">
-                <h1>📊 Market Cap Consolidation Tool</h1>
-                <p>Upload CSV files and consolidate market cap data into a professional Excel file</p>
-            </header>
+            <TabBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-            <main className="main-content">
-                <div className="tabs">
-                    <button
-                        className={`tab-btn ${activeTab === 'download' ? 'active' : ''}`}
-                        onClick={() => setActiveTab('download')}
-                    >
-                        🔽 Download from NSE
-                    </button>
-                    <button
-                        className={`tab-btn ${activeTab === 'range' ? 'active' : ''}`}
-                        onClick={() => setActiveTab('range')}
-                    >
-                        📅 Date Range Download
-                    </button>
-                    <button
-                        className={`tab-btn ${activeTab === 'heatmap' ? 'active' : ''}`}
-                        onClick={() => setActiveTab('heatmap')}
-                    >
-                        🟩 Heatmap
-                    </button>
-                    <button
-                        className={`tab-btn ${activeTab === 'upload' ? 'active' : ''}`}
-                        onClick={() => setActiveTab('upload')}
-                    >
-                        📤 Upload & Process
-                    </button>
-                    <button
-                        className={`tab-btn ${activeTab === 'preview' ? 'active' : ''}`}
-                        onClick={() => setActiveTab('preview')}
-                    >
-                        👁️ Preview
-                    </button>
-                    <button
-                        className={`tab-btn ${activeTab === 'mongo' ? 'active' : ''}`}
-                        onClick={() => setActiveTab('mongo')}
-                    >
-                        🗄️ Mongo Dashboard
-                    </button>
-                </div>
+            <div className="content-area">
+                <Header />
 
-                {error && <div className="alert alert-error">{error}</div>}
-                {success && <div className="alert alert-success">{success}</div>}
+                <main className="main-content">
+                    <AlertMessages 
+                        error={error} 
+                        success={success} 
+                        onErrorClose={() => setError(null)}
+                        onSuccessClose={() => setSuccess(null)}
+                    />
 
-                {activeTab === 'download' && (
-                    <section className="section">
-                        <h2>🔽 Download Market Cap Data from NSE</h2>
-                        <p className="section-hint">
-                            Automatically download Bhavcopy data from NSE website and save as mcapDDMMYYYY.csv
-                        </p>
+                    {activeTab === 'download' && (
+                        <DownloadTab
+                            nseDate={nseDate}
+                            setNseDate={setNseDate}
+                            nseLoading={nseLoading}
+                            exportLoading={exportLoading}
+                            exportLog={exportLog}
+                            handleDownloadFromNSE={handleDownloadFromNSE}
+                            handleExportConsolidated={handleExportConsolidated}
+                        />
+                    )}
 
-                        <div className="nse-download-panel">
-                            <div className="form-group">
-                                <label>Select Date</label>
-                                <input
-                                    type="date"
-                                    value={nseDate}
-                                    onChange={(e) => setNseDate(e.target.value)}
-                                    className="form-input"
-                                    disabled={nseLoading}
-                                />
-                                <small className="form-hint">
-                                    Select any trading date from the last 2 years
-                                </small>
-                            </div>
-
-                            <div className="form-group">
-                                <p className="info-box">
-                                    <span className="info-icon">ℹ️</span>
-                                    This will download the CM - Bhavcopy (PR.zip) from NSE and extract the CSV file.
-                                    The file will be saved as <strong>mcapDDMMYYYY.csv</strong> in the Backend/nosubject/ folder.
-                                </p>
-                            </div>
-
-                            <button
-                                className="btn btn-secondary btn-large"
-                                onClick={handleDownloadFromNSE}
-                                disabled={nseLoading || !nseDate}
-                                title="Download and save CSVs to backend storage"
-                            >
-                                {nseLoading ? '⏳ Downloading...' : '⬇️ Download & Save CSV'}
-                            </button>
-
-                            <button
-                                className="btn btn-success btn-large"
-                                onClick={() => handleExportConsolidated('date')}
-                                disabled={exportLoading || !nseDate}
-                                title="Build Excel (MCAP + PR) from saved CSVs for the selected date"
-                            >
-                                {exportLoading ? '⏳ Exporting...' : '📑 Export Excel'}
-                            </button>
-
-                            {exportLog.length > 0 && (
-                                <div className="log-panel">
-                                    <h4>Export progress</h4>
-                                    <ul>
-                                        {exportLog.map((line, idx) => (
-                                            <li key={idx}>{line}</li>
-                                        ))}
-                                    </ul>
-                                </div>
-                            )}
-
-                            <div className="info-box">
-                                <span className="info-icon">💡</span>
-                                <span>To build a Symbol Dashboard, use the <strong>Date Range Download</strong> tab. Dashboard requires multiple dates to calculate MCAP/PR averages.</span>
-                            </div>
-
-                            <div className="download-info">
-                                <h4>How it works:</h4>
-                                <ol>
-                                    <li>Select a date from the dropdown</li>
-                                    <li>Click "Download & Save CSV"</li>
-                                    <li>The file is downloaded from NSE and automatically saved</li>
-                                    <li>Go to "Upload & Process" tab to consolidate your data</li>
-                                </ol>
-                            </div>
-                        </div>
-                    </section>
-                )}
-
-                {activeTab === 'heatmap' && (
-                    <section className="section heatmap-section">
-                        <div className="section-header">
-                            <div>
-                                <h2>🟩 NSE Heatmap</h2>
-                                <p className="section-hint">Live price movers by index, similar to the NSE heatmap view</p>
-                            </div>
-                        </div>
-
-                        {heatmapError && <div className="alert alert-error">{heatmapError}</div>}
-
-                        <div className="heatmap-layout">
-                            <aside className="heatmap-sidebar">
-                                <div className="heatmap-sidebar-title">Indices</div>
-                                <div className="heatmap-index-list">
-                                    {HEATMAP_INDICES.map((idx) => (
-                                        <button
-                                            key={idx}
-                                            className={`heatmap-index-btn ${heatmapIndex === idx ? 'active' : ''}`}
-                                            onClick={() => setHeatmapIndex(idx)}
-                                            disabled={heatmapLoading && heatmapIndex === idx}
-                                        >
-                                            {idx}
-                                        </button>
-                                    ))}
-                                </div>
-                                <button
-                                    className="btn btn-outline heatmap-refresh"
-                                    onClick={() => fetchHeatmapData(heatmapIndex)}
-                                    disabled={heatmapLoading}
-                                >
-                                    {heatmapLoading ? '⏳ Loading...' : '🔄 Refresh'}
-                                </button>
-                            </aside>
-
-                            <div className="heatmap-content">
-                                <div className="heatmap-meta">
-                                    <div>
-                                        <h3>{heatmapMeta?.index || heatmapIndex}</h3>
-                                        <p className="section-hint">As on {heatmapMeta?.timestamp || '—'}</p>
-                                    </div>
-                                    <div className="heatmap-advances">
-                                        <span className="pill pill-success">Advances {heatmapMeta?.advances?.advances ?? 0}</span>
-                                        <span className="pill pill-warning">Declines {heatmapMeta?.advances?.declines ?? 0}</span>
-                                        <span className="pill pill-info">Unchanged {heatmapMeta?.advances?.unchanged ?? 0}</span>
-                                    </div>
-                                </div>
-
-                                {heatmapLoading && (
-                                    <div className="heatmap-loading">Building heatmap...</div>
-                                )}
-
-                                {!heatmapLoading && heatmapData.length === 0 && (
-                                    <div className="heatmap-empty">No symbols available for this index.</div>
-                                )}
-
-                                {!heatmapLoading && heatmapData.length > 0 && (
-                                    <div className="heatmap-grid">
-                                        {heatmapData.map((row, idx) => {
-                                            const change = row.pChange ?? row.perChange ?? row.change;
-                                            const bg = getHeatmapColor(change);
-                                            const textColor = Math.abs(Number(change) || 0) < 0.5 ? '#0f172a' : '#ffffff';
-                                            return (
-                                                <div
-                                                    key={`${row.symbol || row.symbolName || row.identifier || idx}-${idx}`}
-                                                    className="heatmap-card"
-                                                    style={{ backgroundColor: bg, color: textColor, cursor: 'pointer' }}
-                                                    onClick={(e) => {
-                                                        const rect = e.currentTarget.getBoundingClientRect();
-                                                        setPopupPosition({
-                                                            x: rect.left + rect.width / 2,
-                                                            y: rect.top
-                                                        });
-                                                        setSelectedStock(row);
-                                                    }}
-                                                >
-                                                    <div className="heatmap-symbol">{row.symbol || row.symbolName || row.identifier}</div>
-                                                    <div className="heatmap-price">{formatPrice(row.lastPrice ?? row.last)}</div>
-                                                    <div className="heatmap-change">{change === null || change === undefined || Number.isNaN(change) ? '—' : `${Number(change).toFixed(2)}%`}</div>
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
-                                )}
-
-                                {/* Stock Details Popup */}
-                                {selectedStock && (
-                                    <div className="stock-popup-overlay" onClick={() => setSelectedStock(null)}>
-                                        <div
-                                            className="stock-popup"
-                                            onClick={(e) => e.stopPropagation()}
-                                            style={{
-                                                position: 'fixed',
-                                                left: Math.min(popupPosition.x, window.innerWidth - 320),
-                                                top: Math.max(popupPosition.y - 10, 60)
-                                            }}
-                                        >
-                                            <div className="stock-popup-header">
-                                                <span className="stock-popup-symbol">{selectedStock.symbol}</span>
-                                                <div className="stock-popup-tabs">
-                                                    <span className="stock-popup-tab active">Price</span>
-                                                    <span className="stock-popup-tab">Graph</span>
-                                                </div>
-                                            </div>
-                                            <div className="stock-popup-body">
-                                                <div className="stock-popup-row">
-                                                    <span className="stock-popup-label">Change</span>
-                                                    <span className={`stock-popup-value ${Number(selectedStock.change) >= 0 ? 'positive' : 'negative'}`}>
-                                                        {selectedStock.change ?? '—'}
-                                                    </span>
-                                                </div>
-                                                <div className="stock-popup-row">
-                                                    <span className="stock-popup-label">VWAP</span>
-                                                    <span className="stock-popup-value">{selectedStock.vwap ?? '—'}</span>
-                                                </div>
-                                                <div className="stock-popup-row">
-                                                    <span className="stock-popup-label">High</span>
-                                                    <span className="stock-popup-value">{selectedStock.high ?? selectedStock.dayHigh ?? '—'}</span>
-                                                </div>
-                                                <div className="stock-popup-row">
-                                                    <span className="stock-popup-label">Low</span>
-                                                    <span className="stock-popup-value">{selectedStock.low ?? selectedStock.dayLow ?? '—'}</span>
-                                                </div>
-                                                <div className="stock-popup-row">
-                                                    <span className="stock-popup-label">Traded Volume (Lakhs)</span>
-                                                    <span className="stock-popup-value">
-                                                        {selectedStock.totalTradedVolume
-                                                            ? (Number(selectedStock.totalTradedVolume) / 100000).toFixed(2)
-                                                            : '—'}
-                                                    </span>
-                                                </div>
-                                                <div className="stock-popup-row">
-                                                    <span className="stock-popup-label">Traded Value (Cr.)</span>
-                                                    <span className="stock-popup-value">
-                                                        {selectedStock.totalTradedValue
-                                                            ? (Number(selectedStock.totalTradedValue) / 10000000).toFixed(2)
-                                                            : '—'}
-                                                    </span>
-                                                </div>
-                                            </div>
-                                            <button className="stock-popup-close" onClick={() => setSelectedStock(null)}>×</button>
-                                        </div>
-                                    </div>
-                                )}
-                            </div>
-                        </div>
-                    </section>
+                    {activeTab === 'heatmap' && (
+                        <HeatmapTab
+                            heatmapIndex={heatmapIndex}
+                            setHeatmapIndex={setHeatmapIndex}
+                            heatmapData={heatmapData}
+                            heatmapMeta={heatmapMeta}
+                            heatmapLoading={heatmapLoading}
+                            heatmapError={heatmapError}
+                        fetchHeatmapData={fetchHeatmapData}
+                        selectedStock={selectedStock}
+                        setSelectedStock={setSelectedStock}
+                        popupPosition={popupPosition}
+                        setPopupPosition={setPopupPosition}
+                    />
                 )}
 
                 {activeTab === 'range' && (
-                    <section className="section">
-                        <h2>📅 Download Market Cap Data - Date Range</h2>
-                        <p className="section-hint">
-                            Download multiple days of data at once. Select start and end dates, and all trading days in between will be downloaded.
-                        </p>
-
-                        <div className="nse-download-panel">
-                            <div className="form-row">
-                                <div className="form-group">
-                                    <label>Start Date</label>
-                                    <input
-                                        type="date"
-                                        value={rangeStartDate}
-                                        onChange={(e) => setRangeStartDate(e.target.value)}
-                                        className="form-input"
-                                        disabled={rangeLoading}
-                                    />
-                                </div>
-
-                                <div className="form-group">
-                                    <label>End Date</label>
-                                    <input
-                                        type="date"
-                                        value={rangeEndDate}
-                                        onChange={(e) => setRangeEndDate(e.target.value)}
-                                        className="form-input"
-                                        disabled={rangeLoading}
-                                    />
-                                </div>
-                            </div>
-
-                            <div className="form-group">
-                                <p className="info-box">
-                                    <span className="info-icon">ℹ️</span>
-                                    This will download market cap data for all trading days between the selected dates (excluding weekends).
-                                    Each file will be saved as <strong>mcapDDMMYYYY.csv</strong> in the Backend/nosubject/ folder.
-                                </p>
-                            </div>
-
-                            <button
-                                className="btn btn-secondary btn-large"
-                                onClick={handleDownloadRangeFromNSE}
-                                disabled={rangeLoading || !rangeStartDate || !rangeEndDate}
-                                title="Download and save all CSVs to backend storage"
-                            >
-                                {rangeLoading ? '⏳ Downloading...' : '⬇️ Download Range'}
-                            </button>
-
-                            <button
-                                className="btn btn-success btn-large"
-                                onClick={() => handleExportConsolidated('range')}
-                                disabled={exportLoading || !rangeStartDate || !rangeEndDate}
-                                title="Build Excel (MCAP + PR) from saved CSVs in the selected range"
-                            >
-                                {exportLoading ? '⏳ Exporting...' : '📑 Export Range Excel'}
-                            </button>
-
-                            {exportLog.length > 0 && (
-                                <div className="log-panel">
-                                    <h4>Export progress</h4>
-                                    <ul>
-                                        {exportLog.map((line, idx) => (
-                                            <li key={idx}>{line}</li>
-                                        ))}
-                                    </ul>
-                                </div>
-                            )}
-
-                            <div className={`consolidation-status ${consolidationReady ? 'ready' : 'pending'}`}>
-                                {consolidationReady ? (
-                                    <div>
-                                        <span>✅ Averages calculated for {exportedRange?.start} to {exportedRange?.end}</span>
-                                        <div className="consolidation-details">
-                                            <span className="pill pill-success">Dashboard Ready</span>
-                                            <span className="consolidation-hint">Top 1000 companies by MCAP average</span>
-                                        </div>
-                                    </div>
-                                ) : (
-                                    <div>
-                                        <span>⚠️ To build dashboard:</span>
-                                        <ol className="consolidation-steps">
-                                            <li className={rangeStartDate && rangeEndDate ? 'done' : ''}>Select date range</li>
-                                            <li className={rangeProgress ? 'done' : ''}>Download Range (fetch MCAP/PR files)</li>
-                                            <li>Export Range Excel (calculates averages)</li>
-                                        </ol>
-                                    </div>
-                                )}
-                            </div>
-
-                            <button
-                                className="btn btn-outline btn-large"
-                                onClick={handleBuildDashboard}
-                                disabled={dashboardLoading || !consolidationReady || !rangeStartDate || !rangeEndDate}
-                                title={!rangeStartDate || !rangeEndDate ? "Select date range first" : (consolidationReady ? "Build symbol dashboard for top 1000 companies by Market Cap average" : "Export Excel first to calculate MCAP & PR averages")}
-                            >
-                                {dashboardLoading ? '⏳ Building...' : consolidationReady ? '📊 Build Dashboard (Top 1000 by MCAP Avg)' : '📊 Build Dashboard (Export First)'}
-                            </button>
-
-                            {rangeProgress && (
-                                <div className="scrape-session-panel">
-                                    <h3>📋 Range Download Summary</h3>
-                                    <div className="session-info">
-                                        <p><strong>Cached:</strong> {rangeProgress.summary.cached}</p>
-                                        <p><strong>Fetched:</strong> {rangeProgress.summary.fetched}</p>
-                                        <p><strong>Failed:</strong> {rangeProgress.summary.failed}</p>
-                                        <p><strong>Total Requested:</strong> {rangeProgress.summary.total_requested}</p>
-                                        {rangeProgress.summary.fetched === 0 && rangeProgress.summary.failed === 0 && (
-                                            <div className="pill pill-success">All days served from cache</div>
-                                        )}
-                                    </div>
-                                    {rangeProgress.entries && rangeProgress.entries.length > 0 && (
-                                        <div className="range-status-list">
-                                            <div className="range-status-header">Per-day status</div>
-                                            <ul>
-                                                {rangeProgress.entries.map((entry, idx) => (
-                                                    <li key={idx} className={`range-status-item status-${entry.status}`}>
-                                                        <span className="date">{entry.date}</span>
-                                                        <span className="type">{entry.type.toUpperCase()}</span>
-                                                        <span className="status">{entry.status}</span>
-                                                        {entry.records !== undefined && <span className="records">{entry.records} records</span>}
-                                                    </li>
-                                                ))}
-                                            </ul>
-                                        </div>
-                                    )}
-                                </div>
-                            )}
-
-                            {dashboardResult && (
-                                <div className="dashboard-panel">
-                                    <div className="dashboard-header">
-                                        <h3>📊 Symbol Dashboard</h3>
-                                        <div className="pill pill-info">{dashboardResult.symbols_used || dashboardResult.count || 0} symbols</div>
-                                    </div>
-                                    <div className="dashboard-grid">
-                                        <div className="stat">
-                                            <span className="stat-label">Impact Cost (avg)</span>
-                                            <span className="stat-value">{dashboardResult.averages?.impact_cost ?? 'N/A'}</span>
-                                        </div>
-                                        <div className="stat">
-                                            <span className="stat-label">Free Float Mcap (avg)</span>
-                                            <span className="stat-value">{dashboardResult.averages?.free_float_mcap ?? 'N/A'}</span>
-                                        </div>
-                                        <div className="stat">
-                                            <span className="stat-label">Total Mcap (avg)</span>
-                                            <span className="stat-value">{dashboardResult.averages?.total_market_cap ?? 'N/A'}</span>
-                                        </div>
-                                        <div className="stat">
-                                            <span className="stat-label">Traded Value (avg)</span>
-                                            <span className="stat-value">{dashboardResult.averages?.total_traded_value ?? 'N/A'}</span>
-                                        </div>
-                                    </div>
-                                    <div className="dashboard-actions">
-                                        <button
-                                            className="btn btn-secondary"
-                                            onClick={handleDownloadDashboard}
-                                            disabled={!dashboardResult.download_url}
-                                        >
-                                            ⬇️ Download Dashboard Excel
-                                        </button>
-                                        {dashboardResult.errors && dashboardResult.errors.length > 0 && (
-                                            <span className="pill pill-warning">{dashboardResult.errors.length} symbols failed</span>
-                                        )}
-                                    </div>
-                                </div>
-                            )}
-
-                            {rangeProgress && rangeProgress.summary && (
-                                <div className="progress-summary">
-                                    <h4>Download Summary</h4>
-                                    <div className="progress-stats">
-                                        <div className="stat success">
-                                            <span className="stat-label">Cached</span>
-                                            <span className="stat-value">{rangeProgress.summary.cached}</span>
-                                        </div>
-                                        <div className="stat info">
-                                            <span className="stat-label">Fetched</span>
-                                            <span className="stat-value">{rangeProgress.summary.fetched}</span>
-                                        </div>
-                                        <div className="stat failed">
-                                            <span className="stat-label">Failed</span>
-                                            <span className="stat-value">{rangeProgress.summary.failed}</span>
-                                        </div>
-                                        <div className="stat total">
-                                            <span className="stat-label">Total</span>
-                                            <span className="stat-value">{rangeProgress.summary.total_requested}</span>
-                                        </div>
-                                    </div>
-
-                                    {rangeProgress.summary.fetched === 0 && rangeProgress.summary.failed === 0 && (
-                                        <div className="pill pill-success">All days served from cache</div>
-                                    )}
-
-                                    {rangeProgress.entries && rangeProgress.entries.length > 0 && (
-                                        <div className="files-list">
-                                            <h5>Per-day status:</h5>
-                                            <ul>
-                                                {rangeProgress.entries.map((entry, idx) => (
-                                                    <li key={idx} className={`range-status-item status-${entry.status}`}>
-                                                        <span className="date">{entry.date}</span>
-                                                        <span className="type">{entry.type.toUpperCase()}</span>
-                                                        <span className="status">{entry.status}</span>
-                                                        {entry.records !== undefined && <span className="records">{entry.records} records</span>}
-                                                    </li>
-                                                ))}
-                                            </ul>
-                                        </div>
-                                    )}
-
-                                    {rangeProgress.errors && rangeProgress.errors.length > 0 && (
-                                        <div className="errors-list">
-                                            <h5>Failed Downloads:</h5>
-                                            <ul>
-                                                {rangeProgress.errors.map((err, idx) => (
-                                                    <li key={idx} className="error-item">
-                                                        ❌ {err.date} - {err.error}
-                                                    </li>
-                                                ))}
-                                            </ul>
-                                        </div>
-                                    )}
-                                </div>
-                            )}
-
-                            <div className="download-info">
-                                <h4>How it works:</h4>
-                                <ol>
-                                    <li>Select start date (e.g., 01-Dec-2025)</li>
-                                    <li>Select end date (e.g., 05-Dec-2025)</li>
-                                    <li>Click "📅 Download Date Range"</li>
-                                    <li>All trading days between dates are downloaded automatically</li>
-                                    <li>Files saved with pattern: mcapDDMMYYYY.csv</li>
-                                    <li>Go to "Upload & Process" to consolidate all downloaded files</li>
-                                </ol>
-                            </div>
-                        </div>
-                    </section>
+                    <RangeTab
+                        rangeStartDate={rangeStartDate}
+                        setRangeStartDate={setRangeStartDate}
+                        rangeEndDate={rangeEndDate}
+                        setRangeEndDate={setRangeEndDate}
+                        rangeLoading={rangeLoading}
+                        rangeProgress={rangeProgress}
+                        exportLoading={exportLoading}
+                        exportLog={exportLog}
+                        consolidationReady={consolidationReady}
+                        exportedRange={exportedRange}
+                        dashboardLoading={dashboardLoading}
+                        dashboardResult={dashboardResult}
+                        handleDownloadRangeFromNSE={handleDownloadRangeFromNSE}
+                        handleExportConsolidated={handleExportConsolidated}
+                        handleBuildDashboard={handleBuildDashboard}
+                        handleDownloadDashboard={handleDownloadDashboard}
+                    />
                 )}
 
-                {error && <div className="alert alert-error">{error}</div>}
-                {success && <div className="alert alert-success">{success}</div>}
-
                 {activeTab === 'upload' && (
-                    <section className="section">
-                        <h2>Step 1: Upload CSV Files</h2>
-                        <div className="upload-area">
-                            <input
-                                type="file"
-                                id="file-input"
-                                multiple
-                                accept=".csv"
-                                onChange={handleFileChange}
-                                className="file-input"
-                            />
-                            <label htmlFor="file-input" className="upload-label">
-                                <span className="upload-icon">📁</span>
-                                <span>Drag and drop CSV files or click to select</span>
-                                <span className="upload-hint">Supported: .csv files | Format: mcapDDMMYYYY.csv</span>
-                            </label>
-                        </div>
-
-                        {uploadedFiles.length > 0 && (
-                            <div className="file-list">
-                                <h3>Uploaded Files ({uploadedFiles.length})</h3>
-                                <ul>
-                                    {uploadedFiles.map((file, index) => (
-                                        <li key={index}>
-                                            <span className="file-icon">📄</span>
-                                            <span className="file-name">{file.name}</span>
-                                            <span className="file-size">({(file.size / 1024).toFixed(2)} KB)</span>
-                                        </li>
-                                    ))}
-                                </ul>
-                            </div>
-                        )}
-
-                        <div className="download-options">
-                            <h3>📥 Download Destination</h3>
-                            <div className="destination-buttons">
-                                <button className="destination-btn active" disabled>
-                                    💻 Download Locally
-                                </button>
-                            </div>
-                        </div>
-
-                        <div className="action-buttons">
-                            <button
-                                className="btn btn-primary"
-                                onClick={handlePreview}
-                                disabled={uploadedFiles.length === 0 || loading}
-                            >
-                                {loading ? '⏳ Processing...' : '👁️ Preview Data'}
-                            </button>
-                            <button
-                                className="btn btn-success"
-                                onClick={handleDownload}
-                                disabled={uploadedFiles.length === 0 || loading}
-                            >
-                                {loading ? '⏳ Processing...' : '⬇️ Download Excel'}
-                            </button>
-                        </div>
-                    </section>
+                    <UploadTab
+                        uploadedFiles={uploadedFiles}
+                        loading={loading}
+                        handleFileChange={handleFileChange}
+                        handlePreview={handlePreview}
+                        handleDownload={handleDownload}
+                    />
                 )}
 
                 {activeTab === 'mongo' && (
-                    <section className="section">
-                        <div className="section-header">
-                            <div>
-                                <h2>🗄️ Mongo Data Dashboard</h2>
-                                <p className="section-hint">Live view of stored aggregates and symbol metrics from MongoDB</p>
-                            </div>
-                            <div className="mongo-actions">
-                                <label className="form-inline">
-                                    Limit
-                                    <input
-                                        type="number"
-                                        min="10"
-                                        max="500"
-                                        value={dashboardLimit}
-                                        onChange={(e) => setDashboardLimit(Number(e.target.value) || 100)}
-                                    />
-                                </label>
-                                <button className="btn btn-outline" onClick={() => loadDashboardData(dashboardLimit)} disabled={dashboardLoading}>
-                                    {dashboardLoading ? '⏳ Loading...' : '🔄 Refresh'}
-                                </button>
-                                <button
-                                    className="btn btn-primary"
-                                    onClick={handleUpdateIndices}
-                                    disabled={indicesLoading}
-                                >
-                                    {indicesLoading ? '⏳ Updating...' : '🧭 Update Indices'}
-                                </button>
-                            </div>
-                        </div>
-
-                        {dashboardError && <div className="alert alert-error">{dashboardError}</div>}
-
-                        <div className="mongo-grid">
-                            <div className="mongo-card">
-                                <div className="mongo-card-head">
-                                    <h3>Market Cap Averages</h3>
-                                    <span className="pill pill-info">mcap</span>
-                                </div>
-                                <div className="table-wrap">
-                                    <table className="mongo-table">
-                                        <thead>
-                                            <tr>
-                                                <th>Symbol</th>
-                                                <th>Company</th>
-                                                <th>Days</th>
-                                                <th>Average</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {dashboardResult?.aggregates?.mcap?.length ? (
-                                                dashboardResult.aggregates.mcap.map((row, idx) => (
-                                                    <tr key={idx}>
-                                                        <td>{row.symbol}</td>
-                                                        <td>{row.company_name}</td>
-                                                        <td>{row.days_with_data}</td>
-                                                        <td>{formatNumber(row.average)}</td>
-                                                    </tr>
-                                                ))
-                                            ) : (
-                                                <tr><td colSpan="4" className="empty">No data</td></tr>
-                                            )}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-
-                            <div className="mongo-card">
-                                <div className="mongo-card-head">
-                                    <h3>Net Traded Value Averages</h3>
-                                    <span className="pill pill-info">pr</span>
-                                </div>
-                                <div className="table-wrap">
-                                    <table className="mongo-table">
-                                        <thead>
-                                            <tr>
-                                                <th>Symbol</th>
-                                                <th>Company</th>
-                                                <th>Days</th>
-                                                <th>Average</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {dashboardResult?.aggregates?.pr?.length ? (
-                                                dashboardResult.aggregates.pr.map((row, idx) => (
-                                                    <tr key={idx}>
-                                                        <td>{row.symbol}</td>
-                                                        <td>{row.company_name}</td>
-                                                        <td>{row.days_with_data}</td>
-                                                        <td>{formatNumber(row.average)}</td>
-                                                    </tr>
-                                                ))
-                                            ) : (
-                                                <tr><td colSpan="4" className="empty">No data</td></tr>
-                                            )}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-
-                            <div className="mongo-card wide">
-                                <div className="mongo-card-head">
-                                    <h3>Symbol Metrics</h3>
-                                    <span className="pill pill-info">nse metrics</span>
-                                </div>
-                                <div className="table-wrap">
-                                    <table className="mongo-table">
-                                        <thead>
-                                            <tr>
-                                                <th>Symbol</th>
-                                                <th>Company</th>
-                                                <th>Series</th>
-                                                <th>Index</th>
-                                                <th>Impact Cost</th>
-                                                <th>FF Mcap</th>
-                                                <th>Total Mcap</th>
-                                                <th>Traded Value</th>
-                                                <th>Last Price</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {dashboardResult?.metrics?.length ? (
-                                                dashboardResult.metrics.map((row, idx) => (
-                                                    <tr key={idx}>
-                                                        <td>{row.symbol}</td>
-                                                        <td>{row.companyName || row.company_name}</td>
-                                                        <td>{row.series}</td>
-                                                        <td>{row.primary_index || (Array.isArray(row.indexList) ? row.indexList.slice(0, 2).join(', ') : (row.index || ''))}</td>
-                                                        <td>{formatNumber(row.impact_cost)}</td>
-                                                        <td>{formatNumber(row.free_float_mcap)}</td>
-                                                        <td>{formatNumber(row.total_market_cap)}</td>
-                                                        <td>{formatNumber(row.total_traded_value)}</td>
-                                                        <td>{formatNumber(row.last_price)}</td>
-                                                    </tr>
-                                                ))
-                                            ) : (
-                                                <tr><td colSpan="9" className="empty">No data</td></tr>
-                                            )}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-                        </div>
-                    </section>
+                    <MongoTab
+                        dashboardLimit={dashboardLimit}
+                        setDashboardLimit={setDashboardLimit}
+                        dashboardLoading={dashboardLoading}
+                        dashboardError={dashboardError}
+                        dashboardResult={dashboardResult}
+                        indicesLoading={indicesLoading}
+                        loadDashboardData={loadDashboardData}
+                        handleUpdateIndices={handleUpdateIndices}
+                    />
                 )}
 
                 {activeTab === 'preview' && (
-                    <section className="section">
-                        <h2>Step 3: Preview Results</h2>
-                        {preview ? (
-                            <div className="preview-container">
-                                <div className="summary-cards">
-                                    <div className="summary-card">
-                                        <span className="summary-icon">🏢</span>
-                                        <div>
-                                            <div className="summary-label">Total Companies</div>
-                                            <div className="summary-value">{preview.summary.total_companies}</div>
-                                        </div>
-                                    </div>
-                                    <div className="summary-card">
-                                        <span className="summary-icon">📅</span>
-                                        <div>
-                                            <div className="summary-label">Total Dates</div>
-                                            <div className="summary-value">{preview.summary.total_dates}</div>
-                                        </div>
-                                    </div>
-                                    <div className="summary-card">
-                                        <span className="summary-icon">📤</span>
-                                        <div>
-                                            <div className="summary-label">Uploaded Files</div>
-                                            <div className="summary-value">{preview.summary.uploaded_files}</div>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div className="dates-list">
-                                    <h4>📊 Dates Included:</h4>
-                                    <div className="dates-tags">
-                                        {preview.summary.dates.map((date, idx) => (
-                                            <span key={idx} className="date-tag">{date}</span>
-                                        ))}
-                                    </div>
-                                </div>
-
-                                <div className="preview-table">
-                                    <h4>Sample Data (First 10 Companies)</h4>
-                                    <table>
-                                        <thead>
-                                            <tr>
-                                                {preview.preview.columns.map((col, idx) => (
-                                                    <th key={idx}>{col}</th>
-                                                ))}
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {preview.preview.data.map((row, rowIdx) => (
-                                                <tr key={rowIdx}>
-                                                    {row.map((cell, colIdx) => (
-                                                        <td key={colIdx}>
-                                                            {cell === null || cell === undefined ? '' :
-                                                                typeof cell === 'number' ? cell.toLocaleString('en-IN', {
-                                                                    minimumFractionDigits: 2,
-                                                                    maximumFractionDigits: 2
-                                                                }) : cell}
-                                                        </td>
-                                                    ))}
-                                                </tr>
-                                            ))}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-                        ) : (
-                            <div className="no-preview">
-                                <span>👁️</span>
-                                <p>No preview available yet. Upload files and click "Preview Data" to see results.</p>
-                            </div>
-                        )}
-                    </section>
+                    <PreviewTab preview={preview} />
                 )}
-            </main>
-
-            <footer className="footer">
-                <p>💼 Market Cap Consolidation Tool | Powered by React & Flask</p>
-            </footer>
+                </main>
+            </div>
         </div>
     );
 }

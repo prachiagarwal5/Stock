@@ -38,7 +38,7 @@ dotenv.load_dotenv()
 
 # MongoDB connection
 try:
-    mongo_uri = os.getenv('mongo_URI', 'mongodb://localhost:27017/Stocks')
+    mongo_uri = os.getenv('mongo_URI')
     mongo_client = MongoClient(mongo_uri)
     db = mongo_client['Stocks']
     excel_results_collection = db['excel_results']
