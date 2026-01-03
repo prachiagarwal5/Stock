@@ -13,6 +13,9 @@ import {
     MongoTab
 } from './components';
 
+// API URL from environment variable with fallback to localhost
+const VITE_API_URL = import.meta.env.VITE_API_URL;
+
 function App() {
     const [uploadedFiles, setUploadedFiles] = useState([]);
     const [loading, setLoading] = useState(false);
