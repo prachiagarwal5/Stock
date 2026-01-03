@@ -79,7 +79,7 @@ function App() {
 
     const fetchAvailableDates = async () => {
         try {
-            const response = await fetch('http://localhost:5000/api/nse-dates');
+            const response = await fetch(`${VITE_API_URL}/api/nse-dates`);
             if (response.ok) {
                 const data = await response.json();
                 setAvailableDates(data.dates);
@@ -111,7 +111,7 @@ function App() {
         setHeatmapLoading(true);
         setHeatmapError(null);
         try {
-            const response = await fetch(`http://localhost:5000/api/heatmap?index=${encodeURIComponent(indexName)}`);
+            const response = await fetch(`${VITE_API_URL}/api/heatmap?index=${encodeURIComponent(indexName)}`);
             const data = await response.json();
             if (!response.ok) {
                 throw new Error(data.error || 'Unable to load heatmap');
@@ -188,7 +188,7 @@ function App() {
 
         try {
             const formattedDate = convertDateFormat(nseDate);
-            const response = await fetch('http://localhost:5000/api/download-nse', {
+            const response = await fetch(`${VITE_API_URL}/api/download-nse`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -235,7 +235,7 @@ function App() {
         setRangeProgress(null);
 
         try {
-            const response = await fetch('http://localhost:5000/api/download-nse-range', {
+            const response = await fetch(`${VITE_API_URL}/api/download-nse-range`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -300,7 +300,7 @@ function App() {
         setSuccess(null);
 
         try {
-            const response = await fetch('http://localhost:5000/api/consolidate-saved', {
+            const response = await fetch(`${VITE_API_URL}/api/consolidate-saved`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -374,7 +374,7 @@ function App() {
         uploadedFiles.forEach(file => formData.append('files', file));
 
         try {
-            const response = await fetch('http://localhost:5000/api/preview', {
+            const response = await fetch(`${VITE_API_URL}/api/preview`, {
                 method: 'POST',
                 body: formData
             });
@@ -409,7 +409,7 @@ function App() {
         // Only local download
 
         try {
-            const response = await fetch('http://localhost:5000/api/consolidate', {
+            const response = await fetch(`${VITE_API_URL}/api/consolidate`, {
                 method: 'POST',
                 body: formData
             });
@@ -436,7 +436,7 @@ function App() {
         setDashboardLoading(true);
         setDashboardError(null);
         try {
-            const response = await fetch(`http://localhost:5000/api/dashboard-data?limit=${limit}`);
+            const response = await fetch(`${VITE_API_URL}/api/dashboard-data?limit=${limit}`);
             if (!response.ok) {
                 const err = await response.json();
                 throw new Error(err.error || 'Failed to load dashboard data');
@@ -457,7 +457,7 @@ function App() {
         setSuccess(null);
 
         try {
-            const response = await fetch('http://localhost:5000/api/update-indices', {
+            const response = await fetch(`${VITE_API_URL}/api/update-indices`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -472,7 +472,7 @@ function App() {
 
             setSuccess(`✅ Indices updated for ${data.count} symbols`);
             if (data.download_path) {
-                window.open(`http://localhost:5000${data.download_path}`, '_blank');
+                window.open(`${VITE_API_URL}${data.download_path}`, '_blank');
             }
 
             if (activeTab === 'mongo') {
@@ -509,7 +509,7 @@ function App() {
         setSuccess(null);
 
         try {
-            const response = await fetch('http://localhost:5000/api/nse-symbol-dashboard', {
+            const response = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -544,7 +544,7 @@ function App() {
         }
 
         try {
-            const response = await fetch(`http://localhost:5000${dashboardResult.download_url}`);
+            const response = await fetch(`${VITE_API_URL}${dashboardResult.download_url}`);
             if (!response.ok) {
                 const ct = response.headers.get('content-type') || '';
                 if (ct.includes('application/json')) {
