@@ -1286,7 +1286,7 @@ def nse_symbol_dashboard():
         provided_symbols = data.get('symbols') or []
         top_n = data.get('top_n', 1000)
         top_n_by = data.get('top_n_by') or 'mcap'
-        parallel_workers = data.get('parallel_workers', 25)
+        parallel_workers = data.get('parallel_workers', 100)
         chunk_size = data.get('chunk_size', 100)
         as_on = datetime.now().strftime('%Y-%m-%d')
         page = int(data.get('page', 1)) if str(data.get('page', '')).strip() != '' else 1
@@ -1396,8 +1396,6 @@ def nse_symbol_dashboard():
             excel_path = temp_file.name
             temp_file.close()
 
-        print(f"[symbol-dashboard] symbols_total={total_symbols} slice={len(symbols_slice)} top_n={top_n} by={top_n_by} workers={parallel_workers} chunk={chunk_size}")
-
         # Fetch PR data for % of traded days calculation
         symbol_pr_data = {}
         if symbol_aggregates_collection is not None:
@@ -1458,13 +1456,26 @@ def nse_symbol_dashboard():
 
         # Run in parallel batches to speed up large symbol lists
         try:
-            workers = int(parallel_workers) if str(parallel_workers).strip() != '' else 25
+            workers = int(parallel_workers) if str(parallel_workers).strip() != '' else 100
         except Exception:
-            workers = 25
+            workers = 100
         try:
             chunk_val = int(chunk_size) if str(chunk_size).strip() != '' else 100
         except Exception:
             chunk_val = 100
+
+        max_workers_allowed = 100
+        if workers < max_workers_allowed:
+            workers = max_workers_allowed
+        effective_workers = min(workers, max_workers_allowed)
+        chunk_val = max(1, chunk_val)
+
+        print(
+            f"[symbol-dashboard] symbols_total={total_symbols} "
+            f"slice={len(symbols_slice)} top_n={top_n} by={top_n_by} "
+            f"workers_requested={workers} workers_max={max_workers_allowed} "
+            f"workers_used={effective_workers} chunk={chunk_val}"
+        )
 
         result = fetcher.build_dashboard(
             symbols_slice,
@@ -1472,8 +1483,8 @@ def nse_symbol_dashboard():
             max_symbols=None,
             as_of=as_on,
             parallel=True,
-            max_workers=max(1, min(workers, 32)),
-            chunk_size=max(1, chunk_val),
+            max_workers=effective_workers,
+            chunk_size=chunk_val,
             symbol_pr_data=symbol_pr_data,
             symbol_mcap_data=symbol_mcap_data
         )
