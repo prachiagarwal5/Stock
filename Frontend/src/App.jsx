@@ -161,11 +161,12 @@ function App() {
                 if (err?.name === 'AbortError') {
                     throw new Error('Download cancelled');
                 }
-                console.warn('Save picker failed, using browser download fallback', err);
+                // SecurityError is expected when called after async operations (not a direct user gesture)
+                // Silently fall through to browser download fallback
             }
         }
 
-        // Browser lacks picker (e.g., Safari/Firefox) or picker failed; inform user and fallback
+        // Browser lacks picker or picker failed (async context); use standard download
         const url = window.URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
@@ -174,9 +175,7 @@ function App() {
         link.click();
         window.URL.revokeObjectURL(url);
         document.body.removeChild(link);
-        if (!pickerUsed) {
-            setSuccess(`Saved to browser default downloads. To choose a folder each time, use Chrome/Edge on HTTPS/localhost with downloads set to "Ask where to save each file".`);
-        }
+        // Don't show message for fallback - it's the expected behavior on deployed sites
         return { filename: defaultName, pickerUsed };
     };
 
