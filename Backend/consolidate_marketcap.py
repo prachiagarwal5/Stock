@@ -1,12 +1,16 @@
-import pandas as pd
 import glob
-import os
 import json
-from datetime import datetime
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+import xlsxwriter
+import numpy as np
+
+import pandas as pd
+
 
 class MarketCapConsolidator:
     def __init__(self, data_folder, output_file='Finished_Product.xlsx', config_file='corporate_actions.json', file_type='mcap'):
@@ -20,39 +24,32 @@ class MarketCapConsolidator:
         self._detect_columns()
 
     def _is_summary_symbol(self, symbol):
-        """Return True for summary rows like Total/Listed (with variations/spaces)."""
         if symbol is None:
             return False
         text = str(symbol).strip().upper()
         if not text:
             return False
         normalized = re.sub(r'[^A-Z0-9]', '', text)
-        summary_tokens = {'TOTAL', 'LISTED', 'TOTALLISTED', 'LISTEDTOTAL'}
-        if normalized in summary_tokens:
+        if normalized in {'TOTAL', 'LISTED', 'TOTALLISTED', 'LISTEDTOTAL'}:
             return True
         if text.startswith('TOTAL') or text.startswith('LISTED'):
             return True
         return False
-    
+
     def _detect_columns(self):
-        """Detect which columns to use based on file type"""
         if self.file_type == 'pr':
-            # PR files use: SECURITY, NET_TRDVAL (value) and need to align to MCAP security names
             self.symbol_col = 'SECURITY'
             self.value_col = 'NET_TRDVAL'
-            self.name_col = 'SECURITY'  # Use SECURITY for company name in PR files
+            self.name_col = 'SECURITY'
             self.avg_col = 'Average Net Traded Value'
         else:
-            # MCAP files use: Symbol, Market Cap(Rs.)
             self.symbol_col = 'Symbol'
             self.value_col = 'Market Cap(Rs.)'
             self.name_col = 'Security Name'
             self.avg_col = 'Average Market Cap'
-
         self.days_col = 'Days With Data'
-    
+
     def _load_corporate_actions(self):
-        """Load corporate actions configuration"""
         if os.path.exists(self.config_file):
             with open(self.config_file, 'r') as f:
                 return json.load(f)
@@ -61,40 +58,25 @@ class MarketCapConsolidator:
             "name_changes": [],
             "delistings": []
         }
-    
+
     def _extract_date_from_filename(self, filename):
-        """Extract date from filename like mcap10112025.csv or pr10112025.csv"""
-        # Try mcap pattern first
         match = re.search(r'mcap(\d{8})', filename)
         if match:
-            date_str = match.group(1)
-            # Format: DDMMYYYY
-            day = date_str[0:2]
-            month = date_str[2:4]
-            year = date_str[4:8]
-            return f"{day}-{month}-{year}"
-        
-        # Try pr pattern
+            d = match.group(1)
+            return f"{d[0:2]}-{d[2:4]}-{d[4:8]}"
         match = re.search(r'pr(\d{8})', filename)
         if match:
-            date_str = match.group(1)
-            # Format: DDMMYYYY
-            day = date_str[0:2]
-            month = date_str[2:4]
-            year = date_str[4:8]
-            return f"{day}-{month}-{year}"
-        
+            d = match.group(1)
+            return f"{d[0:2]}-{d[2:4]}-{d[4:8]}"
         return None
-    
+
     def _parse_date_string(self, date_str):
-        """Parse date string like '10-11-2025' to datetime"""
         try:
             return datetime.strptime(date_str, "%d-%m-%Y")
-        except:
+        except Exception:
             return None
 
     def _normalize_name(self, name):
-        """Lowercase and strip non-alphanumeric for matching"""
         if not isinstance(name, str):
             name = str(name)
         name = name.lower().strip()
@@ -102,411 +84,296 @@ class MarketCapConsolidator:
         return name.strip()
 
     def _build_mcap_lookup(self):
-        """Build a lookup of MCAP security names to symbols for PR filtering"""
         lookup = {}
         pattern = os.path.join(self.data_folder, 'mcap*.csv')
-        for mcap_file in glob.glob(pattern):
-            try:
-                df_mcap = pd.read_csv(mcap_file)
-                df_mcap.columns = df_mcap.columns.str.strip()
-                if 'Security Name' not in df_mcap.columns or 'Symbol' not in df_mcap.columns:
-                    continue
-                for _, row in df_mcap.iterrows():
-                    name = str(row.get('Security Name', '')).strip()
-                    symbol = str(row.get('Symbol', '')).strip()
-                    if name:
-                        name_key = self._normalize_name(name)
-                        if name_key and name_key not in lookup:
-                            lookup[name_key] = {'symbol': symbol, 'name': name}
-                    if symbol:
-                        symbol_key = self._normalize_name(symbol)
-                        if symbol_key and symbol_key not in lookup:
-                            lookup[symbol_key] = {'symbol': symbol, 'name': name or symbol}
-            except Exception as e:
-                print(f"Warning: could not read MCAP file {mcap_file}: {e}")
+        mcap_files = sorted(glob.glob(pattern))
+        if not mcap_files:
+            return lookup
+
+        mcap_file = mcap_files[-1]
+        try:
+            df_mcap = pd.read_csv(mcap_file, usecols=['Security Name', 'Symbol'], dtype=str)
+            df_mcap.columns = df_mcap.columns.str.strip()
+            df_mcap = df_mcap.dropna(subset=['Security Name', 'Symbol'])
+            df_mcap['name_key'] = df_mcap['Security Name'].apply(self._normalize_name)
+            df_mcap['symbol_key'] = df_mcap['Symbol'].apply(self._normalize_name)
+
+            for name_key, symbol, sec_name in zip(df_mcap['name_key'], df_mcap['Symbol'], df_mcap['Security Name']):
+                if name_key and name_key not in lookup:
+                    lookup[name_key] = {'symbol': symbol, 'name': sec_name}
+            for symbol_key, symbol, sec_name in zip(df_mcap['symbol_key'], df_mcap['Symbol'], df_mcap['Security Name']):
+                if symbol_key and symbol_key not in lookup:
+                    lookup[symbol_key] = {'symbol': symbol, 'name': sec_name}
+        except Exception as exc:
+            print(f"Warning: could not read MCAP file {mcap_file}: {exc}")
         return lookup
-    
+
     def load_and_consolidate_data(self):
-        """Load all CSV files and consolidate data"""
-        # Choose file pattern based on type
-        if self.file_type == 'pr':
-            pattern = os.path.join(self.data_folder, 'pr*.csv')
-        else:
-            pattern = os.path.join(self.data_folder, 'mcap*.csv')
-        
+        stage_start = time.perf_counter()
+        pattern = os.path.join(self.data_folder, 'pr*.csv' if self.file_type == 'pr' else 'mcap*.csv')
         csv_files = sorted(glob.glob(pattern))
-        
         if not csv_files:
             print(f"No {self.file_type.upper()} CSV files found in {self.data_folder}")
-            return 0, 0  # Return 0, 0 instead of False
-        
-        print(f"Found {len(csv_files)} {self.file_type.upper()} CSV files")
-        
-        # Dictionary to store data: {symbol: {date: value}}
-        consolidated_data = {}
-        company_names = {}  # Store company names
-        self.dates_list = []
+            return 0, 0
 
-        # For PR files, pre-load MCAP security names to filter down to only overlapping entries
+        print(f"Found {len(csv_files)} {self.file_type.upper()} CSV files")
+
         mcap_lookup = {}
         if self.file_type == 'pr':
             mcap_lookup = self._build_mcap_lookup()
             print(f"Loaded {len(mcap_lookup)} MCAP security names for PR filtering")
-        
-        for csv_file in csv_files:
-            date_str = self._extract_date_from_filename(os.path.basename(csv_file))
-            if not date_str:
-                continue
-            
-            self.dates_list.append((date_str, self._parse_date_string(date_str)))
-            print(f"Processing: {os.path.basename(csv_file)} ({date_str})")
-            
-            # Read CSV
+
+        frames = []
+        self.dates_list = []
+
+        # Parallel CSV loading to reduce wall time
+        def process_file(csv_file):
+            start = time.perf_counter()
+            date_str_local = self._extract_date_from_filename(os.path.basename(csv_file))
+            if not date_str_local:
+                return None, None, {'file': csv_file, 'status': 'skipped', 'reason': 'no date', 'rows': 0, 'elapsed': time.perf_counter() - start}
             try:
-                df = pd.read_csv(csv_file)
-                # Strip whitespace from column names
-                df.columns = df.columns.str.strip()
-            except Exception as e:
-                print(f"Error reading {csv_file}: {e}")
-                continue
-            
-            # Check if required columns exist
-            if self.symbol_col not in df.columns:
-                print(f"Warning: Column '{self.symbol_col}' not found. Available columns: {list(df.columns)}")
-                continue
-            
-            if self.value_col not in df.columns:
-                print(f"Warning: Column '{self.value_col}' not found. Available columns: {list(df.columns)}")
-                continue
-            
-            # Extract Symbol and Value (Market Cap or NET_TRDVAL)
-            for idx, row in df.iterrows():
-                raw_symbol = str(row.get(self.symbol_col, '')).strip()
-                value = row.get(self.value_col, '')
-                company_name = str(row.get(self.name_col, raw_symbol)).strip()
+                df_local = pd.read_csv(csv_file)
+                df_local.columns = df_local.columns.str.strip()
+            except Exception:
+                return None, None, {'file': csv_file, 'status': 'error', 'reason': 'read failed', 'rows': 0, 'elapsed': time.perf_counter() - start}
 
-                # Skip summary rows like TOTAL/LISTED (with variations/spaces)
-                if self._is_summary_symbol(raw_symbol):
-                    continue
+            if self.symbol_col not in df_local.columns or self.value_col not in df_local.columns:
+                return None, None, {'file': csv_file, 'status': 'skipped', 'reason': 'missing columns', 'rows': 0, 'elapsed': time.perf_counter() - start}
 
-                if self.file_type == 'pr' and mcap_lookup:
-                    lookup_key = self._normalize_name(company_name)
-                    symbol_key = self._normalize_name(raw_symbol)
-                    match = mcap_lookup.get(lookup_key) or mcap_lookup.get(symbol_key)
-                    if not match:
-                        continue  # Skip securities not present in MCAP
-                    symbol = match.get('symbol') or raw_symbol
-                    company_name = match.get('name') or company_name
-                else:
-                    symbol = raw_symbol
-                
-                if symbol and value:
-                    if symbol not in consolidated_data:
-                        consolidated_data[symbol] = {}
-                    
-                    # Convert value to float (retain original units)
-                    try:
-                        value_float = float(value)
-                        consolidated_data[symbol][date_str] = value_float
-                    except:
-                        consolidated_data[symbol][date_str] = None
-                    
-                    company_names[symbol] = company_name
-        
-        # Sort dates
+            df_local = df_local[[self.symbol_col, self.name_col, self.value_col]].copy()
+            df_local['_date_str'] = date_str_local
+
+            sym_upper = df_local[self.symbol_col].astype(str).str.upper()
+            sym_norm = sym_upper.str.replace(r'[^A-Z0-9]', '', regex=True)
+            summary_mask = sym_norm.isin({'TOTAL', 'LISTED', 'TOTALLISTED', 'LISTEDTOTAL'}) | sym_upper.str.startswith(('TOTAL', 'LISTED'))
+            df_local = df_local[~summary_mask]
+            if df_local.empty:
+                return None, date_str_local, {'file': csv_file, 'status': 'empty after summary filter', 'rows': 0, 'elapsed': time.perf_counter() - start}
+
+            if self.file_type == 'pr' and mcap_lookup:
+                sym_map = {k: v.get('symbol') for k, v in mcap_lookup.items() if v.get('symbol')}
+                name_map = {k: v.get('name') for k, v in mcap_lookup.items() if v.get('name')}
+
+                df_local['norm_name'] = df_local[self.name_col].astype(str).str.lower().str.replace(r'[^a-z0-9]+', ' ', regex=True).str.strip()
+                df_local['norm_symbol'] = df_local[self.symbol_col].astype(str).str.lower().str.replace(r'[^a-z0-9]+', ' ', regex=True).str.strip()
+
+                mapped_symbol = df_local['norm_name'].map(sym_map).combine_first(df_local['norm_symbol'].map(sym_map))
+                mapped_name = df_local['norm_name'].map(name_map).combine_first(df_local['norm_symbol'].map(name_map)).fillna(df_local[self.name_col])
+
+                df_local['Symbol'] = mapped_symbol
+                df_local['Company Name'] = mapped_name
+                df_local = df_local[df_local['Symbol'].notna()]
+            else:
+                df_local['Symbol'] = df_local[self.symbol_col].astype(str).str.strip()
+                df_local['Company Name'] = df_local[self.name_col].astype(str).str.strip()
+
+            df_local['Value'] = pd.to_numeric(df_local[self.value_col], errors='coerce')
+            df_local = df_local[['Symbol', 'Company Name', 'Value', '_date_str']]
+            elapsed = time.perf_counter() - start
+            if df_local is None or df_local.empty:
+                return None, date_str_local, {'file': csv_file, 'status': 'empty after mapping', 'rows': 0, 'elapsed': elapsed}
+            meta = {
+                'file': csv_file,
+                'status': 'ok',
+                'rows': len(df_local),
+                'elapsed': elapsed,
+                'details': {
+                    'after_summary_rows': len(df_local),
+                    'date': date_str_local
+                }
+            }
+            return df_local, date_str_local, meta
+
+        workers = min(20, max(2, (os.cpu_count() or 4)))
+        print(f"Loading CSVs with {workers} workers...")
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(process_file, csv_file): csv_file for csv_file in csv_files}
+            for future in as_completed(future_map):
+                df_local, date_str_local, meta = future.result()
+                if meta:
+                    status = meta.get('status', 'unknown')
+                    rows = meta.get('rows', 0)
+                    elapsed = meta.get('elapsed', 0)
+                    fname = os.path.basename(meta.get('file', ''))
+                    reason = meta.get('reason', '')
+                    details = meta.get('details', {})
+                    if status == 'ok':
+                        extra = f" date={details.get('date','')} after_summary_rows={details.get('after_summary_rows', rows)}"
+                        print(f"[worker] {fname}: {rows} rows in {elapsed:.2f}s{extra}")
+                    elif reason:
+                        print(f"[worker] {fname}: {status} ({reason}) in {elapsed:.2f}s")
+                    else:
+                        print(f"[worker] {fname}: {status} in {elapsed:.2f}s")
+                if date_str_local:
+                    self.dates_list.append((date_str_local, self._parse_date_string(date_str_local)))
+                if df_local is not None and not df_local.empty:
+                    frames.append(df_local)
+
+        print(f"Loaded CSVs in {time.perf_counter() - stage_start:.2f}s; merging...")
+
+        merge_start = time.perf_counter()
+
+        self.dates_list = [item for item in self.dates_list if item[1] is not None]
         self.dates_list.sort(key=lambda x: x[1])
         sorted_dates = [d[0] for d in self.dates_list]
-        
-        # Create consolidated dataframe
-        data_for_df = []
-        for symbol in sorted(consolidated_data.keys()):
-            row = {
-                'Symbol': symbol,
-                'Company Name': company_names.get(symbol, symbol)
-            }
-            
-            # Compute totals/averages only for days with data
-            values_with_data = [
-                consolidated_data[symbol].get(date_str)
-                for date_str in sorted_dates
-                if consolidated_data[symbol].get(date_str) is not None
-            ]
-            days_with_data = len(values_with_data)
-            average_value = sum(values_with_data) / days_with_data if days_with_data > 0 else None
+        if not frames:
+            print("No symbols found after processing files")
+            return 0, len(sorted_dates)
 
-            row[self.days_col] = days_with_data
-            row[self.avg_col] = average_value
+        df_all = pd.concat(frames, ignore_index=True)
+        df_all = df_all.dropna(subset=['Symbol'])
+        df_all['_date_str'] = pd.Categorical(df_all['_date_str'], categories=sorted_dates, ordered=True)
+        df_all = df_all.drop_duplicates(subset=['Symbol', '_date_str'], keep='last')
 
-            # Add values for each date
-            for date_str in sorted_dates:
-                row[date_str] = consolidated_data[symbol].get(date_str, None)
-            
-            data_for_df.append(row)
-        
-        self.df_consolidated = pd.DataFrame(data_for_df)
+        pivot = df_all.pivot(index='Symbol', columns='_date_str', values='Value')
+        pivot.reset_index(inplace=True)
 
-        # Ensure consistent column order
-        columns_order = ['Symbol', 'Company Name', self.days_col, self.avg_col] + sorted_dates
-        self.df_consolidated = self.df_consolidated[columns_order]
+        name_lookup = df_all.dropna(subset=['Company Name']).drop_duplicates(subset=['Symbol'], keep='last').set_index('Symbol')['Company Name'].to_dict()
+        pivot['Company Name'] = pivot['Symbol'].map(name_lookup).fillna(pivot['Symbol'])
 
-        # Drop any lingering summary rows that slipped through
-        self.df_consolidated = self.df_consolidated[
-            ~self.df_consolidated['Symbol'].apply(self._is_summary_symbol)
-        ]
+        date_cols = [c for c in pivot.columns if isinstance(c, str) and re.match(r"\d{2}-\d{2}-\d{4}", c)]
+        date_cols = sorted(date_cols, key=lambda d: datetime.strptime(d, '%d-%m-%Y'))
 
-        # Sort by average (descending), keep rows without averages at the end
-        self.df_consolidated = self.df_consolidated.sort_values(
-            by=self.avg_col, ascending=False, na_position='last'
-        ).reset_index(drop=True)
+        numeric_dates = pivot[date_cols].apply(pd.to_numeric, errors='coerce') if date_cols else pd.DataFrame()
+        pivot[self.days_col] = numeric_dates.count(axis=1) if not numeric_dates.empty else 0
+        pivot[self.avg_col] = numeric_dates.mean(axis=1) if not numeric_dates.empty else None
+
+        columns_order = ['Symbol', 'Company Name', self.days_col, self.avg_col] + date_cols
+        self.df_consolidated = pivot[columns_order]
+
+        self.df_consolidated = self.df_consolidated[~self.df_consolidated['Symbol'].apply(self._is_summary_symbol)]
+        self.df_consolidated = self.df_consolidated.sort_values(by=self.avg_col, ascending=False, na_position='last').reset_index(drop=True)
+
+        self.dates_list = [(d, datetime.strptime(d, '%d-%m-%Y')) for d in date_cols]
         companies_count = len(self.df_consolidated)
-        dates_count = len(sorted_dates)
-        print(f"\nConsolidated data: {companies_count} companies across {dates_count} dates")
+        dates_count = len(date_cols)
+        print(f"\nConsolidated data: {companies_count} companies across {dates_count} dates (merge/pivot in {time.perf_counter() - merge_start:.2f}s)")
         return companies_count, dates_count
-    
+
     def apply_corporate_actions(self):
-        """Apply corporate actions to blank out cells before split dates"""
         if self.df_consolidated is None:
             return
-        
+
         print("\nApplying corporate actions...")
-        
-        # Handle stock splits
+        start = time.perf_counter()
+
         for split in self.corporate_actions.get('splits', []):
             old_symbol = split.get('old_symbol', '').strip()
-            new_symbols = split.get('new_symbols', [])
             split_date = split.get('split_date', '')
-            
-            if old_symbol in self.df_consolidated['Symbol'].values:
-                print(f"Processing split: {old_symbol} -> {new_symbols} on {split_date}")
-                
-                # Find columns before split date
-                date_columns = [col for col in self.df_consolidated.columns 
-                              if col not in ['Symbol', 'Company Name']]
-                
-                split_datetime = self._parse_date_string(split_date)
-                if split_datetime:
-                    for date_col in date_columns:
-                        col_datetime = self._parse_date_string(date_col)
-                        if col_datetime and col_datetime < split_datetime:
-                            # Blank out old symbol before split
-                            self.df_consolidated.loc[
-                                self.df_consolidated['Symbol'] == old_symbol, 
-                                date_col
-                            ] = None
-        
-        # Handle name changes
+            if old_symbol not in self.df_consolidated['Symbol'].values:
+                continue
+            date_columns = [col for col in self.df_consolidated.columns if col not in ['Symbol', 'Company Name']]
+            split_dt = self._parse_date_string(split_date)
+            if not split_dt:
+                continue
+            for date_col in date_columns:
+                col_dt = self._parse_date_string(date_col)
+                if col_dt and col_dt < split_dt:
+                    self.df_consolidated.loc[self.df_consolidated['Symbol'] == old_symbol, date_col] = None
+
         for change in self.corporate_actions.get('name_changes', []):
             old_symbol = change.get('old_symbol', '').strip()
-            new_symbol = change.get('new_symbol', '').strip()
             change_date = change.get('change_date', '')
-            
-            print(f"Processing name change: {old_symbol} -> {new_symbol} on {change_date}")
-            
-            # Rename symbol from change_date onwards
-            if old_symbol in self.df_consolidated['Symbol'].values:
-                date_columns = [col for col in self.df_consolidated.columns 
-                              if col not in ['Symbol', 'Company Name']]
-                
-                change_datetime = self._parse_date_string(change_date)
-                if change_datetime:
-                    for date_col in date_columns:
-                        col_datetime = self._parse_date_string(date_col)
-                        if col_datetime and col_datetime < change_datetime:
-                            self.df_consolidated.loc[
-                                self.df_consolidated['Symbol'] == old_symbol,
-                                date_col
-                            ] = None
-    
+            if old_symbol not in self.df_consolidated['Symbol'].values:
+                continue
+            date_columns = [col for col in self.df_consolidated.columns if col not in ['Symbol', 'Company Name']]
+            change_dt = self._parse_date_string(change_date)
+            if not change_dt:
+                continue
+            for date_col in date_columns:
+                col_dt = self._parse_date_string(date_col)
+                if col_dt and col_dt < change_dt:
+                    self.df_consolidated.loc[self.df_consolidated['Symbol'] == old_symbol, date_col] = None
+
+        print(f"Corporate actions done in {time.perf_counter() - start:.2f}s")
+
     def format_excel_output(self, output_file=None):
-        """Format and save to Excel with styling"""
         if output_file:
             self.output_file = output_file
-        
-        print(f"\nCreating Excel file: {self.output_file}")
-        
-        # Replace NaN with None for cleaner output
+
+        print("Creating Excel files with parallel row prep (no formatting)...")
+        start_excel = time.perf_counter()
+
         df = self.df_consolidated.copy()
+        # Clean NaN/INF so xlsxwriter write_row doesn't fail
+        df = df.replace([np.inf, -np.inf], np.nan)
         df = df.where(pd.notna(df), None)
-        
-        # Save to temporary CSV first
-        temp_csv = self.output_file.replace('.xlsx', '_temp.csv')
-        df.to_csv(temp_csv, index=False)
-        
-        # Create Excel workbook with formatting
-        wb = Workbook()
-        ws = wb.active
-        # Title based on file type
-        if self.file_type == 'pr':
-            ws.title = "Net Traded Value"
-        else:
-            ws.title = "Market Cap Data"
 
-        # Secondary sheet for averages only
-        avg_ws = wb.create_sheet(title="Averages")
-        
-        # Header styling
-        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        header_font = Font(bold=True, color="FFFFFF", size=11)
-        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        border = Border(
-            left=Side(style='thin'),
-            right=Side(style='thin'),
-            top=Side(style='thin'),
-            bottom=Side(style='thin')
-        )
-        
-        # Write headers for main sheet
-        headers = df.columns.tolist()
-        for col_num, header in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=col_num)
-            cell.value = str(header)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = header_alignment
-            cell.border = border
-        
-        # Write data
-        # Indian grouping for financial values
-        number_format = '#,##,##0.00'
-        data_alignment = Alignment(horizontal="right", vertical="center")
-        
-        for row_num, row in enumerate(df.values, 2):
-            for col_num, value in enumerate(row, 1):
-                cell = ws.cell(row=row_num, column=col_num)
-                header = headers[col_num - 1]
-
-                if header in ['Symbol', 'Company Name']:
-                    cell.value = str(value) if value is not None else ""
-                    cell.alignment = Alignment(horizontal="left", vertical="center")
-                elif header == self.days_col:
-                    cell.value = int(value) if value not in (None, "") else None
-                    cell.alignment = data_alignment
-                    cell.number_format = '0'
-                else:  # Average column or date columns with values
-                    if value is not None and value != "" and not (isinstance(value, float) and pd.isna(value)):
-                        try:
-                            numeric_value = float(value)
-                            cell.value = numeric_value
-                            cell.number_format = number_format
-                            cell.alignment = data_alignment
-                        except (ValueError, TypeError):
-                            cell.value = value
-                            cell.alignment = data_alignment
-                    else:
-                        cell.value = None
-
-                cell.border = border
-        
-        # Adjust column widths
-        ws.column_dimensions['A'].width = 15  # Symbol
-        ws.column_dimensions['B'].width = 30  # Company Name
-        ws.column_dimensions['C'].width = 15  # Days with data
-        ws.column_dimensions['D'].width = 20  # Average
-        
-        for col_num in range(5, len(headers) + 1):
-            ws.column_dimensions[get_column_letter(col_num)].width = 18
-        
-        # Freeze panes (first row and first two columns)
-        ws.freeze_panes = "C2"
-
-        # Populate averages sheet (Symbol, Company Name, Days, Average)
+        main_sheet = 'Market Cap Data' if self.file_type == 'mcap' else 'Net Traded Value'
         avg_headers = ['Symbol', 'Company Name', self.days_col, self.avg_col]
-        for col_num, header in enumerate(avg_headers, 1):
-            cell = avg_ws.cell(row=1, column=col_num)
-            cell.value = str(header)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = header_alignment
-            cell.border = border
+        avg_df = df[avg_headers].copy()
 
-        for row_num, (_, row) in enumerate(self.df_consolidated[avg_headers].iterrows(), 2):
-            for col_num, header in enumerate(avg_headers, 1):
-                value = row[header]
-                cell = avg_ws.cell(row=row_num, column=col_num)
-                if header in ['Symbol', 'Company Name']:
-                    cell.value = str(value) if value is not None else ""
-                    cell.alignment = Alignment(horizontal="left", vertical="center")
-                elif header == self.days_col:
-                    cell.value = int(value) if value not in (None, "") else None
-                    cell.number_format = '0'
-                    cell.alignment = data_alignment
-                else:
-                    if value is not None and value != "" and not (isinstance(value, float) and pd.isna(value)):
-                        try:
-                            numeric_value = float(value)
-                            cell.value = numeric_value
-                            cell.number_format = number_format
-                            cell.alignment = data_alignment
-                        except (ValueError, TypeError):
-                            cell.value = value
-                            cell.alignment = data_alignment
-                    else:
-                        cell.value = None
-                cell.border = border
+        def chunk_rows(frame, chunk_size=5000):
+            values = frame.to_numpy()
+            chunks = []
+            for start in range(0, len(values), chunk_size):
+                chunks.append(values[start:start + chunk_size])
+            return chunks
 
-        avg_ws.column_dimensions['A'].width = 15
-        avg_ws.column_dimensions['B'].width = 30
-        avg_ws.column_dimensions['C'].width = 15
-        avg_ws.column_dimensions['D'].width = 20
-        avg_ws.freeze_panes = "C2"
-        
-        wb.save(self.output_file)
-        print(f"✓ Excel file created: {self.output_file}")
+        def flatten_chunks(chunks, max_workers):
+            rows = []
+            if not chunks:
+                return rows
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [pool.submit(lambda arr: arr.tolist(), ch) for ch in chunks]
+                for fut in as_completed(futures):
+                    rows.extend(fut.result())
+            return rows
 
-        # Save averages-only workbook as a separate file
-        avg_only_path = self.output_file.replace('.xlsx', '_Averages.xlsx')
-        avg_only_wb = Workbook()
-        avg_only_ws = avg_only_wb.active
-        avg_only_ws.title = "Averages"
+        workers = min(20, max(2, (os.cpu_count() or 4)))
 
-        for col_num, header in enumerate(avg_headers, 1):
-            cell = avg_only_ws.cell(row=1, column=col_num)
-            cell.value = str(header)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = header_alignment
-            cell.border = border
+        main_chunks = chunk_rows(df)
+        avg_chunks = chunk_rows(avg_df)
 
-        for row_num, (_, row) in enumerate(self.df_consolidated[avg_headers].iterrows(), 2):
-            for col_num, header in enumerate(avg_headers, 1):
-                value = row[header]
-                cell = avg_only_ws.cell(row=row_num, column=col_num)
-                if header in ['Symbol', 'Company Name']:
-                    cell.value = str(value) if value is not None else ""
-                    cell.alignment = Alignment(horizontal="left", vertical="center")
-                elif header == self.days_col:
-                    cell.value = int(value) if value not in (None, "") else None
-                    cell.number_format = '0'
-                    cell.alignment = data_alignment
-                else:
-                    if value is not None and value != "" and not (isinstance(value, float) and pd.isna(value)):
-                        try:
-                            numeric_value = float(value)
-                            cell.value = numeric_value
-                            cell.number_format = number_format
-                            cell.alignment = data_alignment
-                        except (ValueError, TypeError):
-                            cell.value = value
-                            cell.alignment = data_alignment
-                    else:
-                        cell.value = None
-                cell.border = border
+        print(f"Preparing rows in parallel with {workers} workers...")
+        prep_start = time.perf_counter()
+        main_rows = flatten_chunks(main_chunks, workers)
+        avg_rows = flatten_chunks(avg_chunks, workers)
+        print(f"Row prep done in {time.perf_counter() - prep_start:.2f}s")
 
-        avg_only_ws.column_dimensions['A'].width = 15
-        avg_only_ws.column_dimensions['B'].width = 30
-        avg_only_ws.column_dimensions['C'].width = 15
-        avg_only_ws.column_dimensions['D'].width = 20
-        avg_only_ws.freeze_panes = "C2"
+        workbook = xlsxwriter.Workbook(self.output_file, {'constant_memory': True, 'nan_inf_to_errors': True})
+        ws_main = workbook.add_worksheet(main_sheet)
+        ws_avg = workbook.add_worksheet('Averages')
 
-        avg_only_wb.save(avg_only_path)
-        print(f"✓ Averages-only file created: {avg_only_path}")
-        
-        # Cleanup temp file
-        if os.path.exists(temp_csv):
-            os.remove(temp_csv)
-    
+        # Basic formats
+        header_fmt = workbook.add_format({'bold': True, 'font_color': '#FFFFFF', 'bg_color': '#4F81BD', 'border': 1, 'align': 'center', 'valign': 'vcenter'})
+        text_fmt = workbook.add_format({'border': 1, 'align': 'left'})
+        int_fmt = workbook.add_format({'border': 1, 'align': 'right', 'num_format': '0'})
+        num_fmt = workbook.add_format({'border': 1, 'align': 'right', 'num_format': '#,##0.00'})
+
+        # Headers
+        for col_idx, col_name in enumerate(df.columns):
+            ws_main.write(0, col_idx, col_name, header_fmt)
+        for col_idx, col_name in enumerate(avg_df.columns):
+            ws_avg.write(0, col_idx, col_name, header_fmt)
+
+        # Column widths/formats
+        ws_main.set_column(0, 0, 15, text_fmt)
+        ws_main.set_column(1, 1, 30, text_fmt)
+        ws_main.set_column(2, 2, 12, int_fmt)
+        ws_main.set_column(3, 3, 18, num_fmt)
+        if len(df.columns) > 4:
+            ws_main.set_column(4, len(df.columns) - 1, 14, num_fmt)
+        ws_main.freeze_panes(1, 2)
+
+        ws_avg.set_column(0, 0, 15, text_fmt)
+        ws_avg.set_column(1, 1, 30, text_fmt)
+        ws_avg.set_column(2, 2, 12, int_fmt)
+        ws_avg.set_column(3, 3, 18, num_fmt)
+        ws_avg.freeze_panes(1, 2)
+
+        # Data rows
+        for row_idx, row in enumerate(main_rows, start=1):
+            ws_main.write_row(row_idx, 0, row)
+        for row_idx, row in enumerate(avg_rows, start=1):
+            ws_avg.write_row(row_idx, 0, row)
+
+        workbook.close()
+        print(f"✓ Excel file created: {self.output_file} in {time.perf_counter() - start_excel:.2f}s")
+
     def create_corporate_actions_template(self):
-        """Create a template for corporate actions if it doesn't exist"""
         if not os.path.exists(self.config_file):
             template = {
                 "splits": [
@@ -533,36 +400,34 @@ class MarketCapConsolidator:
                     }
                 ]
             }
-            
             with open(self.config_file, 'w') as f:
                 json.dump(template, f, indent=2)
             print(f"✓ Created corporate actions template: {self.config_file}")
-    
+
     def run(self):
-        """Run the complete consolidation process"""
         file_type_name = "Net Traded Value" if self.file_type == 'pr' else "Market Cap"
         print("=" * 60)
         print(f"{file_type_name} Consolidation Tool")
         print("=" * 60)
-        
+
         self.create_corporate_actions_template()
-        
+
+        overall_start = time.perf_counter()
         companies_count, dates_count = self.load_and_consolidate_data()
         if companies_count > 0:
             self.apply_corporate_actions()
             self.format_excel_output()
-            print("\n✓ Consolidation complete!")
+            print(f"\n✓ Consolidation complete! Total elapsed {time.perf_counter() - overall_start:.2f}s")
             return True
-        else:
-            print("✗ Consolidation failed!")
-            return False
+        print("✗ Consolidation failed!")
+        return False
+
 
 def main():
-    # Set the data folder
     data_folder = '/Users/vinayak/Desktop/Proj01/nosubject'
-    
     consolidator = MarketCapConsolidator(data_folder)
     consolidator.run()
+
 
 if __name__ == "__main__":
     main()

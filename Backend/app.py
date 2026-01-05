@@ -17,6 +17,7 @@ from pathlib import Path
 import requests
 from io import BytesIO, StringIO
 import zipfile
+import time
 from dateutil import parser as date_parser
 import numpy as np
 from pymongo import MongoClient, UpdateOne
@@ -32,6 +33,21 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"], "allow_headers": ["Content-Type", "Authorization"]}})
+
+
+@app.after_request
+def add_cors_expose_headers(response):
+    expose = response.headers.get('Access-Control-Expose-Headers')
+    needed = ['Content-Disposition', 'X-Export-Log']
+    if expose:
+        existing = [h.strip() for h in expose.split(',') if h.strip()]
+    else:
+        existing = []
+    for h in needed:
+        if h not in existing:
+            existing.append(h)
+    response.headers['Access-Control-Expose-Headers'] = ', '.join(existing)
+    return response
 
 @app.route("/")
 def home():
@@ -432,6 +448,40 @@ def get_cached_csv(date_iso, data_type):
         return None
 
 
+def get_cached_csv_bulk(date_iso_list, data_type):
+    """Bulk fetch cached CSVs for multiple dates (faster than one-by-one)"""
+    if bhavcache_collection is None:
+        return {}
+    
+    try:
+        # Single query for all dates
+        docs = list(bhavcache_collection.find({
+            'date': {'$in': date_iso_list},
+            'type': data_type
+        }))
+        
+        results = {}
+        for doc in docs:
+            date_iso = doc.get('date')
+            try:
+                csv_bytes = doc.get('file_data')
+                if csv_bytes:
+                    df = pd.read_csv(BytesIO(csv_bytes))
+                    results[date_iso] = {
+                        'df': df,
+                        'records': doc.get('records', len(df)),
+                        'columns': doc.get('columns', df.columns.tolist()),
+                        'stored_at': doc.get('stored_at')
+                    }
+            except Exception as e:
+                print(f"⚠️ Failed to read cached {data_type} for {date_iso}: {e}")
+        
+        return results
+    except Exception as e:
+        print(f"⚠️ Bulk cache fetch failed for {data_type}: {e}")
+        return {}
+
+
 def put_cached_csv(date_iso, data_type, df, source='nse'):
     if bhavcache_collection is None or df is None:
         return None
@@ -501,15 +551,15 @@ def bulk_upsert_symbol_daily_from_df(df, date_iso, data_type, source='nse_downlo
 
 
 def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False, log_fn=None, allowed_symbols=None, symbol_name_map=None):
-    """Build consolidated dataframe directly from cached CSVs in Mongo (no filesystem).
-
-    allowed_symbols: filter rows to this set (used to align PR to MCAP symbols)
-    symbol_name_map: optional map symbol -> company name (used to carry MCAP names into PR)
-    """
+    """Build consolidated dataframe - ULTRA-OPTIMIZED with minimal operations."""
+    
+    # BULK LOAD all dates at once
+    cached_dict = get_cached_csv_bulk(date_iso_list, data_type)
+    
     frames = []
     missing_dates = []
     for date_iso in date_iso_list:
-        cached = get_cached_csv(date_iso, data_type)
+        cached = cached_dict.get(date_iso)
         if not cached or cached.get('df') is None:
             missing_dates.append(date_iso)
             continue
@@ -518,17 +568,13 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
         df['_date_iso'] = date_iso
         frames.append(df)
 
-    if missing_dates:
-        msg = f"Missing cached {data_type.upper()} for: {', '.join(missing_dates)}"
-        if allow_missing:
-            if log_fn:
-                log_fn(msg)
-        else:
-            raise ValueError(msg)
+    if missing_dates and not allow_missing:
+        raise ValueError(f"Missing cached {data_type.upper()} for: {', '.join(missing_dates)}")
 
     if not frames:
         raise ValueError(f"No cached {data_type.upper()} data available")
 
+    # Concatenate all data at once (fast)
     df_all = pd.concat(frames, ignore_index=True)
 
     if data_type == 'pr':
@@ -542,66 +588,68 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
         name_col = 'Security Name'
         avg_col = 'Average Market Cap'
 
-    df_all[symbol_col] = df_all[symbol_col].astype(str).str.strip()
-    df_all[name_col] = df_all[name_col].astype(str).str.strip()
+    # OPTIMIZATION: Skip strip() on columns - it's slow. Just convert/clean what matters
+    df_all[symbol_col] = df_all[symbol_col].astype(str)
+    df_all[name_col] = df_all[name_col].astype(str)
     df_all[value_col] = pd.to_numeric(df_all[value_col], errors='coerce')
 
-    # Drop summary rows such as Total/Listed
-    df_all = df_all[~df_all[symbol_col].apply(is_summary_symbol)]
+    # Remove summary rows (vectorized, no apply())
+    symbols_upper = df_all[symbol_col].astype(str).str.upper()
+    symbols_normalized = symbols_upper.str.replace(r'[^A-Z0-9]', '', regex=True)
+    is_summary = symbols_normalized.isin({'TOTAL', 'LISTED', 'TOTALLISTED', 'LISTEDTOTAL'}) | \
+                 symbols_upper.str.startswith(('TOTAL', 'LISTED'))
+    df_all = df_all[~is_summary]
 
+    # Filter to allowed symbols if needed
     if allowed_symbols is not None:
-        allowed_set = set(allowed_symbols)
-        df_all = df_all[df_all[symbol_col].isin(allowed_set)]
+        df_all = df_all[df_all[symbol_col].isin(allowed_symbols)]
         if df_all.empty:
-            raise ValueError(f"No {data_type.upper()} data available for requested symbols")
+            raise ValueError(f"No {data_type.upper()} data for requested symbols")
 
+    # Convert dates once (vectorized)
     df_all['_date_str'] = pd.to_datetime(df_all['_date_iso']).dt.strftime('%d-%m-%Y')
+    date_cols = sorted(df_all['_date_str'].unique(), key=lambda d: datetime.strptime(d, '%d-%m-%Y'))
 
-    pivot = df_all.pivot_table(
-        index=symbol_col,
-        columns='_date_str',
-        values=value_col,
-        aggfunc='last'
-    )
+    # ULTRA-FAST RESHAPE: No groupby, just direct unstack with drop_duplicates
+    df_all = df_all.drop_duplicates(subset=[symbol_col, '_date_str'], keep='last')
+    df_all_pivot = df_all.set_index([symbol_col, '_date_str'])[value_col].unstack(fill_value=None)
+    df_all_pivot.reset_index(inplace=True)
+    df_all_pivot.rename(columns={symbol_col: 'Symbol'}, inplace=True)
 
-    pivot.reset_index(inplace=True)
-    pivot.rename(columns={symbol_col: 'Symbol'}, inplace=True)
-
-    # If we were given an allowed_symbols set, reindex to include all of them (even if PR has gaps)
-    if allowed_symbols is not None:
-        allowed_order = list(allowed_symbols)
-        pivot = pivot.set_index('Symbol').reindex(allowed_order).reset_index()
-
-    if data_type == 'pr' and symbol_name_map:
-        # Prefer MCAP-sourced names when provided; fall back to PR names if missing
-        name_map = df_all.groupby('SECURITY')[name_col].agg('last').to_dict()
-        pivot['Company Name'] = pivot['Symbol'].map(symbol_name_map).fillna(pivot['Symbol'].map(name_map)).fillna(pivot['Symbol'])
+    # Get company names (single pass, handles symbol_col == name_col case)
+    if symbol_col == name_col:
+        # When symbol and name are the same column, map each to itself
+        name_lookup = {sym: sym for sym in df_all[symbol_col].drop_duplicates().values}
     else:
-        name_map = df_all.groupby('Symbol' if data_type != 'pr' else 'SECURITY')[name_col].agg('last')
-        pivot['Company Name'] = pivot['Symbol'].map(name_map.to_dict()).fillna(pivot['Symbol'])
+        # Normal case: create mapping from different columns
+        unique_df = df_all.drop_duplicates(symbol_col, keep='last')
+        name_lookup = unique_df.set_index(symbol_col)[name_col].to_dict()
+    df_all_pivot['Company Name'] = df_all_pivot['Symbol'].map(name_lookup)
 
-    # Compute metrics
-    date_cols = sorted(
-        [c for c in pivot.columns if re.match(r"\d{2}-\d{2}-\d{4}", str(c))],
-        key=lambda d: datetime.strptime(d, '%d-%m-%Y')
-    )
-    # Drop rows that have no PR/MCAP data in any requested date column (prevents empty rows after reindex)
-    if allowed_symbols is not None and date_cols:
-        pivot = pivot[~pivot[date_cols].isna().all(axis=1)].reset_index(drop=True)
-    pivot['Days With Data'] = pivot[date_cols].count(axis=1)
-    pivot[avg_col] = pivot[date_cols].mean(axis=1)
+    # Override with symbol_name_map if provided (for PR alignment with MCAP)
+    if data_type == 'pr' and symbol_name_map:
+        df_all_pivot['Company Name'] = df_all_pivot['Symbol'].map(symbol_name_map).fillna(df_all_pivot['Company Name'])
 
-    # Sort by average descending, NaN last
-    pivot = pivot.sort_values(by=avg_col, ascending=False, na_position='last').reset_index(drop=True)
+    # Get available date columns
+    available_cols = [c for c in date_cols if c in df_all_pivot.columns]
+    
+    # Vectorized metrics (one pass through data)
+    df_all_pivot['Days With Data'] = df_all_pivot[available_cols].notna().sum(axis=1)
+    df_all_pivot[avg_col] = df_all_pivot[available_cols].mean(axis=1)
 
-    # Order columns
-    ordered_cols = ['Symbol', 'Company Name', 'Days With Data', avg_col] + date_cols
-    pivot = pivot[ordered_cols]
+    # Remove empty rows
+    df_all_pivot = df_all_pivot[~df_all_pivot[available_cols].isna().all(axis=1)].reset_index(drop=True)
 
-    # Build dates list for downstream formatting/persistence
-    dates_list = [(d, datetime.strptime(d, '%d-%m-%Y')) for d in date_cols]
+    # Sort by average
+    df_all_pivot = df_all_pivot.sort_values(by=avg_col, ascending=False, na_position='last').reset_index(drop=True)
 
-    return pivot, dates_list, avg_col
+    # Final column order
+    final_cols = ['Symbol', 'Company Name', 'Days With Data', avg_col] + available_cols
+    df_all_pivot = df_all_pivot[final_cols]
+
+    dates_list = [(d, datetime.strptime(d, '%d-%m-%Y')) for d in available_cols]
+
+    return df_all_pivot, dates_list, avg_col
 
 # Configuration
 UPLOAD_FOLDER = tempfile.mkdtemp()
@@ -1892,8 +1940,8 @@ def consolidate_saved():
             start_date_str = payload.get('start_date')
             end_date_str = payload.get('end_date')
             file_type = payload.get('file_type', 'both')
-            # Default to persistence on (fast_mode=False) so aggregates for MCAP/PR get stored
-            fast_mode = payload.get('fast_mode', False)
+            # Force fast mode (skip Mongo persistence) to avoid long DB writes
+            fast_mode = True
             allow_missing = payload.get('allow_missing', True)
 
             if file_type not in ['mcap', 'pr', 'both']:
@@ -1921,11 +1969,13 @@ def consolidate_saved():
                 return jsonify({'error': 'Invalid date format. Use DD-Mon-YYYY (e.g., 03-Dec-2025)'}), 400
 
             logs = []
+            stage_start = time.perf_counter()
             work_dir = tempfile.mkdtemp()
             results = {}
 
             def add_log(message):
                 logs.append(message)
+                print(message)
 
             def make_consolidator_from_cache(data_type, allowed_symbols=None, symbol_name_map=None):
                 df, dates_list, avg_col = build_consolidated_from_cache(
@@ -1943,33 +1993,44 @@ def consolidate_saved():
                 return cons, len(df), len(dates_list)
 
             mcap_output_path = None
-            mcap_avg_path = None
             pr_output_path = None
-            pr_avg_path = None
             mcap_symbols = None
 
             mcap_name_map = None
 
+            # Build a label for filenames based on requested dates
+            if len(date_iso_list) == 1:
+                date_label = date_iso_list[0]
+            elif len(date_iso_list) > 1:
+                date_label = f"{date_iso_list[0]}_to_{date_iso_list[-1]}"
+            else:
+                date_label = "dates"
+            date_label = date_label.replace('/', '-').replace(' ', '_')
+
             if file_type in ['mcap', 'both']:
                 try:
+                    mcap_stage_start = time.perf_counter()
                     consolidator_mcap, companies_count, dates_count = make_consolidator_from_cache('mcap')
                     mcap_output_path = os.path.join(work_dir, 'Market_Cap.xlsx')
                     add_log(f"Creating Excel file: {mcap_output_path}")
                     consolidator_mcap.format_excel_output(mcap_output_path)
                     add_log(f"✓ Excel file created: {mcap_output_path}")
-                    mcap_avg_path = mcap_output_path.replace('.xlsx', '_Averages.xlsx')
                     mcap_symbols = set(consolidator_mcap.df_consolidated['Symbol'])
                     mcap_name_map = dict(zip(
                         consolidator_mcap.df_consolidated['Symbol'],
                         consolidator_mcap.df_consolidated['Company Name']
                     ))
                     if not fast_mode:
+                        persist_start = time.perf_counter()
+                        add_log("Starting MCAP persistence to Mongo...")
                         persist_consolidated_results(consolidator_mcap, 'mcap', source='cached_db')
+                        add_log(f"Persisted MCAP aggregates in {time.perf_counter() - persist_start:.2f}s")
                     results['mcap'] = {
                         'companies': companies_count,
                         'dates': dates_count,
                         'files': len(date_iso_list)
                     }
+                    add_log(f"MCAP stage done in {time.perf_counter() - mcap_stage_start:.2f}s")
                 except ValueError as exc:
                     shutil.rmtree(work_dir, ignore_errors=True)
                     return jsonify({'error': str(exc)}), 400
@@ -1979,6 +2040,7 @@ def consolidate_saved():
 
             if file_type in ['pr', 'both']:
                 try:
+                    pr_stage_start = time.perf_counter()
                     consolidator_pr, companies_count_pr, dates_count_pr = make_consolidator_from_cache(
                         'pr', allowed_symbols=None, symbol_name_map=mcap_name_map
                     )
@@ -1986,14 +2048,17 @@ def consolidate_saved():
                     add_log(f"Creating PR Excel file: {pr_output_path}")
                     consolidator_pr.format_excel_output(pr_output_path)
                     add_log(f"✓ PR Excel file created: {pr_output_path}")
-                    pr_avg_path = pr_output_path.replace('.xlsx', '_Averages.xlsx')
                     if not fast_mode:
+                        persist_start = time.perf_counter()
+                        add_log("Starting PR persistence to Mongo...")
                         persist_consolidated_results(consolidator_pr, 'pr', source='cached_db')
+                        add_log(f"Persisted PR aggregates in {time.perf_counter() - persist_start:.2f}s")
                     results['pr'] = {
                         'companies': companies_count_pr,
                         'dates': dates_count_pr,
                         'files': len(date_iso_list)
                     }
+                    add_log(f"PR stage done in {time.perf_counter() - pr_stage_start:.2f}s")
                 except ValueError as exc:
                     shutil.rmtree(work_dir, ignore_errors=True)
                     return jsonify({'error': str(exc)}), 400
@@ -2007,47 +2072,57 @@ def consolidate_saved():
 
             response = None
             if mcap_output_path and pr_output_path:
-                zip_path = os.path.join(work_dir, 'Market_Data.zip')
+                zip_start = time.perf_counter()
+                zip_name = f"Market_Data_{date_label}.zip"
+                zip_path = os.path.join(work_dir, zip_name)
                 add_log(f"Packaging files into zip: {zip_path}")
                 with zipfile.ZipFile(zip_path, 'w') as zipf:
                     zipf.write(mcap_output_path, arcname='Market_Cap.xlsx')
-                    if mcap_avg_path and os.path.exists(mcap_avg_path):
-                        zipf.write(mcap_avg_path, arcname='Market_Cap_Averages.xlsx')
                     zipf.write(pr_output_path, arcname='Net_Traded_Value.xlsx')
-                    if pr_avg_path and os.path.exists(pr_avg_path):
-                        zipf.write(pr_avg_path, arcname='Net_Traded_Value_Averages.xlsx')
+                add_log(f"Zip build done in {time.perf_counter() - zip_start:.2f}s")
+                add_log("Sending zipped response...")
                 response = send_file(
                     zip_path,
                     mimetype='application/zip',
                     as_attachment=True,
-                    download_name='Market_Data.zip'
+                    download_name=zip_name
                 )
+                response.headers['Content-Disposition'] = f"attachment; filename={zip_name}"
+                add_log("send_file invoked for zipped response")
             elif mcap_output_path:
-                zip_path = os.path.join(work_dir, 'Market_Cap.zip')
+                zip_start = time.perf_counter()
+                zip_name = f"Market_Cap_{date_label}.zip"
+                zip_path = os.path.join(work_dir, zip_name)
                 add_log(f"Packaging MCAP files into zip: {zip_path}")
                 with zipfile.ZipFile(zip_path, 'w') as zipf:
                     zipf.write(mcap_output_path, arcname='Market_Cap.xlsx')
-                    if mcap_avg_path and os.path.exists(mcap_avg_path):
-                        zipf.write(mcap_avg_path, arcname='Market_Cap_Averages.xlsx')
+                add_log(f"Zip build done in {time.perf_counter() - zip_start:.2f}s")
+                add_log("Sending MCAP zip response...")
                 response = send_file(
                     zip_path,
                     mimetype='application/zip',
                     as_attachment=True,
-                    download_name='Market_Cap.zip'
+                    download_name=zip_name
                 )
+                response.headers['Content-Disposition'] = f"attachment; filename={zip_name}"
+                add_log("send_file invoked for MCAP zip")
             elif pr_output_path:
-                zip_path = os.path.join(work_dir, 'Net_Traded_Value.zip')
+                zip_start = time.perf_counter()
+                zip_name = f"Net_Traded_Value_{date_label}.zip"
+                zip_path = os.path.join(work_dir, zip_name)
                 add_log(f"Packaging PR files into zip: {zip_path}")
                 with zipfile.ZipFile(zip_path, 'w') as zipf:
                     zipf.write(pr_output_path, arcname='Net_Traded_Value.xlsx')
-                    if pr_avg_path and os.path.exists(pr_avg_path):
-                        zipf.write(pr_avg_path, arcname='Net_Traded_Value_Averages.xlsx')
+                add_log(f"Zip build done in {time.perf_counter() - zip_start:.2f}s")
+                add_log("Sending PR zip response...")
                 response = send_file(
                     zip_path,
                     mimetype='application/zip',
                     as_attachment=True,
-                    download_name='Net_Traded_Value.zip'
+                    download_name=zip_name
                 )
+                response.headers['Content-Disposition'] = f"attachment; filename={zip_name}"
+                add_log("send_file invoked for PR zip")
             if logs:
                 safe_log = ' | '.join(logs)
                 safe_log = safe_log.encode('ascii', errors='ignore').decode('ascii')
@@ -2060,6 +2135,9 @@ def consolidate_saved():
             shutil.rmtree(work_dir, ignore_errors=True)
             return jsonify({'error': str(e)}), 500
         response.call_on_close(lambda: shutil.rmtree(work_dir, ignore_errors=True))
+        total_elapsed = time.perf_counter() - stage_start
+        add_log(f"Total consolidate_saved time {total_elapsed:.2f}s")
+        print("X-Export-Log:", ' | '.join(logs))
         return response
 
     except Exception as e:
