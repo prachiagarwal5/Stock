@@ -183,7 +183,7 @@ class SymbolMetricsFetcher:
 
         return rows, errors
 
-    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=100, chunk_size=100, symbol_pr_data=None, symbol_mcap_data=None):
+    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=50, chunk_size=100, symbol_pr_data=None, symbol_mcap_data=None):
         """
         Build dashboard with additional calculated columns.
         

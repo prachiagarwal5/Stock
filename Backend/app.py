@@ -1279,6 +1279,9 @@ def nse_symbol_dashboard():
     """
     try:
         data = request.get_json() or {}
+        req_id = f"symboldash-{int(time.time() * 1000)}"
+        start_time = time.perf_counter()
+
         date_str = data.get('date')
         start_date_str = data.get('start_date')
         end_date_str = data.get('end_date')
@@ -1286,12 +1289,17 @@ def nse_symbol_dashboard():
         provided_symbols = data.get('symbols') or []
         top_n = data.get('top_n', 1000)
         top_n_by = data.get('top_n_by') or 'mcap'
-        parallel_workers = data.get('parallel_workers', 100)
+        parallel_workers = data.get('parallel_workers', 50)
         chunk_size = data.get('chunk_size', 100)
         as_on = datetime.now().strftime('%Y-%m-%d')
         page = int(data.get('page', 1)) if str(data.get('page', '')).strip() != '' else 1
         page_size = int(data.get('page_size', data.get('max_symbols', 1000))) if str(data.get('page_size', '')).strip() != '' else int(data.get('max_symbols', 1000))
         page_size = max(10, min(page_size, 1000))  # allow up to 1000
+
+        print(
+            f"[symbol-dashboard][start] id={req_id} save_to_file={save_to_file} "
+            f"payload_keys={list(data.keys())} top_n={top_n} top_n_by={top_n_by}"
+        )
 
         symbols = provided_symbols[:] if provided_symbols else []
         target_files = []
@@ -1354,6 +1362,7 @@ def nse_symbol_dashboard():
                     print(f"⚠️ Unable to fetch top {top_n_val} symbols by {top_n_by}: {exc}")
 
         if not symbols:
+            print(f"[symbol-dashboard][error] id={req_id} no symbols found")
             return jsonify({'error': 'No symbols found. Provide symbols or download MCAP first.'}), 400
 
         # Drop duplicates and keep order
@@ -1456,18 +1465,18 @@ def nse_symbol_dashboard():
 
         # Run in parallel batches to speed up large symbol lists
         try:
-            workers = int(parallel_workers) if str(parallel_workers).strip() != '' else 100
+            workers = int(parallel_workers) if str(parallel_workers).strip() != '' else 50
         except Exception:
-            workers = 100
+            workers = 50
         try:
             chunk_val = int(chunk_size) if str(chunk_size).strip() != '' else 100
         except Exception:
             chunk_val = 100
 
-        max_workers_allowed = 100
-        if workers < max_workers_allowed:
-            workers = max_workers_allowed
-        effective_workers = min(workers, max_workers_allowed)
+        max_workers_allowed = 50
+        if workers > max_workers_allowed:
+            print(f"[symbol-dashboard][clamp] id={req_id} requested_workers={workers} capped_to={max_workers_allowed}")
+        effective_workers = max(1, min(workers, max_workers_allowed))
         chunk_val = max(1, chunk_val)
 
         print(
@@ -1519,6 +1528,12 @@ def nse_symbol_dashboard():
             if db_id:
                 download_url = f"/api/nse-symbol-dashboard/download?id={db_id}"
 
+        duration = time.perf_counter() - start_time
+        print(
+            f"[symbol-dashboard][done] id={req_id} symbols_used={len(symbols_slice)} "
+            f"errors={len(result.get('errors', []))} elapsed={duration:.2f}s"
+        )
+
         return jsonify({
             'success': True,
             'count': result.get('count', 0),
@@ -1535,7 +1550,7 @@ def nse_symbol_dashboard():
             'range': {'start': start_idx + 1, 'end': end_idx}
         }), 200
     except Exception as e:
-        print(f"Error building symbol dashboard: {e}")
+        print(f"[symbol-dashboard][error] {e}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -1947,6 +1962,12 @@ def consolidate_saved():
     try:
         try:
             payload = request.get_json() or {}
+            req_id = f"consolidate-{int(time.time() * 1000)}"
+            stage_start = time.perf_counter()
+            print(
+                f"[consolidate-saved][start] id={req_id} file_type={payload.get('file_type', 'both')} "
+                f"date={payload.get('date')} range={payload.get('start_date')}->{payload.get('end_date')}"
+            )
             date_str = payload.get('date')
             start_date_str = payload.get('start_date')
             end_date_str = payload.get('end_date')
@@ -1980,7 +2001,6 @@ def consolidate_saved():
                 return jsonify({'error': 'Invalid date format. Use DD-Mon-YYYY (e.g., 03-Dec-2025)'}), 400
 
             logs = []
-            stage_start = time.perf_counter()
             work_dir = tempfile.mkdtemp()
             results = {}
 
@@ -2139,19 +2159,19 @@ def consolidate_saved():
                 safe_log = safe_log.encode('ascii', errors='ignore').decode('ascii')
                 response.headers['X-Export-Log'] = safe_log
 
+            total_elapsed = time.perf_counter() - stage_start
+            print(f"[consolidate-saved][done] id={req_id} outputs={list(results.keys())} elapsed={total_elapsed:.2f}s")
+
             response.call_on_close(lambda: shutil.rmtree(work_dir, ignore_errors=True))
             return response
 
         except Exception as e:
             shutil.rmtree(work_dir, ignore_errors=True)
+            print(f"[consolidate-saved][error] id={req_id} {e}")
             return jsonify({'error': str(e)}), 500
-        response.call_on_close(lambda: shutil.rmtree(work_dir, ignore_errors=True))
-        total_elapsed = time.perf_counter() - stage_start
-        add_log(f"Total consolidate_saved time {total_elapsed:.2f}s")
-        print("X-Export-Log:", ' | '.join(logs))
-        return response
 
     except Exception as e:
+        print(f"[consolidate-saved][error] {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/google-drive-files', methods=['GET'])
