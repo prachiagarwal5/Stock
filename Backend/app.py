@@ -1502,6 +1502,7 @@ def nse_symbol_dashboard():
         # Set time limit for Render free tier (25 seconds to leave margin for response)
         max_time = 25 if is_render else None
 
+        # Process symbols directly (frontend handles batching across multiple requests)
         result = fetcher.build_dashboard(
             symbols_slice,
             excel_path=excel_path,

@@ -487,6 +487,9 @@ function App() {
         }
     };
 
+    // State for batch progress
+    const [dashboardBatchProgress, setDashboardBatchProgress] = useState(null);
+
     const handleBuildDashboard = async () => {
         // Dashboard only available for date range (after MCAP/PR averages are calculated)
         if (!rangeStartDate || !rangeEndDate) {
@@ -494,48 +497,127 @@ function App() {
             return;
         }
 
-        const payload = {
-            save_to_file: true,
-            page: 1,
-            page_size: 1000,
-            top_n: 1000,
-            top_n_by: 'mcap',
-            parallel_workers: 25,
-            chunk_size: 100,
-            start_date: convertDateFormat(rangeStartDate),
-            end_date: convertDateFormat(rangeEndDate)
-        };
-
         setDashboardLoading(true);
         setError(null);
         setSuccess(null);
+        setDashboardResult(null);
+
+        // Configuration for batch processing
+        const TOTAL_SYMBOLS = 1000;
+        const BATCH_SIZE = 100;  // 100 symbols per request (fits in Render 30s timeout)
+        const TOTAL_BATCHES = Math.ceil(TOTAL_SYMBOLS / BATCH_SIZE);
+
+        let allRows = [];
+        let allErrors = [];
+        let lastFileId = null;
+        let lastDownloadUrl = null;
 
         try {
-            const response = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(payload)
-            });
+            for (let batchNum = 0; batchNum < TOTAL_BATCHES; batchNum++) {
+                const startSymbol = batchNum * BATCH_SIZE + 1;
+                const endSymbol = Math.min((batchNum + 1) * BATCH_SIZE, TOTAL_SYMBOLS);
+                
+                // Update progress
+                setDashboardBatchProgress({
+                    currentBatch: batchNum + 1,
+                    totalBatches: TOTAL_BATCHES,
+                    symbolsProcessed: batchNum * BATCH_SIZE,
+                    totalSymbols: TOTAL_SYMBOLS,
+                    status: `Fetching symbols ${startSymbol}-${endSymbol}...`
+                });
 
-            if (!response.ok) {
-                const errorData = await response.json();
-                console.error('[dashboard] failed status', response.status, errorData);
-                throw new Error(errorData.error || 'Dashboard build failed');
+                console.log(`[dashboard] Batch ${batchNum + 1}/${TOTAL_BATCHES}: symbols ${startSymbol}-${endSymbol}`);
+
+                const payload = {
+                    save_to_file: batchNum === TOTAL_BATCHES - 1,  // Only save Excel on last batch
+                    page: batchNum + 1,
+                    page_size: BATCH_SIZE,
+                    top_n: TOTAL_SYMBOLS,
+                    top_n_by: 'mcap',
+                    parallel_workers: 50,  // Higher parallelism per batch
+                    chunk_size: 25,
+                    batch_size: BATCH_SIZE,  // Tell backend this is batch mode
+                    start_date: convertDateFormat(rangeStartDate),
+                    end_date: convertDateFormat(rangeEndDate)
+                };
+
+                const response = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    console.error(`[dashboard] Batch ${batchNum + 1} failed:`, errorData);
+                    allErrors.push({ batch: batchNum + 1, error: errorData.error || 'Request failed' });
+                    continue;  // Continue with next batch even if one fails
+                }
+
+                const data = await response.json();
+                console.log(`[dashboard] Batch ${batchNum + 1} success:`, data.count, 'symbols');
+
+                // Collect rows from this batch
+                if (data.rows) {
+                    allRows = allRows.concat(data.rows);
+                }
+                if (data.errors) {
+                    allErrors = allErrors.concat(data.errors);
+                }
+                
+                // Keep track of download URL from last successful batch
+                if (data.file_id) lastFileId = data.file_id;
+                if (data.download_url) lastDownloadUrl = data.download_url;
+
+                // Update progress
+                setDashboardBatchProgress({
+                    currentBatch: batchNum + 1,
+                    totalBatches: TOTAL_BATCHES,
+                    symbolsProcessed: endSymbol,
+                    totalSymbols: TOTAL_SYMBOLS,
+                    status: `✅ Batch ${batchNum + 1} complete (${data.count || 0} symbols)`
+                });
+
+                // Small delay between batches
+                if (batchNum < TOTAL_BATCHES - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
             }
 
-            const data = await response.json();
-            console.log('[dashboard] success', data);
-            setDashboardResult(data);
-            const start = data.range?.start || 1;
-            const end = data.range?.end || data.symbols_used || data.count || 0;
-            setSuccess(`✅ Dashboard ready for symbols ${start}-${end} of ${data.total_symbols || data.symbols_used || data.count || 0}`);
+            // Calculate averages from all collected rows
+            const averages = {};
+            if (allRows.length > 0) {
+                ['impact_cost', 'free_float_mcap', 'total_market_cap', 'total_traded_value', 'last_price'].forEach(field => {
+                    const values = allRows.map(r => r[field]).filter(v => v != null && !isNaN(v));
+                    if (values.length > 0) {
+                        averages[field] = (values.reduce((a, b) => a + b, 0) / values.length).toFixed(2);
+                    }
+                });
+            }
+
+            // Set final merged result
+            setDashboardResult({
+                success: true,
+                count: allRows.length,
+                symbols_used: allRows.length,
+                total_symbols: TOTAL_SYMBOLS,
+                averages: averages,
+                errors: allErrors,
+                file_id: lastFileId,
+                download_url: lastDownloadUrl,
+                file: `Symbol_Dashboard_${convertDateFormat(rangeStartDate)}_${convertDateFormat(rangeEndDate)}.xlsx`
+            });
+
+            setSuccess(`✅ Dashboard complete! ${allRows.length} symbols fetched in ${TOTAL_BATCHES} batches`);
+            
         } catch (err) {
             console.error('[dashboard] error', err);
             setError(err.message);
         } finally {
             setDashboardLoading(false);
+            setDashboardBatchProgress(null);
         }
     };
 
@@ -623,6 +705,7 @@ function App() {
                         exportedRange={exportedRange}
                         dashboardLoading={dashboardLoading}
                         dashboardResult={dashboardResult}
+                        dashboardBatchProgress={dashboardBatchProgress}
                         handleDownloadRangeFromNSE={handleDownloadRangeFromNSE}
                         handleExportConsolidated={handleExportConsolidated}
                         handleBuildDashboard={handleBuildDashboard}

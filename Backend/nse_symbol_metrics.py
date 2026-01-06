@@ -372,3 +372,156 @@ class SymbolMetricsFetcher:
             'averages': averages,
             'count': len(rows)
         }
+    def _save_dashboard_excel(self, rows, excel_path, symbol_pr_data=None, symbol_mcap_data=None):
+        """Save dashboard rows to Excel file (extracted for batch processing)."""
+        if not rows or not excel_path:
+            return
+        
+        df = pd.DataFrame(rows)
+        numeric_fields = ['impact_cost', 'free_float_mcap', 'total_market_cap', 'total_traded_value', 'last_price']
+        averages = {}
+        for field in numeric_fields:
+            series = df[field].dropna() if field in df.columns else pd.Series(dtype=float)
+            averages[field] = round(series.mean(), 2) if not series.empty else None
+        
+        df_copy = df.copy()
+        
+        # Calculate Broader Index - "Nifty 500" if in qualifying indices
+        def calc_broader_index(index_list):
+            if not index_list:
+                return ''
+            indices = index_list if isinstance(index_list, list) else [index_list]
+            for idx in indices:
+                if idx and any(ni in idx.upper().replace(' ', '') for ni in ['NIFTY50', 'NIFTYNEXT50', 'NIFTYMIDCAP150', 'NIFTYSMALLCAP250']):
+                    return 'Nifty 500'
+                if idx and idx.upper() in NIFTY_500_INDICES:
+                    return 'Nifty 500'
+            return ''
+        
+        df_copy['Broader Index'] = df_copy['indexList'].apply(calc_broader_index) if 'indexList' in df_copy.columns else ''
+        
+        # Parse listingDate to datetime for clean display and flags
+        if 'listingDate' in df_copy.columns:
+            df_copy['listingDate_dt'] = pd.to_datetime(df_copy['listingDate'], errors='coerce')
+        else:
+            df_copy['listingDate_dt'] = pd.NaT
+
+        today = datetime.now()
+
+        def calc_listed_flag(date_val, months):
+            if pd.isna(date_val):
+                return ''
+            threshold = today - relativedelta(months=months)
+            return 'Y' if date_val <= threshold else 'N'
+
+        df_copy['listed> 6months'] = df_copy['listingDate_dt'].apply(lambda x: calc_listed_flag(x, 6))
+        df_copy['listed> 1 months'] = df_copy['listingDate_dt'].apply(lambda x: calc_listed_flag(x, 1))
+        df_copy['listingDate'] = df_copy['listingDate_dt']
+        
+        # Calculate Ratio of avg free float to avg total market cap
+        def calc_ff_ratio(symbol):
+            if symbol_mcap_data and symbol in symbol_mcap_data:
+                mcap_info = symbol_mcap_data[symbol]
+                avg_ff = mcap_info.get('avg_free_float')
+                avg_total = mcap_info.get('avg_mcap')
+                if avg_ff and avg_total and avg_total > 0:
+                    return round(avg_ff / avg_total, 4)
+            row = df_copy[df_copy['symbol'] == symbol]
+            if row.empty:
+                return None
+            ff = row['free_float_mcap'].values[0] if 'free_float_mcap' in row.columns else None
+            total = row['total_market_cap'].values[0] if 'total_market_cap' in row.columns else None
+            if ff and total and total > 0:
+                return round(ff / total, 4)
+            return None
+        
+        df_copy['Ratio of avg FF to avg Total Mcap'] = df_copy['symbol'].apply(calc_ff_ratio)
+        
+        # Convert indexList to string for Excel
+        if 'indexList' in df_copy.columns:
+            df_copy['indexList'] = df_copy['indexList'].apply(lambda x: ', '.join(x) if isinstance(x, list) else (x or ''))
+        else:
+            df_copy['indexList'] = ''
+
+        if 'index' not in df_copy.columns:
+            df_copy['index'] = ''
+
+        # Reorder columns for better readability
+        preferred_order = [
+            'symbol', 'companyName', 'series', 'status', 
+            'Broader Index', 'index', 'indexList',
+            'listingDate', 'listed> 6months', 'listed> 1 months',
+            'impact_cost', 'free_float_mcap', 'total_market_cap', 
+            'total_traded_value', 'last_price',
+            'Ratio of avg FF to avg Total Mcap',
+            'basicIndustry', 'applicableMargin', 'as_on'
+        ]
+        existing_cols = [c for c in preferred_order if c in df_copy.columns]
+        other_cols = [c for c in df_copy.columns if c not in preferred_order]
+        df_copy = df_copy[existing_cols + other_cols]
+
+        avg_row = {'symbol': 'AVERAGE'}
+        avg_row.update({k: averages.get(k) for k in numeric_fields})
+        df_copy = pd.concat([df_copy, pd.DataFrame([avg_row])], ignore_index=True)
+        
+        # Clean NaN/INF for safe Excel writing
+        df_copy = df_copy.replace([np.inf, -np.inf], np.nan)
+        if 'listingDate' in df_copy.columns:
+            df_copy['listingDate'] = pd.to_datetime(df_copy['listingDate'], errors='coerce')
+        if 'as_on' in df_copy.columns:
+            df_copy['as_on'] = pd.to_datetime(df_copy['as_on'], errors='coerce')
+        df_copy = df_copy.where(pd.notna(df_copy), None)
+
+        with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
+            sheet_name = 'Symbol Dashboard'
+            df_copy.to_excel(writer, sheet_name=sheet_name, index=False)
+            ws = writer.sheets[sheet_name]
+            wb = writer.book
+
+            header_fmt = wb.add_format({
+                'bold': True,
+                'font_color': '#FFFFFF',
+                'bg_color': '#4F81BD',
+                'border': 1,
+                'align': 'center',
+                'valign': 'vcenter',
+                'text_wrap': True
+            })
+            text_fmt = wb.add_format({'border': 1, 'align': 'left'})
+            int_fmt = wb.add_format({'border': 1, 'align': 'right', 'num_format': '0'})
+            num_fmt = wb.add_format({'border': 1, 'align': 'right', 'num_format': '#,##0.00'})
+            ratio_fmt = wb.add_format({'border': 1, 'align': 'right', 'num_format': '0.0000'})
+            date_fmt = wb.add_format({'border': 1, 'align': 'left', 'num_format': 'yyyy-mm-dd'})
+
+            for col_idx, col_name in enumerate(df_copy.columns):
+                ws.write(0, col_idx, col_name, header_fmt)
+
+            col_config = {
+                'symbol': (15, text_fmt),
+                'companyName': (30, text_fmt),
+                'series': (8, text_fmt),
+                'status': (10, text_fmt),
+                'Broader Index': (15, text_fmt),
+                'index': (18, text_fmt),
+                'indexList': (30, text_fmt),
+                'listingDate': (14, date_fmt),
+                'listed> 6months': (12, text_fmt),
+                'listed> 1 months': (12, text_fmt),
+                'impact_cost': (12, num_fmt),
+                'free_float_mcap': (16, num_fmt),
+                'total_market_cap': (16, num_fmt),
+                'total_traded_value': (16, num_fmt),
+                'last_price': (12, num_fmt),
+                'Ratio of avg FF to avg Total Mcap': (18, ratio_fmt),
+                'basicIndustry': (20, text_fmt),
+                'applicableMargin': (14, int_fmt),
+                'as_on': (14, date_fmt)
+            }
+
+            for idx, col_name in enumerate(df_copy.columns):
+                width, fmt = col_config.get(col_name, (14, text_fmt))
+                ws.set_column(idx, idx, width, fmt)
+
+            ws.freeze_panes(1, 2)
+            ws.autofilter(0, 0, len(df_copy), len(df_copy.columns) - 1)
+            ws.set_row(0, 22)

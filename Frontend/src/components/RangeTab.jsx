@@ -1,5 +1,3 @@
-import React from 'react';
-
 const RangeTab = ({
     rangeStartDate,
     setRangeStartDate,
@@ -13,6 +11,7 @@ const RangeTab = ({
     exportedRange,
     dashboardLoading,
     dashboardResult,
+    dashboardBatchProgress,
     handleDownloadRangeFromNSE,
     handleExportConsolidated,
     handleBuildDashboard,
@@ -33,8 +32,7 @@ const RangeTab = ({
                             type="date"
                             value={rangeStartDate}
                             onChange={(e) => setRangeStartDate(e.target.value)}
-                            className="form-input"
-                        />
+                            className="form-input" />
 
 
                     </div>
@@ -46,8 +44,7 @@ const RangeTab = ({
                             value={rangeEndDate}
                             onChange={(e) => setRangeEndDate(e.target.value)}
                             className="form-input"
-                            disabled={rangeLoading}
-                        />
+                            disabled={rangeLoading} />
                     </div>
                 </div>
 
@@ -88,6 +85,96 @@ const RangeTab = ({
                         <span style={{ fontSize: '1.3rem' }}>📊</span> {dashboardLoading ? 'Building...' : consolidationReady ? 'Build Dashboard' : 'Build Dashboard (Export First)'}
                     </button>
                 </div>
+
+                {/* Dashboard Building Progress Indicator */}
+                {dashboardLoading && (
+                    <div style={{ 
+                        background: 'linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%)', 
+                        borderRadius: '16px', 
+                        padding: '24px 28px', 
+                        marginBottom: '24px',
+                        border: '2px solid #81c784',
+                        boxShadow: '0 4px 20px rgba(76, 175, 80, 0.15)'
+                    }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '16px' }}>
+                            <div style={{
+                                width: '40px',
+                                height: '40px',
+                                border: '4px solid #e0e0e0',
+                                borderTop: '4px solid #4caf50',
+                                borderRadius: '50%',
+                                animation: 'spin 1s linear infinite'
+                            }} />
+                            <div>
+                                <div style={{ fontWeight: 'bold', fontSize: '1.2rem', color: '#2e7d32' }}>
+                                    🔄 Building Dashboard...
+                                </div>
+                                <div style={{ color: '#558b2f', fontSize: '0.95rem', marginTop: '4px' }}>
+                                    {dashboardBatchProgress 
+                                        ? `Batch ${dashboardBatchProgress.currentBatch}/${dashboardBatchProgress.totalBatches}: ${dashboardBatchProgress.status}`
+                                        : 'Initializing...'}
+                                </div>
+                            </div>
+                        </div>
+                        
+                        {/* Progress Bar */}
+                        {dashboardBatchProgress && (
+                            <div style={{ marginBottom: '16px' }}>
+                                <div style={{ 
+                                    background: '#fff', 
+                                    borderRadius: '10px', 
+                                    height: '24px',
+                                    overflow: 'hidden',
+                                    border: '1px solid #a5d6a7'
+                                }}>
+                                    <div style={{
+                                        background: 'linear-gradient(90deg, #4caf50, #81c784)',
+                                        height: '100%',
+                                        width: `${(dashboardBatchProgress.symbolsProcessed / dashboardBatchProgress.totalSymbols) * 100}%`,
+                                        transition: 'width 0.5s ease',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
+                                        color: '#fff',
+                                        fontWeight: 'bold',
+                                        fontSize: '0.85rem'
+                                    }}>
+                                        {Math.round((dashboardBatchProgress.symbolsProcessed / dashboardBatchProgress.totalSymbols) * 100)}%
+                                    </div>
+                                </div>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '8px', fontSize: '0.9rem', color: '#558b2f' }}>
+                                    <span>{dashboardBatchProgress.symbolsProcessed} symbols processed</span>
+                                    <span>{dashboardBatchProgress.totalSymbols} total</span>
+                                </div>
+                            </div>
+                        )}
+                        
+                        <div style={{ 
+                            background: '#fff', 
+                            borderRadius: '10px', 
+                            padding: '14px 18px',
+                            border: '1px solid #a5d6a7'
+                        }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                                <span style={{ color: '#666', fontWeight: '500' }}>📦 Batch:</span>
+                                <span style={{ fontWeight: 'bold', color: '#2e7d32' }}>
+                                    {dashboardBatchProgress ? `${dashboardBatchProgress.currentBatch} of ${dashboardBatchProgress.totalBatches}` : '—'}
+                                </span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                                <span style={{ color: '#666', fontWeight: '500' }}>🔢 Symbols per batch:</span>
+                                <span style={{ fontWeight: 'bold', color: '#2e7d32' }}>100</span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                <span style={{ color: '#666', fontWeight: '500' }}>⏱️ Est. per batch:</span>
+                                <span style={{ fontWeight: 'bold', color: '#2e7d32' }}>~20-25 seconds</span>
+                            </div>
+                        </div>
+                        <div style={{ marginTop: '12px', fontSize: '0.9rem', color: '#689f38', textAlign: 'center' }}>
+                            💡 <em>Each batch request completes within Render's 30s limit</em>
+                        </div>
+                    </div>
+                )}
 
                 {consolidationReady ? (
                     <div className="consolidation-details" style={{ marginBottom: '18px' }}>
@@ -138,7 +225,7 @@ const RangeTab = ({
                                         if (!grouped[entry.date]) grouped[entry.date] = {};
                                         grouped[entry.date][entry.type.toUpperCase()] = entry;
                                     });
-                                    return Object.entries(grouped).map(([date, types], idx) => (
+                                    return Object.entries(grouped).map(([date, types]) => (
                                         <div key={date} className="range-status-card frosted-bg" style={{ background: '#f6fff8', borderRadius: '16px', boxShadow: '0 2px 12px rgba(44,62,80,0.08)', padding: '18px 16px', display: 'flex', flexDirection: 'column', alignItems: 'flex-start', minHeight: '120px', justifyContent: 'center' }}>
                                             <div className="range-status-date" style={{ fontWeight: 'bold', fontSize: '1.1rem', color: '#176a3a', marginBottom: '10px', letterSpacing: '1px' }}>{date}</div>
                                             <div style={{ display: 'flex', gap: '12px', width: '100%' }}>
@@ -248,7 +335,6 @@ const RangeTab = ({
                     </li>
                 </ol>
             </div>
-
         </section>
     );
 };
