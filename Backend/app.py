@@ -1473,7 +1473,20 @@ def nse_symbol_dashboard():
         except Exception:
             chunk_val = 100
 
-        max_workers_allowed = 50
+        # Check if running on Render (free tier has 30s timeout, limited memory)
+        is_render = os.environ.get('RENDER') == 'true' or os.environ.get('RENDER_SERVICE_NAME')
+        
+        if is_render:
+            # Render free tier: conservative settings to avoid timeout/OOM
+            max_workers_allowed = 20
+            max_symbols_render = 100  # Limit symbols on free tier
+            if len(symbols_slice) > max_symbols_render:
+                print(f"[symbol-dashboard][render] Limiting from {len(symbols_slice)} to {max_symbols_render} symbols")
+                symbols_slice = symbols_slice[:max_symbols_render]
+        else:
+            # Local/paid hosting: allow high parallelism
+            max_workers_allowed = 250
+            
         if workers > max_workers_allowed:
             print(f"[symbol-dashboard][clamp] id={req_id} requested_workers={workers} capped_to={max_workers_allowed}")
         effective_workers = max(1, min(workers, max_workers_allowed))
@@ -1486,6 +1499,9 @@ def nse_symbol_dashboard():
             f"workers_used={effective_workers} chunk={chunk_val}"
         )
 
+        # Set time limit for Render free tier (25 seconds to leave margin for response)
+        max_time = 25 if is_render else None
+
         result = fetcher.build_dashboard(
             symbols_slice,
             excel_path=excel_path,
@@ -1495,7 +1511,8 @@ def nse_symbol_dashboard():
             max_workers=effective_workers,
             chunk_size=chunk_val,
             symbol_pr_data=symbol_pr_data,
-            symbol_mcap_data=symbol_mcap_data
+            symbol_mcap_data=symbol_mcap_data,
+            max_time_seconds=max_time
         )
 
         print(f"[symbol-dashboard] completed fetch rows={len(result.get('rows', []))} errors={len(result.get('errors', []))}")

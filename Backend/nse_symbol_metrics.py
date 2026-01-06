@@ -143,13 +143,21 @@ class SymbolMetricsFetcher:
         }
         return result
 
-    def fetch_many(self, symbols, sleep_between=0.05, max_symbols=None, as_of=None, parallel=True, max_workers=10, chunk_size=100):
+    def fetch_many(self, symbols, sleep_between=0.02, max_symbols=None, as_of=None, parallel=True, max_workers=10, chunk_size=100, max_time_seconds=None):
+        """
+        Fetch symbol data with optional timeout protection.
+        max_time_seconds: If set, stop fetching after this many seconds and return partial results.
+        """
         rows = []
         errors = []
         capped_symbols = symbols[:max_symbols] if max_symbols else symbols
+        start_time = time.time()
 
         if parallel and max_workers and max_workers > 1:
             def _worker(sym):
+                # Check time budget before making request
+                if max_time_seconds and (time.time() - start_time) > max_time_seconds:
+                    return ('timeout', {'symbol': sym, 'error': 'Skipped - time limit reached'})
                 # Fresh session per thread to avoid session locking
                 sess = self._make_session()
                 self._prime_cookies(sess)
@@ -159,11 +167,20 @@ class SymbolMetricsFetcher:
                     return ('err', {'symbol': sym, 'error': str(exc)})
 
             for i in range(0, len(capped_symbols), chunk_size or len(capped_symbols)):
+                # Check if we're running out of time
+                if max_time_seconds and (time.time() - start_time) > max_time_seconds:
+                    remaining = len(capped_symbols) - i
+                    errors.append({'symbol': 'timeout', 'error': f'Time limit reached. {remaining} symbols skipped.'})
+                    break
+                    
                 batch = capped_symbols[i:i + (chunk_size or len(capped_symbols))]
                 with ThreadPoolExecutor(max_workers=min(max_workers, len(batch))) as executor:
                     for status, payload in executor.map(_worker, batch):
                         if status == 'ok':
                             rows.append(payload)
+                        elif status == 'timeout':
+                            # Don't add individual timeout errors, we'll add summary
+                            pass
                         else:
                             errors.append(payload)
         else:
@@ -183,14 +200,15 @@ class SymbolMetricsFetcher:
 
         return rows, errors
 
-    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=50, chunk_size=100, symbol_pr_data=None, symbol_mcap_data=None):
+    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=50, chunk_size=100, symbol_pr_data=None, symbol_mcap_data=None, max_time_seconds=None):
         """
         Build dashboard with additional calculated columns.
         
         symbol_pr_data: dict of {symbol: {'days_with_data': int, 'total_trading_days': int, 'avg_pr': float}}
         symbol_mcap_data: dict of {symbol: {'avg_mcap': float, 'avg_free_float': float}}
+        max_time_seconds: Optional time limit for fetching (returns partial results if exceeded)
         """
-        rows, errors = self.fetch_many(symbols, max_symbols=max_symbols, as_of=as_of, parallel=parallel, max_workers=max_workers, chunk_size=chunk_size)
+        rows, errors = self.fetch_many(symbols, max_symbols=max_symbols, as_of=as_of, parallel=parallel, max_workers=max_workers, chunk_size=chunk_size, max_time_seconds=max_time_seconds)
 
         df = pd.DataFrame(rows)
         numeric_fields = ['impact_cost', 'free_float_mcap', 'total_market_cap', 'total_traded_value', 'last_price']
