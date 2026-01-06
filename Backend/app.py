@@ -1372,13 +1372,7 @@ def dashboard_data():
 def nse_symbol_dashboard():
     """
     Build a dashboard of impact cost, free float market cap, traded value, and index for symbols.
-    Payload options:
-    {
-        "date": "03-Dec-2025" # use cached MCAP/PR in Mongo
-        "start_date": "01-Dec-2025", "end_date": "05-Dec-2025" # optional range scan in Mongo cache
-        "symbols": ["ABB", ...],  # optional explicit list
-        "save_to_file": true/false  # default true, saves Excel to Mongo and returns download id
-    }
+    Processes ALL requested symbols in batches and accumulates results.
     """
     try:
         data = request.get_json() or {}
@@ -1390,14 +1384,11 @@ def nse_symbol_dashboard():
         end_date_str = data.get('end_date')
         save_to_file = data.get('save_to_file', True)
         provided_symbols = data.get('symbols') or []
-        top_n = data.get('top_n', 100)  # Default to 100
+        top_n = data.get('top_n', 1000)  # Default to 1000 for full dashboard
         top_n_by = data.get('top_n_by') or 'mcap'
         parallel_workers = data.get('parallel_workers', 50)
-        chunk_size = data.get('chunk_size', 100)
+        chunk_size = data.get('chunk_size', 10)
         as_on = datetime.now().strftime('%Y-%m-%d')
-        page = int(data.get('page', 1)) if str(data.get('page', '')).strip() != '' else 1
-        page_size = int(data.get('page_size', data.get('max_symbols', 1000))) if str(data.get('page_size', '')).strip() != '' else int(data.get('max_symbols', 1000))
-        page_size = max(10, min(page_size, 1000))  # allow up to 1000
 
         print(
             f"[symbol-dashboard][start] id={req_id} save_to_file={save_to_file} "
@@ -1405,7 +1396,6 @@ def nse_symbol_dashboard():
         )
 
         symbols = provided_symbols[:] if provided_symbols else []
-        target_files = []
         tag = None
 
         # Build date_range filter for querying aggregates
@@ -1427,17 +1417,14 @@ def nse_symbol_dashboard():
             if start_dt > end_dt:
                 return jsonify({'error': 'start_date cannot be after end_date'}), 400
             tag = f"{start_dt.strftime('%d%m%Y')}_{end_dt.strftime('%d%m%Y')}"
-            # Build date range filter to match overlapping ranges in aggregates
-            # Match documents where aggregates.date_range overlaps with requested range
             requested_start = start_dt.strftime('%Y-%m-%d')
             requested_end = end_dt.strftime('%Y-%m-%d')
             date_range_filter = {
-                'date_range.start': {'$lte': requested_end},    # aggregate starts before or on requested end
-                'date_range.end': {'$gte': requested_start}      # aggregate ends after or on requested start
+                'date_range.start': {'$lte': requested_end},
+                'date_range.end': {'$gte': requested_start}
             }
-            print(f"[symbol-dashboard] Using date range filter: {date_range_filter}")
 
-        # If symbols not provided, fetch from Mongo aggregates (latest) to avoid filesystem reads
+        # If symbols not provided, fetch from Mongo aggregates
         if not symbols and symbol_aggregates_collection is not None:
             query = {'type': 'mcap'}
             if date_range_filter:
@@ -1446,12 +1433,12 @@ def nse_symbol_dashboard():
             symbols = agg_symbols
             print(f"[symbol-dashboard] Found {len(symbols)} symbols from aggregates collection")
 
-        # Optionally limit to top N by averages from Mongo aggregates
+        # Limit to top N by averages from Mongo aggregates
         if symbol_aggregates_collection is not None:
             try:
-                top_n_val = int(top_n) if str(top_n).strip() != '' else 100
+                top_n_val = int(top_n) if str(top_n).strip() != '' else 1000
             except Exception:
-                top_n_val = 100
+                top_n_val = 1000
             if top_n_val and top_n_val > 0:
                 try:
                     query = {'type': top_n_by}
@@ -1466,76 +1453,51 @@ def nse_symbol_dashboard():
                     print(f"⚠️ Unable to fetch top {top_n_val} symbols by {top_n_by}: {exc}")
 
         if not symbols:
-            print(f"[symbol-dashboard][error] id={req_id} no symbols found")
             return jsonify({'error': 'No symbols found. Provide symbols or download MCAP first.'}), 400
 
         # Drop duplicates and keep order
         symbols = list(dict.fromkeys(symbols))
-
         total_symbols = len(symbols)
+
         if total_symbols == 0:
             return jsonify({'error': 'No symbols found. Provide symbols or download MCAP first.'}), 400
 
-        # If top_n provided, ensure we get that many symbols
+        # Apply top_n limit
         if top_n:
             try:
                 top_n_val = int(top_n)
             except Exception:
-                top_n_val = 100
+                top_n_val = 1000
             if top_n_val and top_n_val > 0:
                 symbols = symbols[:top_n_val]
                 total_symbols = len(symbols)
-                page = 1
-                page_size = max(page_size, top_n_val)
-        
-        total_pages = max(1, math.ceil(total_symbols / page_size))
-        page = max(1, min(page, total_pages))
-        start_idx = (page - 1) * page_size
-        end_idx = min(start_idx + page_size, total_symbols)
-        symbols_slice = symbols[start_idx:end_idx]
 
-        print(f"[symbol-dashboard] Processing {len(symbols_slice)} symbols (total: {total_symbols})")
+        print(f"[symbol-dashboard] Will process ALL {total_symbols} symbols in batches")
 
         fetcher = SymbolMetricsFetcher()
 
-        # Fetch primary_index from DB for the slice (no external calls for indices)
-        index_map = primary_index_map_from_db(symbols_slice)
+        # Fetch primary_index from DB for all symbols
+        index_map = primary_index_map_from_db(symbols)
 
-        excel_path = None
-        download_name = None
-        temp_file = None
-        db_id = None
-        if save_to_file:
-            download_name = f"Symbol_Dashboard_{tag or 'latest'}.xlsx"
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
-            excel_path = temp_file.name
-            temp_file.close()
-
-        # Fetch PR data for % of traded days calculation
+        # Fetch PR data for all symbols
         symbol_pr_data = {}
         if symbol_aggregates_collection is not None:
             try:
-                pr_query = {
-                    'symbol': {'$in': symbols_slice},
-                    'type': 'pr'
-                }
+                pr_query = {'symbol': {'$in': symbols}, 'type': 'pr'}
                 if date_range_filter:
                     pr_query.update(date_range_filter)
                 pr_docs = list(symbol_aggregates_collection.find(pr_query))
                 for doc in pr_docs:
                     sym = doc.get('symbol')
                     if sym:
-                        # Get total trading days from date_range if available
                         date_range = doc.get('date_range', {})
                         days_with_data = doc.get('days_with_data', 0)
-                        # Calculate total trading days from range
-                        total_trading_days = days_with_data  # Default to days with data
+                        total_trading_days = days_with_data
                         if date_range and date_range.get('start') and date_range.get('end'):
                             try:
-                                start_dt = date_parser.parse(date_range['start'])
-                                end_dt = date_parser.parse(date_range['end'])
-                                # Count weekdays between dates
-                                total_trading_days = sum(1 for d in pd.date_range(start_dt, end_dt) if d.weekday() < 5)
+                                s_dt = date_parser.parse(date_range['start'])
+                                e_dt = date_parser.parse(date_range['end'])
+                                total_trading_days = sum(1 for d in pd.date_range(s_dt, e_dt) if d.weekday() < 5)
                             except Exception:
                                 pass
                         symbol_pr_data[sym] = {
@@ -1547,14 +1509,11 @@ def nse_symbol_dashboard():
             except Exception as exc:
                 print(f"⚠️ Failed to fetch PR data: {exc}")
 
-        # Fetch MCAP data for ratio calculation
+        # Fetch MCAP data for all symbols
         symbol_mcap_data = {}
         if symbol_aggregates_collection is not None:
             try:
-                mcap_query = {
-                    'symbol': {'$in': symbols_slice},
-                    'type': 'mcap'
-                }
+                mcap_query = {'symbol': {'$in': symbols}, 'type': 'mcap'}
                 if date_range_filter:
                     mcap_query.update(date_range_filter)
                 mcap_docs = list(symbol_aggregates_collection.find(mcap_query))
@@ -1563,119 +1522,192 @@ def nse_symbol_dashboard():
                     if sym:
                         symbol_mcap_data[sym] = {
                             'avg_mcap': doc.get('average'),
-                            'avg_free_float': None  # Will be calculated from metrics if available
+                            'avg_free_float': None
                         }
                 print(f"[symbol-dashboard] Loaded MCAP data for {len(symbol_mcap_data)} symbols")
             except Exception as exc:
                 print(f"⚠️ Failed to fetch MCAP data: {exc}")
 
-        # Run in parallel batches to speed up large symbol lists
+        # Worker settings - optimized for processing 1000 symbols
+        is_render = os.environ.get('RENDER') == 'true' or os.environ.get('RENDER_SERVICE_NAME')
+        
+        if is_render:
+            max_workers_allowed = 20
+            batch_size = 50  # 50 symbols per batch = 20 batches for 1000 symbols
+            max_time_per_batch = 15  # seconds
+        else:
+            max_workers_allowed = 100
+            batch_size = 100  # 100 symbols per batch = 10 batches for 1000 symbols
+            max_time_per_batch = 60  # seconds
+            
         try:
             workers = int(parallel_workers) if str(parallel_workers).strip() != '' else 50
         except Exception:
             workers = 50
-        try:
-            chunk_val = int(chunk_size) if str(chunk_size).strip() != '' else 100
-        except Exception:
-            chunk_val = 100
-
-        # Check if running on Render (free tier has 30s timeout, limited memory)
-        is_render = os.environ.get('RENDER') == 'true' or os.environ.get('RENDER_SERVICE_NAME')
-        
-        if is_render:
-            # Render free tier: use conservative settings but don't limit symbols as much
-            max_workers_allowed = 30  # Increased from 20
-            # Don't limit symbols here - let the timeout handle it
-            max_symbols_render = 150  # Increased from 100
-            if len(symbols_slice) > max_symbols_render:
-                print(f"[symbol-dashboard][render] Limiting from {len(symbols_slice)} to {max_symbols_render} symbols")
-                symbols_slice = symbols_slice[:max_symbols_render]
-        else:
-            # Local/paid hosting: allow high parallelism
-            max_workers_allowed = 250
-            
-        if workers > max_workers_allowed:
-            print(f"[symbol-dashboard][clamp] id={req_id} requested_workers={workers} capped_to={max_workers_allowed}")
         effective_workers = max(1, min(workers, max_workers_allowed))
-        chunk_val = max(1, chunk_val)
+        
+        try:
+            chunk_val = int(chunk_size) if str(chunk_size).strip() != '' else 10
+        except Exception:
+            chunk_val = 10
+        chunk_val = max(1, min(chunk_val, 20))
 
-        print(
-            f"[symbol-dashboard] symbols_total={total_symbols} "
-            f"slice={len(symbols_slice)} top_n={top_n} by={top_n_by} "
-            f"workers_requested={workers} workers_max={max_workers_allowed} "
-            f"workers_used={effective_workers} chunk={chunk_val}"
-        )
-
-        # Set time limit for Render free tier (25 seconds to leave margin for response)
-        max_time = 25 if is_render else 60  # 60 seconds for local/paid
-
-        # Process symbols directly (frontend handles batching across multiple requests)
-        result = fetcher.build_dashboard(
-            symbols_slice,
-            excel_path=excel_path,
-            max_symbols=None,
-            as_of=as_on,
-            parallel=True,
-            max_workers=effective_workers,
-            chunk_size=chunk_val,
-            symbol_pr_data=symbol_pr_data,
-            symbol_mcap_data=symbol_mcap_data,
-            max_time_seconds=max_time
-        )
-
-        print(f"[symbol-dashboard] completed fetch rows={len(result.get('rows', []))} errors={len(result.get('errors', []))}")
-
-        # Persist symbol metrics
-        for row in result.get('rows', []):
-            row = dict(row)
-            row['as_on'] = row.get('as_on') or as_on
-            sym = row.get('symbol')
-            # Prefer DB-sourced primary_index if available
-            if sym in index_map:
-                row['primary_index'] = index_map[sym]
-            upsert_symbol_metrics(row, source='symbol_dashboard')
-
-        download_url = None
-        if excel_path and download_name:
-            metadata = {
-                'tag': tag,
-                'symbols_used': len(symbols_slice),
-                'total_symbols': total_symbols,
-                'page': page,
-                'page_size': page_size,
-                'as_on': as_on
-            }
-            db_id = save_excel_to_database(excel_path, download_name, metadata)
+        # ===== PROCESS ALL SYMBOLS IN BATCHES AND ACCUMULATE RESULTS =====
+        all_rows = []
+        all_errors = []
+        
+        # Split symbols into batches
+        symbol_batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
+        total_batches = len(symbol_batches)
+        
+        print(f"[symbol-dashboard] Processing {total_batches} batches of ~{batch_size} symbols each "
+              f"(workers={effective_workers}, chunk={chunk_val})")
+        
+        for batch_idx, batch_symbols in enumerate(symbol_batches):
+            batch_start = time.perf_counter()
+            batch_num = batch_idx + 1
+            
+            # Filter PR and MCAP data for this batch
+            batch_pr_data = {s: symbol_pr_data[s] for s in batch_symbols if s in symbol_pr_data}
+            batch_mcap_data = {s: symbol_mcap_data[s] for s in batch_symbols if s in symbol_mcap_data}
+            
             try:
-                os.remove(excel_path)
-            except Exception:
-                pass
-            if db_id:
-                download_url = f"/api/nse-symbol-dashboard/download?id={db_id}"
+                result = fetcher.build_dashboard(
+                    batch_symbols,
+                    excel_path=None,  # Don't write Excel per batch
+                    max_symbols=None,
+                    as_of=as_on,
+                    parallel=True,
+                    max_workers=effective_workers,
+                    chunk_size=chunk_val,
+                    symbol_pr_data=batch_pr_data,
+                    symbol_mcap_data=batch_mcap_data,
+                    max_time_seconds=max_time_per_batch
+                )
+                
+                batch_rows = result.get('rows', [])
+                batch_errors = result.get('errors', [])
+                
+                # Add primary_index from DB to each row
+                for row in batch_rows:
+                    sym = row.get('symbol')
+                    if sym and sym in index_map:
+                        row['primary_index'] = index_map[sym]
+                
+                all_rows.extend(batch_rows)
+                all_errors.extend(batch_errors)
+                
+                batch_elapsed = time.perf_counter() - batch_start
+                print(f"[symbol-dashboard] Batch {batch_num}/{total_batches}: "
+                      f"{len(batch_rows)}/{len(batch_symbols)} symbols, "
+                      f"{len(batch_errors)} errors, {batch_elapsed:.1f}s "
+                      f"(total so far: {len(all_rows)})")
+                
+            except Exception as exc:
+                print(f"[symbol-dashboard] Batch {batch_num} failed: {exc}")
+                all_errors.append({'batch': batch_num, 'symbols': len(batch_symbols), 'error': str(exc)})
+            
+            # Small delay between batches to avoid rate limiting
+            if batch_idx < total_batches - 1:
+                time.sleep(0.3)
+
+        print(f"[symbol-dashboard] TOTAL ACCUMULATED: {len(all_rows)} rows from {total_symbols} symbols, {len(all_errors)} errors")
+
+        # ===== PERSIST ALL RESULTS TO MONGO =====
+        persist_count = 0
+        for row in all_rows:
+            row_copy = dict(row)
+            row_copy['as_on'] = row_copy.get('as_on') or as_on
+            upsert_symbol_metrics(row_copy, source='symbol_dashboard')
+            persist_count += 1
+        print(f"[symbol-dashboard] Persisted {persist_count} rows to MongoDB")
+
+        # ===== GENERATE EXCEL WITH ALL ACCUMULATED DATA =====
+        excel_path = None
+        download_name = None
+        db_id = None
+        download_url = None
+        
+        if save_to_file and all_rows:
+            download_name = f"Symbol_Dashboard_{tag or 'latest'}_{len(all_rows)}symbols.xlsx"
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+            excel_path = temp_file.name
+            temp_file.close()
+            
+            try:
+                # Create Excel from accumulated rows
+                df = pd.DataFrame(all_rows)
+                
+                # Reorder columns for better readability
+                preferred_cols = [
+                    'symbol', 'company_name', 'primary_index', 'impact_cost', 
+                    'free_float_mcap', 'traded_value', 'last_price', 'pct_change',
+                    'pe_ratio', 'pb_ratio', 'dividend_yield', 'as_on'
+                ]
+                existing_cols = [c for c in preferred_cols if c in df.columns]
+                other_cols = [c for c in df.columns if c not in preferred_cols]
+                df = df[existing_cols + other_cols]
+                
+                # Write to Excel with formatting
+                with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+                    df.to_excel(writer, index=False, sheet_name='Symbol Dashboard')
+                    
+                    # Auto-adjust column widths
+                    worksheet = writer.sheets['Symbol Dashboard']
+                    for idx, col in enumerate(df.columns):
+                        max_len = max(df[col].astype(str).map(len).max(), len(col)) + 2
+                        worksheet.column_dimensions[get_column_letter(idx + 1)].width = min(max_len, 50)
+                
+                print(f"[symbol-dashboard] Excel created with {len(df)} rows: {download_name}")
+                
+                metadata = {
+                    'tag': tag,
+                    'symbols_used': len(all_rows),
+                    'total_symbols': total_symbols,
+                    'batches_processed': total_batches,
+                    'errors_count': len(all_errors),
+                    'as_on': as_on
+                }
+                db_id = save_excel_to_database(excel_path, download_name, metadata)
+                
+                if db_id:
+                    download_url = f"/api/nse-symbol-dashboard/download?id={db_id}"
+                    
+            except Exception as exc:
+                print(f"[symbol-dashboard] Excel creation failed: {exc}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                try:
+                    if excel_path and os.path.exists(excel_path):
+                        os.remove(excel_path)
+                except Exception:
+                    pass
 
         duration = time.perf_counter() - start_time
         print(
-            f"[symbol-dashboard][done] id={req_id} symbols_used={len(symbols_slice)} "
-            f"rows_returned={len(result.get('rows', []))} errors={len(result.get('errors', []))} elapsed={duration:.2f}s"
+            f"[symbol-dashboard][done] id={req_id} "
+            f"total_rows={len(all_rows)}/{total_symbols} "
+            f"batches={total_batches} errors={len(all_errors)} "
+            f"elapsed={duration:.1f}s"
         )
 
         return jsonify({
             'success': True,
-            'count': result.get('count', 0),
-            'rows': result.get('rows', []),  # Include rows in response for frontend
-            'averages': result.get('averages', {}),
-            'errors': result.get('errors', []),
+            'count': len(all_rows),
+            'rows': all_rows,
+            'averages': {},
+            'errors': all_errors,
             'file': download_name,
             'file_id': str(db_id) if db_id else None,
             'download_url': download_url,
-            'symbols_used': len(symbols_slice),
-            'symbols_requested': len(symbols),
+            'symbols_used': len(all_rows),
+            'symbols_requested': total_symbols,
             'total_symbols': total_symbols,
-            'page': page,
-            'page_size': page_size,
-            'total_pages': total_pages,
-            'range': {'start': start_idx + 1, 'end': end_idx}
+            'processed_batches': total_batches,
+            'duration_seconds': round(duration, 1)
         }), 200
+        
     except Exception as e:
         print(f"[symbol-dashboard][error] {e}")
         import traceback
@@ -1824,6 +1856,7 @@ def get_excel_results():
                 result['created_at'] = result['created_at'].isoformat()
         
         return jsonify({
+
             'success': True,
             'count': len(results),
             'results': results
