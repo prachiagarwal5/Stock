@@ -1715,421 +1715,73 @@ def download_symbol_dashboard():
     )
 
 
-@app.route('/api/dashboard-data', methods=['GET'])
-def dashboard_data():
-    """Return consolidated dashboard data from Mongo (aggregates + symbol metrics)."""
-    if db is None:
+@app.route('/api/update-indices', methods=['POST'])
+def update_indices():
+    if symbol_metrics_collection is None:
         return jsonify({'error': 'Database not connected'}), 500
 
     try:
-        limit = int(request.args.get('limit', 500))
-        limit = max(1, min(limit, 1000))
+        # Build primary index map only from existing Mongo data (no NSE API calls)
+        symbol_index_map = {}
+        cursor = symbol_metrics_collection.find({}, {
+            'symbol': 1,
+            'primary_index': 1,
+            'index': 1,
+            'indexList': 1,
+            'updated_at': 1,
+            'as_on': 1
+        }).sort([
+            ('updated_at', -1),
+            ('as_on', -1)
+        ])
 
-        def _clean(doc):
-            doc = dict(doc)
-            doc.pop('file_data', None)
-            if '_id' in doc:
-                doc['_id'] = str(doc['_id'])
-            if isinstance(doc.get('updated_at'), datetime):
-                doc['updated_at'] = doc['updated_at'].isoformat()
-            if isinstance(doc.get('as_on'), datetime):
-                doc['as_on'] = doc['as_on'].isoformat()
-            return doc
+        for doc in cursor:
+            sym = doc.get('symbol')
+            if not sym or sym in symbol_index_map:
+                continue
+            idx = doc.get('primary_index') or doc.get('index')
+            if not idx:
+                idx_list = doc.get('indexList')
+                if isinstance(idx_list, (list, tuple)) and idx_list:
+                    idx = idx_list[0]
+            if idx:
+                symbol_index_map[sym] = idx
 
-        # Get MCAP aggregates
-        agg_mcap = []
-        if symbol_aggregates_collection is not None:
-            agg_mcap = list(symbol_aggregates_collection.find({'type': 'mcap'}).sort('average', -1).limit(limit))
+        if not symbol_index_map:
+            return jsonify({'error': 'No index data found in database'}), 404
 
-        # Get PR aggregates
-        agg_pr = []
-        if symbol_aggregates_collection is not None:
-            agg_pr = list(symbol_aggregates_collection.find({'type': 'pr'}).sort('average', -1).limit(limit))
+        bulk_ops = [
+            UpdateOne(
+                {'symbol': symbol},
+                {'$set': {'primary_index': primary_index, 'updated_at': datetime.now().isoformat()}},
+                upsert=True
+            )
+            for symbol, primary_index in symbol_index_map.items()
+        ]
 
-        # Get symbol metrics
-        metrics = []
-        if symbol_metrics_collection is not None:
-            metrics = list(symbol_metrics_collection.find({}).sort([('as_on', -1), ('symbol', 1)]).limit(limit))
+        if bulk_ops:
+            symbol_metrics_collection.bulk_write(bulk_ops, ordered=False)
 
-        # Build merged dashboard data
-        # Create lookup maps
-        mcap_map = {doc.get('symbol'): doc for doc in agg_mcap if doc.get('symbol')}
-        pr_map = {doc.get('symbol'): doc for doc in agg_pr if doc.get('symbol')}
-        metrics_map = {doc.get('symbol'): doc for doc in metrics if doc.get('symbol')}
+        csv_buffer = StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerow(['symbol', 'primary_index'])
+        for sym, idx in sorted(symbol_index_map.items()):
+            writer.writerow([sym, idx])
+        csv_content = csv_buffer.getvalue()
 
-        # Get all unique symbols
-        all_symbols = set(mcap_map.keys()) | set(pr_map.keys()) | set(metrics_map.keys())
-
-        # Build merged records
-        merged_data = []
-        for symbol in all_symbols:
-            mcap_doc = mcap_map.get(symbol, {})
-            pr_doc = pr_map.get(symbol, {})
-            metrics_doc = metrics_map.get(symbol, {})
-
-            merged_record = {
-                'symbol': symbol,
-                'company_name': mcap_doc.get('company_name') or pr_doc.get('company_name') or metrics_doc.get('company_name') or symbol,
-                # MCAP data
-                'avg_mcap': mcap_doc.get('average'),
-                'mcap_days_with_data': mcap_doc.get('days_with_data'),
-                'mcap_date_range': mcap_doc.get('date_range'),
-                # PR data
-                'avg_pr': pr_doc.get('average'),
-                'pr_days_with_data': pr_doc.get('days_with_data'),
-                'pr_date_range': pr_doc.get('date_range'),
-                # Metrics data
-                'impact_cost': metrics_doc.get('impact_cost'),
-                'free_float_mcap': metrics_doc.get('free_float_mcap') or metrics_doc.get('ffmc'),
-                'traded_value': metrics_doc.get('traded_value') or metrics_doc.get('avg_traded_value'),
-                'primary_index': metrics_doc.get('primary_index') or metrics_doc.get('index'),
-                'pe_ratio': metrics_doc.get('pe_ratio') or metrics_doc.get('pe'),
-                'pb_ratio': metrics_doc.get('pb_ratio') or metrics_doc.get('pb'),
-                'dividend_yield': metrics_doc.get('dividend_yield'),
-                'last_price': metrics_doc.get('last_price') or metrics_doc.get('ltp'),
-                'pct_change': metrics_doc.get('pct_change') or metrics_doc.get('pChange'),
-                'as_on': metrics_doc.get('as_on'),
-                'updated_at': mcap_doc.get('updated_at') or pr_doc.get('updated_at') or metrics_doc.get('updated_at')
-            }
-            merged_data.append(merged_record)
-
-        # Sort by avg_mcap descending
-        merged_data.sort(key=lambda x: x.get('avg_mcap') or 0, reverse=True)
-        merged_data = merged_data[:limit]
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        file_name = f'indices_{timestamp}.csv'
+        INDEX_FILES['latest'] = {'name': file_name, 'content': csv_content}
 
         return jsonify({
-            'success': True,
-            'aggregates': {
-                'mcap': [_clean(x) for x in agg_mcap],
-                'pr': [_clean(x) for x in agg_pr]
-            },
-            'metrics': [_clean(x) for x in metrics],
-            'merged': [_clean(x) for x in merged_data],
-            'counts': {
-                'mcap': len(agg_mcap),
-                'pr': len(agg_pr),
-                'metrics': len(metrics),
-                'merged': len(merged_data)
-            },
-            'limit': limit
+            'message': 'Indices updated from DB',
+            'count': len(symbol_index_map),
+            'errors': [],
+            'download_path': '/api/download-indices',
+            'file_saved': file_name
         }), 200
     except Exception as e:
-        print(f"Error fetching dashboard data: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/nse-symbol-dashboard', methods=['POST'])
-def nse_symbol_dashboard():
-    """
-    Build a dashboard of impact cost, free float market cap, traded value, and index for symbols.
-    Payload options:
-    {
-        "date": "03-Dec-2025" # use cached MCAP/PR in Mongo
-        "start_date": "01-Dec-2025", "end_date": "05-Dec-2025" # optional range scan in Mongo cache
-        "symbols": ["ABB", ...],  # optional explicit list
-        "save_to_file": true/false  # default true, saves Excel to Mongo and returns download id
-    }
-    """
-    try:
-        data = request.get_json() or {}
-        req_id = f"symboldash-{int(time.time() * 1000)}"
-        start_time = time.perf_counter()
-
-        date_str = data.get('date')
-        start_date_str = data.get('start_date')
-        end_date_str = data.get('end_date')
-        save_to_file = data.get('save_to_file', True)
-        provided_symbols = data.get('symbols') or []
-        top_n = data.get('top_n', 100)  # Default to 100
-        top_n_by = data.get('top_n_by') or 'mcap'
-        parallel_workers = data.get('parallel_workers', 50)
-        chunk_size = data.get('chunk_size', 100)
-        as_on = datetime.now().strftime('%Y-%m-%d')
-        page = int(data.get('page', 1)) if str(data.get('page', '')).strip() != '' else 1
-        page_size = int(data.get('page_size', data.get('max_symbols', 1000))) if str(data.get('page_size', '')).strip() != '' else int(data.get('max_symbols', 1000))
-        page_size = max(10, min(page_size, 1000))  # allow up to 1000
-
-        print(
-            f"[symbol-dashboard][start] id={req_id} save_to_file={save_to_file} "
-            f"payload_keys={list(data.keys())} top_n={top_n} top_n_by={top_n_by}"
-        )
-
-        symbols = provided_symbols[:] if provided_symbols else []
-        target_files = []
-        tag = None
-
-        # Build date_range filter for querying aggregates
-        date_range_filter = None
-        
-        if date_str:
-            try:
-                date_obj = date_parser.parse(date_str)
-            except Exception:
-                return jsonify({'error': 'Invalid date format. Use DD-Mon-YYYY'}), 400
-            tag = date_obj.strftime('%d%m%Y')
-
-        elif start_date_str and end_date_str:
-            try:
-                start_dt = date_parser.parse(start_date_str)
-                end_dt = date_parser.parse(end_date_str)
-            except Exception:
-                return jsonify({'error': 'Invalid start/end date format. Use DD-Mon-YYYY'}), 400
-            if start_dt > end_dt:
-                return jsonify({'error': 'start_date cannot be after end_date'}), 400
-            tag = f"{start_dt.strftime('%d%m%Y')}_{end_dt.strftime('%d%m%Y')}"
-            # Build date range filter to match overlapping ranges in aggregates
-            # Match documents where aggregates.date_range overlaps with requested range
-            requested_start = start_dt.strftime('%Y-%m-%d')
-            requested_end = end_dt.strftime('%Y-%m-%d')
-            date_range_filter = {
-                'date_range.start': {'$lte': requested_end},    # aggregate starts before or on requested end
-                'date_range.end': {'$gte': requested_start}      # aggregate ends after or on requested start
-            }
-            print(f"[symbol-dashboard] Using date range filter: {date_range_filter}")
-
-        # If symbols not provided, fetch from Mongo aggregates (latest) to avoid filesystem reads
-        if not symbols and symbol_aggregates_collection is not None:
-            query = {'type': 'mcap'}
-            if date_range_filter:
-                query.update(date_range_filter)
-            agg_symbols = list(symbol_aggregates_collection.distinct('symbol', query))
-            symbols = agg_symbols
-            print(f"[symbol-dashboard] Found {len(symbols)} symbols from aggregates collection")
-
-        # Optionally limit to top N by averages from Mongo aggregates
-        if symbol_aggregates_collection is not None:
-            try:
-                top_n_val = int(top_n) if str(top_n).strip() != '' else 100
-            except Exception:
-                top_n_val = 100
-            if top_n_val and top_n_val > 0:
-                try:
-                    query = {'type': top_n_by}
-                    if date_range_filter:
-                        query.update(date_range_filter)
-                    agg_docs = list(symbol_aggregates_collection.find(query).sort('average', -1).limit(top_n_val))
-                    agg_symbols = [doc.get('symbol') for doc in agg_docs if doc.get('symbol')]
-                    if agg_symbols:
-                        symbols = agg_symbols
-                    print(f"[symbol-dashboard] Top {top_n_val} query returned {len(agg_symbols)} symbols")
-                except Exception as exc:
-                    print(f"⚠️ Unable to fetch top {top_n_val} symbols by {top_n_by}: {exc}")
-
-        if not symbols:
-            print(f"[symbol-dashboard][error] id={req_id} no symbols found")
-            return jsonify({'error': 'No symbols found. Provide symbols or download MCAP first.'}), 400
-
-        # Drop duplicates and keep order
-        symbols = list(dict.fromkeys(symbols))
-
-        total_symbols = len(symbols)
-        if total_symbols == 0:
-            return jsonify({'error': 'No symbols found. Provide symbols or download MCAP first.'}), 400
-
-        # If top_n provided, ensure we get that many symbols
-        if top_n:
-            try:
-                top_n_val = int(top_n)
-            except Exception:
-                top_n_val = 100
-            if top_n_val and top_n_val > 0:
-                symbols = symbols[:top_n_val]
-                total_symbols = len(symbols)
-                page = 1
-                page_size = max(page_size, top_n_val)
-        
-        total_pages = max(1, math.ceil(total_symbols / page_size))
-        page = max(1, min(page, total_pages))
-        start_idx = (page - 1) * page_size
-        end_idx = min(start_idx + page_size, total_symbols)
-        symbols_slice = symbols[start_idx:end_idx]
-
-        print(f"[symbol-dashboard] Processing {len(symbols_slice)} symbols (total: {total_symbols})")
-
-        fetcher = SymbolMetricsFetcher()
-
-        # Fetch primary_index from DB for the slice (no external calls for indices)
-        index_map = primary_index_map_from_db(symbols_slice)
-
-        excel_path = None
-        download_name = None
-        temp_file = None
-        db_id = None
-        if save_to_file:
-            download_name = f"Symbol_Dashboard_{tag or 'latest'}.xlsx"
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
-            excel_path = temp_file.name
-            temp_file.close()
-
-        # Fetch PR data for % of traded days calculation
-        symbol_pr_data = {}
-        if symbol_aggregates_collection is not None:
-            try:
-                pr_query = {
-                    'symbol': {'$in': symbols_slice},
-                    'type': 'pr'
-                }
-                if date_range_filter:
-                    pr_query.update(date_range_filter)
-                pr_docs = list(symbol_aggregates_collection.find(pr_query))
-                for doc in pr_docs:
-                    sym = doc.get('symbol')
-                    if sym:
-                        # Get total trading days from date_range if available
-                        date_range = doc.get('date_range', {})
-                        days_with_data = doc.get('days_with_data', 0)
-                        # Calculate total trading days from range
-                        total_trading_days = days_with_data  # Default to days with data
-                        if date_range and date_range.get('start') and date_range.get('end'):
-                            try:
-                                start_dt = date_parser.parse(date_range['start'])
-                                end_dt = date_parser.parse(date_range['end'])
-                                # Count weekdays between dates
-                                total_trading_days = sum(1 for d in pd.date_range(start_dt, end_dt) if d.weekday() < 5)
-                            except Exception:
-                                pass
-                        symbol_pr_data[sym] = {
-                            'days_with_data': days_with_data,
-                            'total_trading_days': total_trading_days,
-                            'avg_pr': doc.get('average')
-                        }
-                print(f"[symbol-dashboard] Loaded PR data for {len(symbol_pr_data)} symbols")
-            except Exception as exc:
-                print(f"⚠️ Failed to fetch PR data: {exc}")
-
-        # Fetch MCAP data for ratio calculation
-        symbol_mcap_data = {}
-        if symbol_aggregates_collection is not None:
-            try:
-                mcap_query = {
-                    'symbol': {'$in': symbols_slice},
-                    'type': 'mcap'
-                }
-                if date_range_filter:
-                    mcap_query.update(date_range_filter)
-                mcap_docs = list(symbol_aggregates_collection.find(mcap_query))
-                for doc in mcap_docs:
-                    sym = doc.get('symbol')
-                    if sym:
-                        symbol_mcap_data[sym] = {
-                            'avg_mcap': doc.get('average'),
-                            'avg_free_float': None  # Will be calculated from metrics if available
-                        }
-                print(f"[symbol-dashboard] Loaded MCAP data for {len(symbol_mcap_data)} symbols")
-            except Exception as exc:
-                print(f"⚠️ Failed to fetch MCAP data: {exc}")
-
-        # Run in parallel batches to speed up large symbol lists
-        try:
-            workers = int(parallel_workers) if str(parallel_workers).strip() != '' else 50
-        except Exception:
-            workers = 50
-        try:
-            chunk_val = int(chunk_size) if str(chunk_size).strip() != '' else 100
-        except Exception:
-            chunk_val = 100
-
-        # Check if running on Render (free tier has 30s timeout, limited memory)
-        is_render = os.environ.get('RENDER') == 'true' or os.environ.get('RENDER_SERVICE_NAME')
-        
-        if is_render:
-            # Render free tier: use conservative settings but don't limit symbols as much
-            max_workers_allowed = 30  # Increased from 20
-            # Don't limit symbols here - let the timeout handle it
-            max_symbols_render = 150  # Increased from 100
-            if len(symbols_slice) > max_symbols_render:
-                print(f"[symbol-dashboard][render] Limiting from {len(symbols_slice)} to {max_symbols_render} symbols")
-                symbols_slice = symbols_slice[:max_symbols_render]
-        else:
-            # Local/paid hosting: allow high parallelism
-            max_workers_allowed = 250
-            
-        if workers > max_workers_allowed:
-            print(f"[symbol-dashboard][clamp] id={req_id} requested_workers={workers} capped_to={max_workers_allowed}")
-        effective_workers = max(1, min(workers, max_workers_allowed))
-        chunk_val = max(1, chunk_val)
-
-        print(
-            f"[symbol-dashboard] symbols_total={total_symbols} "
-            f"slice={len(symbols_slice)} top_n={top_n} by={top_n_by} "
-            f"workers_requested={workers} workers_max={max_workers_allowed} "
-            f"workers_used={effective_workers} chunk={chunk_val}"
-        )
-
-        # Set time limit for Render free tier (25 seconds to leave margin for response)
-        max_time = 25 if is_render else 60  # 60 seconds for local/paid
-
-        # Process symbols directly (frontend handles batching across multiple requests)
-        result = fetcher.build_dashboard(
-            symbols_slice,
-            excel_path=excel_path,
-            max_symbols=None,
-            as_of=as_on,
-            parallel=True,
-            max_workers=effective_workers,
-            chunk_size=chunk_val,
-            symbol_pr_data=symbol_pr_data,
-            symbol_mcap_data=symbol_mcap_data,
-            max_time_seconds=max_time
-        )
-
-        print(f"[symbol-dashboard] completed fetch rows={len(result.get('rows', []))} errors={len(result.get('errors', []))}")
-
-        # Persist symbol metrics
-        for row in result.get('rows', []):
-            row = dict(row)
-            row['as_on'] = row.get('as_on') or as_on
-            sym = row.get('symbol')
-            # Prefer DB-sourced primary_index if available
-            if sym in index_map:
-                row['primary_index'] = index_map[sym]
-            upsert_symbol_metrics(row, source='symbol_dashboard')
-
-        download_url = None
-        if excel_path and download_name:
-            metadata = {
-                'tag': tag,
-                'symbols_used': len(symbols_slice),
-                'total_symbols': total_symbols,
-                'page': page,
-                'page_size': page_size,
-                'as_on': as_on
-            }
-            db_id = save_excel_to_database(excel_path, download_name, metadata)
-            try:
-                os.remove(excel_path)
-            except Exception:
-                pass
-            if db_id:
-                download_url = f"/api/nse-symbol-dashboard/download?id={db_id}"
-
-        duration = time.perf_counter() - start_time
-        print(
-            f"[symbol-dashboard][done] id={req_id} symbols_used={len(symbols_slice)} "
-            f"rows_returned={len(result.get('rows', []))} errors={len(result.get('errors', []))} elapsed={duration:.2f}s"
-        )
-
-        return jsonify({
-            'success': True,
-            'count': result.get('count', 0),
-            'rows': result.get('rows', []),  # Include rows in response for frontend
-            'averages': result.get('averages', {}),
-            'errors': result.get('errors', []),
-            'file': download_name,
-            'file_id': str(db_id) if db_id else None,
-            'download_url': download_url,
-            'symbols_used': len(symbols_slice),
-            'symbols_requested': len(symbols),
-            'total_symbols': total_symbols,
-            'page': page,
-            'page_size': page_size,
-            'total_pages': total_pages,
-            'range': {'start': start_idx + 1, 'end': end_idx}
-        }), 200
-    except Exception as e:
-        print(f"[symbol-dashboard][error] {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error in update_indices: {e}")
         return jsonify({'error': str(e)}), 500
 
 
