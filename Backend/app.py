@@ -652,7 +652,7 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
     return df_all_pivot, dates_list, avg_col
 
 # Configuration
-UPLOAD_FOLDER = tempfile.mkdtemp()
+UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', './Backend/uploads/market_cap')
 ALLOWED_EXTENSIONS = {'csv'}
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
@@ -1398,66 +1398,52 @@ def nse_symbol_dashboard():
         # Render detection and settings
         is_render = os.environ.get('RENDER') == 'true' or os.environ.get('RENDER_SERVICE_NAME')
         
-        if is_render:
-            BATCH_SIZE = 25  # Small batches for Render
-            MAX_TIME_TOTAL = 25  # Leave 5s margin for response
-            MAX_TIME_PER_SYMBOL = 0.8  # ~0.8s per symbol max
-            MAX_WORKERS = 15
-        else:
-            BATCH_SIZE = 50
-            MAX_TIME_TOTAL = 55
-            MAX_TIME_PER_SYMBOL = 1.0
-            MAX_WORKERS = 50
+
+        # Force user requirements: 10 batches of 100 symbols (top 1000 by MCAP)
+        BATCH_SIZE = 100
+        TOTAL_SYMBOLS = 1000
+        MAX_TIME_TOTAL = 55
+        MAX_TIME_PER_SYMBOL = 1.0
+        MAX_WORKERS = 50
 
         print(f"[symbol-dashboard][start] id={req_id} batch_index={batch_index} "
               f"is_render={is_render} top_n={top_n}")
 
+
         symbols = provided_symbols[:] if provided_symbols else []
         tag = None
-        date_range_filter = None
-        
-        if date_str:
-            try:
-                date_obj = date_parser.parse(date_str)
-                tag = date_obj.strftime('%d%m%Y')
-            except Exception:
-                return jsonify({'error': 'Invalid date format'}), 400
-
-        elif start_date_str and end_date_str:
-            try:
-                start_dt = date_parser.parse(start_date_str)
-                end_dt = date_parser.parse(end_date_str)
-                if start_dt > end_dt:
-                    return jsonify({'error': 'start_date cannot be after end_date'}), 400
-                tag = f"{start_dt.strftime('%d%m%Y')}_{end_dt.strftime('%d%m%Y')}"
-                date_range_filter = {
-                    'date_range.start': {'$lte': end_dt.strftime('%Y-%m-%d')},
-                    'date_range.end': {'$gte': start_dt.strftime('%Y-%m-%d')}
-                }
-            except Exception:
-                return jsonify({'error': 'Invalid date format'}), 400
-
-        # Get symbols from DB if not provided
-        if not symbols and symbol_aggregates_collection is not None:
-            try:
-                top_n_val = int(top_n) if str(top_n).strip() else 100
-                query = {'type': top_n_by}
-                if date_range_filter:
-                    query.update(date_range_filter)
-                agg_docs = list(symbol_aggregates_collection.find(query).sort('average', -1).limit(top_n_val))
-                symbols = [doc.get('symbol') for doc in agg_docs if doc.get('symbol')]
-                print(f"[symbol-dashboard] Got {len(symbols)} symbols from DB")
-            except Exception as exc:
-                print(f"⚠️ Failed to fetch symbols: {exc}")
+        # Always use local Excel for top 1000 if no symbols provided
 
         if not symbols:
-            return jsonify({'error': 'No symbols found. Download MCAP data first.'}), 400
+            market_cap_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject', 'Market_Cap.xlsx')
+            try:
+                df = pd.read_excel(market_cap_path)
+                # Try to find the right columns for symbol and market cap
+                symbol_col = None
+                mcap_col = None
+                for c in df.columns:
+                    if str(c).strip().lower() in ['symbol', 'symbols']:
+                        symbol_col = c
+                    if 'mcap' in str(c).strip().lower() or 'market cap' in str(c).strip().lower():
+                        mcap_col = c
+                if symbol_col is None or mcap_col is None:
+                    return jsonify({'error': 'Could not find symbol or market cap column in Market_Cap.xlsx'}), 400
+                df = df[[symbol_col, mcap_col]].dropna()
+                df = df.sort_values(by=mcap_col, ascending=False)
+                symbols = df[symbol_col].astype(str).tolist()[:TOTAL_SYMBOLS]
+                print(f"[symbol-dashboard] Got {len(symbols)} symbols from Market_Cap.xlsx (top 1000 MCAP)")
+            except Exception as exc:
+                print(f"⚠️ Failed to fetch symbols from Market_Cap.xlsx: {exc}")
+                return jsonify({'error': f'Failed to fetch symbols from Market_Cap.xlsx: {exc}'}), 400
 
-        symbols = list(dict.fromkeys(symbols))  # Remove duplicates
+        if not symbols:
+            return jsonify({'error': 'No symbols found. Export MCAP Excel first.'}), 400
+
+        symbols = list(dict.fromkeys(symbols))[:TOTAL_SYMBOLS]  # Remove duplicates, force top 1000
         total_symbols = len(symbols)
 
-        # Calculate batches
-        symbol_batches = [symbols[i:i + BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
+        # Always 10 batches of 100
+        symbol_batches = [symbols[i:i + BATCH_SIZE] for i in range(0, TOTAL_SYMBOLS, BATCH_SIZE)]
         total_batches = len(symbol_batches)
 
         print(f"[symbol-dashboard] {total_symbols} symbols -> {total_batches} batches of {BATCH_SIZE}")
@@ -1499,8 +1485,36 @@ def nse_symbol_dashboard():
             
             duration = time.perf_counter() - start_time
             is_last_batch = (batch_idx == total_batches - 1)
-            
-            return jsonify({
+
+            # If this is the last batch, generate Excel and provide download_url
+            download_url = None
+            db_id = None
+            download_name = None
+            if is_last_batch and len(rows) > 0:
+                download_name = f"Symbol_Dashboard_batch_{batch_idx+1}_{len(rows)}.xlsx"
+                try:
+                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+                    excel_path = temp_file.name
+                    temp_file.close()
+                    df = pd.DataFrame(rows)
+                    preferred_cols = ['symbol', 'company_name', 'primary_index', 'impact_cost', 
+                                      'free_float_mcap', 'traded_value', 'last_price', 'pct_change']
+                    existing = [c for c in preferred_cols if c in df.columns]
+                    other = [c for c in df.columns if c not in preferred_cols]
+                    df = df[existing + other]
+                    df.to_excel(excel_path, index=False, sheet_name='Dashboard')
+                    db_id = save_excel_to_database(excel_path, download_name, {
+                        'symbols': len(rows),
+                        'batch': batch_idx+1,
+                        'as_on': as_on
+                    })
+                    if db_id:
+                        download_url = f"/api/nse-symbol-dashboard/download?id={db_id}"
+                    os.remove(excel_path)
+                except Exception as exc:
+                    print(f"[symbol-dashboard][Excel batch] failed: {exc}")
+
+            response = {
                 'success': True,
                 'count': len(rows),
                 'rows': rows,
@@ -1511,7 +1525,20 @@ def nse_symbol_dashboard():
                 'symbols_in_batch': len(batch_symbols),
                 'complete': is_last_batch,
                 'duration_seconds': round(duration, 1)
-            }), 200
+            }
+            if is_last_batch:
+                response['file'] = download_name
+                response['file_id'] = str(db_id) if db_id else None
+                response['download_url'] = download_url
+                # Only delete Market_Cap.xlsx after the last batch
+                market_cap_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject', 'Market_Cap.xlsx')
+                if os.path.exists(market_cap_path):
+                    try:
+                        os.remove(market_cap_path)
+                        print(f"✓ Market_Cap.xlsx deleted after all batches processed")
+                    except Exception as exc:
+                        print(f"⚠️ Could not delete Market_Cap.xlsx: {exc}")
+            return jsonify(response), 200
 
         # === FULL REQUEST: Process all batches with time limit ===
         all_rows = []
@@ -1539,21 +1566,10 @@ def nse_symbol_dashboard():
         fetcher = SymbolMetricsFetcher()
         
         for batch_idx, batch_symbols in enumerate(symbol_batches):
-            elapsed = time.perf_counter() - start_time
-            
-            # Check if we're running out of time
-            if elapsed > MAX_TIME_TOTAL - 5:  # Leave 5s for response
-                print(f"[symbol-dashboard] Time limit reached after {batches_completed} batches")
-                break
-            
             batch_start = time.perf_counter()
-            remaining_time = MAX_TIME_TOTAL - elapsed - 3  # 3s buffer
-            batch_timeout = min(remaining_time, MAX_TIME_PER_SYMBOL * len(batch_symbols))
-            
             try:
                 batch_pr = {s: symbol_pr_data.get(s) for s in batch_symbols if s in symbol_pr_data}
                 batch_mcap = {s: symbol_mcap_data.get(s) for s in batch_symbols if s in symbol_mcap_data}
-                
                 result = fetcher.build_dashboard(
                     batch_symbols,
                     excel_path=None,
@@ -1564,32 +1580,26 @@ def nse_symbol_dashboard():
                     chunk_size=5,
                     symbol_pr_data=batch_pr,
                     symbol_mcap_data=batch_mcap,
-                    max_time_seconds=batch_timeout
+                    max_time_seconds=None
                 )
-                
                 batch_rows = result.get('rows', [])
                 batch_errors = result.get('errors', [])
-                
                 # Add primary_index
                 for row in batch_rows:
                     sym = row.get('symbol')
                     if sym and sym in index_map:
                         row['primary_index'] = index_map[sym]
-                
                 all_rows.extend(batch_rows)
                 all_errors.extend(batch_errors)
                 batches_completed += 1
-                
                 batch_elapsed = time.perf_counter() - batch_start
                 print(f"[symbol-dashboard] Batch {batch_idx + 1}/{total_batches}: "
                       f"{len(batch_rows)}/{len(batch_symbols)} in {batch_elapsed:.1f}s "
                       f"(total: {len(all_rows)})")
-                
             except Exception as exc:
                 print(f"[symbol-dashboard] Batch {batch_idx + 1} failed: {exc}")
                 all_errors.append({'batch': batch_idx + 1, 'error': str(exc)})
                 batches_completed += 1
-            
             # Small delay to avoid rate limiting
             if batch_idx < total_batches - 1:
                 time.sleep(0.2)
@@ -1768,6 +1778,34 @@ def download_indices():
         download_name=cached['name']
     )
 
+@app.route('/api/nse-symbol-dashboard/download', methods=['GET'])
+def download_symbol_dashboard_file():
+    if excel_results_collection is None:
+        return jsonify({'error': 'Database not connected'}), 500
+
+    file_id = request.args.get('id')
+    if not file_id:
+        return jsonify({'error': 'Missing id parameter'}), 400
+
+    try:
+        oid = ObjectId(file_id)
+    except Exception:
+        return jsonify({'error': 'Invalid file id'}), 400
+
+    try:
+        doc = excel_results_collection.find_one({'_id': oid})
+        if not doc:
+            return jsonify({'error': 'File not found'}), 404
+
+        return send_file(
+            BytesIO(doc['file_data']),
+            mimetype=doc.get('file_type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+            as_attachment=True,
+            download_name=doc.get('filename', 'Symbol_Dashboard.xlsx')
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/excel-results', methods=['GET'])
 def get_excel_results():
     """Get list of all Excel files stored in database"""
@@ -1775,24 +1813,14 @@ def get_excel_results():
         return jsonify({'error': 'Database not connected'}), 500
     
     try:
-        results = list(excel_results_collection.find({}, {
-            'file_data': 0,  # Exclude binary data from list
-            'file_type': 1,
-            'filename': 1,
-            'file_size': 1,
-            'created_at': 1,
-            '_id': 1,
-            'metadata': 1
-        }).sort('created_at', -1))
-        
+        # Use only exclusion for file_data to avoid MongoDB projection error
+        results = list(excel_results_collection.find({}, {'file_data': 0}).sort('created_at', -1))
         # Convert ObjectId to string and datetime to ISO format
         for result in results:
             result['_id'] = str(result['_id'])
             if 'created_at' in result:
                 result['created_at'] = result['created_at'].isoformat()
-        
         return jsonify({
-
             'success': True,
             'count': len(results),
             'results': results
@@ -1923,9 +1951,21 @@ def consolidate():
             consolidator = MarketCapConsolidator(request_folder)
             companies_count, dates_count = consolidator.load_and_consolidate_data()
             
-            # Create output file
+
+            # Create output file in temp folder
             output_path = os.path.join(request_folder, 'Finished_Product.xlsx')
             consolidator.format_excel_output(output_path)
+
+            # Also save a copy as nosubject/Market_Cap.xlsx for dashboard use
+            try:
+                nosubject_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject')
+                if not os.path.exists(nosubject_dir):
+                    os.makedirs(nosubject_dir)
+                market_cap_dest = os.path.join(nosubject_dir, 'Market_Cap.xlsx')
+                shutil.copy2(output_path, market_cap_dest)
+                print(f"✓ Market_Cap.xlsx copied to {market_cap_dest}")
+            except Exception as exc:
+                print(f"⚠️ Could not copy Market_Cap.xlsx to nosubject/: {exc}")
 
             # Persist per-symbol values and averages (uploaded files consolidation)
             persist_consolidated_results(consolidator, 'mcap', source='upload_consolidation')
@@ -2161,6 +2201,19 @@ def consolidate_saved():
                 return jsonify({'error': 'No output generated'}), 500
 
             response = None
+
+            # Always copy MCAP file to nosubject/Market_Cap.xlsx for dashboard use
+            try:
+                nosubject_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject')
+                if not os.path.exists(nosubject_dir):
+                    os.makedirs(nosubject_dir)
+                if mcap_output_path:
+                    market_cap_dest = os.path.join(nosubject_dir, 'Market_Cap.xlsx')
+                    shutil.copy2(mcap_output_path, market_cap_dest)
+                    add_log(f"✓ Market_Cap.xlsx copied to {market_cap_dest}")
+            except Exception as exc:
+                add_log(f"⚠️ Could not copy Market_Cap.xlsx to nosubject/: {exc}")
+
             if mcap_output_path and pr_output_path:
                 zip_start = time.perf_counter()
                 zip_name = f"Market_Data_{date_label}.zip"
@@ -2221,7 +2274,8 @@ def consolidate_saved():
             total_elapsed = time.perf_counter() - stage_start
             print(f"[consolidate-saved][done] id={req_id} outputs={list(results.keys())} elapsed={total_elapsed:.2f}s")
 
-            response.call_on_close(lambda: shutil.rmtree(work_dir, ignore_errors=True))
+            response.call_on_close(lambda: [shutil.rmtree(work_dir, ignore_errors=True),
+                                            os.path.exists(market_cap_dest) and os.remove(market_cap_dest)])
             return response
 
         except Exception as e:
@@ -2414,6 +2468,50 @@ def heatmap_view():
         print(f"[heatmap] Error: {exc}")
         return jsonify({'error': str(exc)}), 500
 
+@app.route('/api/nse-symbol-dashboard/save-excel', methods=['POST'])
+def nse_symbol_dashboard_save_excel():
+    """
+    Accepts all dashboard rows from the frontend and generates a single Excel file for all batches.
+    Returns the download_url for the complete file.
+    """
+    try:
+        data = request.get_json() or {}
+        rows = data.get('rows', [])
+        as_on = data.get('as_on') or datetime.now().strftime('%Y-%m-%d')
+        if not rows or not isinstance(rows, list):
+            return jsonify({'error': 'No rows provided'}), 400
+        download_name = f"Symbol_Dashboard_All_{len(rows)}.xlsx"
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+        excel_path = temp_file.name
+        temp_file.close()
+        df = pd.DataFrame(rows)
+        preferred_cols = ['symbol', 'company_name', 'primary_index', 'impact_cost', 
+                          'free_float_mcap', 'traded_value', 'last_price', 'pct_change']
+        existing = [c for c in preferred_cols if c in df.columns]
+        other = [c for c in df.columns if c not in preferred_cols]
+        df = df[existing + other]
+        df.to_excel(excel_path, index=False, sheet_name='Dashboard')
+        db_id = save_excel_to_database(excel_path, download_name, {
+            'symbols': len(rows),
+            'as_on': as_on,
+            'all_batches': True
+        })
+        download_url = None
+        if db_id:
+            download_url = f"/api/nse-symbol-dashboard/download?id={db_id}"
+        os.remove(excel_path)
+        return jsonify({
+            'success': True,
+            'file': download_name,
+            'file_id': str(db_id) if db_id else None,
+            'download_url': download_url,
+            'symbols': len(rows)
+        }), 200
+    except Exception as e:
+        print(f"[symbol-dashboard][save-excel][error] {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     import os

@@ -504,41 +504,33 @@ function App() {
 
         // Configuration for batch processing
         const TOTAL_SYMBOLS = 1000;
-        const BATCH_SIZE = 100;  // 100 symbols per request (fits in Render 30s timeout)
-        const TOTAL_BATCHES = Math.ceil(TOTAL_SYMBOLS / BATCH_SIZE);
+        const BATCH_SIZE = 100;
+        const TOTAL_BATCHES = 10;
 
         let allRows = [];
         let allErrors = [];
-        let lastFileId = null;
-        let lastDownloadUrl = null;
+        let processedSymbols = 0;
 
         try {
             for (let batchNum = 0; batchNum < TOTAL_BATCHES; batchNum++) {
                 const startSymbol = batchNum * BATCH_SIZE + 1;
                 const endSymbol = Math.min((batchNum + 1) * BATCH_SIZE, TOTAL_SYMBOLS);
-                
-                // Update progress
+
                 setDashboardBatchProgress({
                     currentBatch: batchNum + 1,
                     totalBatches: TOTAL_BATCHES,
-                    symbolsProcessed: batchNum * BATCH_SIZE,
+                    symbolsProcessed: processedSymbols,
                     totalSymbols: TOTAL_SYMBOLS,
                     status: `Fetching symbols ${startSymbol}-${endSymbol}...`
                 });
 
-                console.log(`[dashboard] Batch ${batchNum + 1}/${TOTAL_BATCHES}: symbols ${startSymbol}-${endSymbol}`);
-
                 const payload = {
-                    save_to_file: batchNum === TOTAL_BATCHES - 1,  // Only save Excel on last batch
-                    page: batchNum + 1,
-                    page_size: BATCH_SIZE,
+                    batch_index: batchNum,
+                    save_to_file: false, // Don't save file in backend batch
                     top_n: TOTAL_SYMBOLS,
                     top_n_by: 'mcap',
-                    parallel_workers: 50,  // Higher parallelism per batch
-                    chunk_size: 25,
-                    batch_size: BATCH_SIZE,  // Tell backend this is batch mode
-                    start_date: convertDateFormat(rangeStartDate),
-                    end_date: convertDateFormat(rangeEndDate)
+                    start_date: rangeStartDate, // Use raw YYYY-MM-DD
+                    end_date: rangeEndDate     // Use raw YYYY-MM-DD
                 };
 
                 const response = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard`, {
@@ -551,38 +543,47 @@ function App() {
 
                 if (!response.ok) {
                     const errorData = await response.json();
-                    console.error(`[dashboard] Batch ${batchNum + 1} failed:`, errorData);
                     allErrors.push({ batch: batchNum + 1, error: errorData.error || 'Request failed' });
-                    continue;  // Continue with next batch even if one fails
+                    continue;
                 }
 
                 const data = await response.json();
-                console.log(`[dashboard] Batch ${batchNum + 1} success:`, data.count, 'symbols');
-
-                // Collect rows from this batch
+                let batchCount = 0;
                 if (data.rows) {
                     allRows = allRows.concat(data.rows);
+                    batchCount = data.rows.length;
                 }
                 if (data.errors) {
                     allErrors = allErrors.concat(data.errors);
                 }
-                
-                // Keep track of download URL from last successful batch
-                if (data.file_id) lastFileId = data.file_id;
-                if (data.download_url) lastDownloadUrl = data.download_url;
 
-                // Update progress
+                processedSymbols += batchCount;
                 setDashboardBatchProgress({
                     currentBatch: batchNum + 1,
                     totalBatches: TOTAL_BATCHES,
-                    symbolsProcessed: endSymbol,
+                    symbolsProcessed: processedSymbols,
                     totalSymbols: TOTAL_SYMBOLS,
-                    status: `✅ Batch ${batchNum + 1} complete (${data.count || 0} symbols)`
+                    status: `✅ Batch ${batchNum + 1} complete (${batchCount} symbols)`
                 });
+            }
 
-                // Small delay between batches
-                if (batchNum < TOTAL_BATCHES - 1) {
-                    await new Promise(resolve => setTimeout(resolve, 500));
+            // After all batches, send allRows to /api/nse-symbol-dashboard/save-excel
+            let lastFileId = null;
+            let lastDownloadUrl = null;
+            let fileName = `Symbol_Dashboard_${convertDateFormat(rangeStartDate)}_${convertDateFormat(rangeEndDate)}.xlsx`;
+            if (allRows.length > 0) {
+                const saveExcelResp = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard/save-excel`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ rows: allRows, as_on: rangeEndDate })
+                });
+                if (saveExcelResp.ok) {
+                    const saveExcelData = await saveExcelResp.json();
+                    lastFileId = saveExcelData.file_id;
+                    lastDownloadUrl = saveExcelData.download_url;
+                    if (saveExcelData.file) fileName = saveExcelData.file;
                 }
             }
 
@@ -597,7 +598,6 @@ function App() {
                 });
             }
 
-            // Set final merged result
             setDashboardResult({
                 success: true,
                 count: allRows.length,
@@ -607,13 +607,10 @@ function App() {
                 errors: allErrors,
                 file_id: lastFileId,
                 download_url: lastDownloadUrl,
-                file: `Symbol_Dashboard_${convertDateFormat(rangeStartDate)}_${convertDateFormat(rangeEndDate)}.xlsx`
+                file: fileName
             });
-
             setSuccess(`✅ Dashboard complete! ${allRows.length} symbols fetched in ${TOTAL_BATCHES} batches`);
-            
         } catch (err) {
-            console.error('[dashboard] error', err);
             setError(err.message);
         } finally {
             setDashboardLoading(false);
@@ -656,9 +653,9 @@ function App() {
                 <Header />
 
                 <main className="main-content">
-                    <AlertMessages 
-                        error={error} 
-                        success={success} 
+                    <AlertMessages
+                        error={error}
+                        success={success}
                         onErrorClose={() => setError(null)}
                         onSuccessClose={() => setSuccess(null)}
                     />
@@ -683,62 +680,62 @@ function App() {
                             heatmapMeta={heatmapMeta}
                             heatmapLoading={heatmapLoading}
                             heatmapError={heatmapError}
-                        fetchHeatmapData={fetchHeatmapData}
-                        selectedStock={selectedStock}
-                        setSelectedStock={setSelectedStock}
-                        popupPosition={popupPosition}
-                        setPopupPosition={setPopupPosition}
-                    />
-                )}
+                            fetchHeatmapData={fetchHeatmapData}
+                            selectedStock={selectedStock}
+                            setSelectedStock={setSelectedStock}
+                            popupPosition={popupPosition}
+                            setPopupPosition={setPopupPosition}
+                        />
+                    )}
 
-                {activeTab === 'range' && (
-                    <RangeTab
-                        rangeStartDate={rangeStartDate}
-                        setRangeStartDate={setRangeStartDate}
-                        rangeEndDate={rangeEndDate}
-                        setRangeEndDate={setRangeEndDate}
-                        rangeLoading={rangeLoading}
-                        rangeProgress={rangeProgress}
-                        exportLoading={exportLoading}
-                        exportLog={exportLog}
-                        consolidationReady={consolidationReady}
-                        exportedRange={exportedRange}
-                        dashboardLoading={dashboardLoading}
-                        dashboardResult={dashboardResult}
-                        dashboardBatchProgress={dashboardBatchProgress}
-                        handleDownloadRangeFromNSE={handleDownloadRangeFromNSE}
-                        handleExportConsolidated={handleExportConsolidated}
-                        handleBuildDashboard={handleBuildDashboard}
-                        handleDownloadDashboard={handleDownloadDashboard}
-                    />
-                )}
+                    {activeTab === 'range' && (
+                        <RangeTab
+                            rangeStartDate={rangeStartDate}
+                            setRangeStartDate={setRangeStartDate}
+                            rangeEndDate={rangeEndDate}
+                            setRangeEndDate={setRangeEndDate}
+                            rangeLoading={rangeLoading}
+                            rangeProgress={rangeProgress}
+                            exportLoading={exportLoading}
+                            exportLog={exportLog}
+                            consolidationReady={consolidationReady}
+                            exportedRange={exportedRange}
+                            dashboardLoading={dashboardLoading}
+                            dashboardResult={dashboardResult}
+                            dashboardBatchProgress={dashboardBatchProgress}
+                            handleDownloadRangeFromNSE={handleDownloadRangeFromNSE}
+                            handleExportConsolidated={handleExportConsolidated}
+                            handleBuildDashboard={handleBuildDashboard}
+                            handleDownloadDashboard={handleDownloadDashboard}
+                        />
+                    )}
 
-                {activeTab === 'upload' && (
-                    <UploadTab
-                        uploadedFiles={uploadedFiles}
-                        loading={loading}
-                        handleFileChange={handleFileChange}
-                        handlePreview={handlePreview}
-                        handleDownload={handleDownload}
-                    />
-                )}
+                    {activeTab === 'upload' && (
+                        <UploadTab
+                            uploadedFiles={uploadedFiles}
+                            loading={loading}
+                            handleFileChange={handleFileChange}
+                            handlePreview={handlePreview}
+                            handleDownload={handleDownload}
+                        />
+                    )}
 
-                {activeTab === 'mongo' && (
-                    <MongoTab
-                        dashboardLimit={dashboardLimit}
-                        setDashboardLimit={setDashboardLimit}
-                        dashboardLoading={dashboardLoading}
-                        dashboardError={dashboardError}
-                        dashboardResult={dashboardResult}
-                        indicesLoading={indicesLoading}
-                        loadDashboardData={loadDashboardData}
-                        handleUpdateIndices={handleUpdateIndices}
-                    />
-                )}
+                    {activeTab === 'mongo' && (
+                        <MongoTab
+                            dashboardLimit={dashboardLimit}
+                            setDashboardLimit={setDashboardLimit}
+                            dashboardLoading={dashboardLoading}
+                            dashboardError={dashboardError}
+                            dashboardResult={dashboardResult}
+                            indicesLoading={indicesLoading}
+                            loadDashboardData={loadDashboardData}
+                            handleUpdateIndices={handleUpdateIndices}
+                        />
+                    )}
 
-                {activeTab === 'preview' && (
-                    <PreviewTab preview={preview} />
-                )}
+                    {activeTab === 'preview' && (
+                        <PreviewTab preview={preview} />
+                    )}
                 </main>
             </div>
         </div>
