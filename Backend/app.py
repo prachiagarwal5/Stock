@@ -307,10 +307,12 @@ def upsert_symbol_metrics(row, source='nse_symbol_metrics'):
 
 
 def persist_consolidated_results(consolidator, data_type, source='consolidation'):
-    """Store per-symbol per-date values and averages into MongoDB."""
+    """Store per-symbol per-date values and averages into MongoDB using bulk operations."""
     if consolidator is None:
         return
     try:
+        from pymongo import UpdateOne
+        
         date_cols = [d[0] for d in consolidator.dates_list]
         date_range = None
         if date_cols:
@@ -321,25 +323,80 @@ def persist_consolidated_results(consolidator, data_type, source='consolidation'
             except Exception:
                 date_range = None
 
+        # Collect all aggregate operations
+        aggregate_ops = []
+        daily_ops = []
+        
         for _, row in consolidator.df_consolidated.iterrows():
             symbol = str(row.get('Symbol') or '').strip()
             company_name = str(row.get('Company Name') or '').strip()
             if not symbol:
                 continue
 
+            # Prepare aggregate upsert
             avg_val = row.get(consolidator.avg_col)
             days_val = row.get(consolidator.days_col)
-            upsert_symbol_aggregate(symbol, company_name, data_type, days_val, avg_val, date_range, source=source)
+            if symbol_aggregates_collection is not None:
+                payload = {
+                    'symbol': symbol,
+                    'company_name': company_name,
+                    'type': data_type,
+                    'days_with_data': int(days_val or 0),
+                    'average': _safe_float(avg_val),
+                    'date_range': date_range,
+                    'source': source,
+                    'updated_at': datetime.now().isoformat()
+                }
+                aggregate_ops.append(
+                    UpdateOne(
+                        {'symbol': symbol, 'type': data_type},
+                        {'$set': payload},
+                        upsert=True
+                    )
+                )
 
-            for date_str in date_cols:
-                val = row.get(date_str)
-                if val in (None, ''):
-                    continue
-                try:
-                    date_iso = datetime.strptime(date_str, '%d-%m-%Y').strftime('%Y-%m-%d')
-                except Exception:
-                    date_iso = None
-                upsert_symbol_daily(symbol, company_name, date_iso, data_type, val, source=source)
+            # Prepare daily upserts
+            if symbol_daily_collection is not None:
+                for date_str in date_cols:
+                    val = row.get(date_str)
+                    if val in (None, ''):
+                        continue
+                    try:
+                        date_iso = datetime.strptime(date_str, '%d-%m-%Y').strftime('%Y-%m-%d')
+                    except Exception:
+                        continue
+                    
+                    payload = {
+                        'symbol': symbol,
+                        'company_name': company_name,
+                        'date': date_iso,
+                        'type': data_type,
+                        'value': _safe_float(val),
+                        'source': source,
+                        'updated_at': datetime.now().isoformat()
+                    }
+                    daily_ops.append(
+                        UpdateOne(
+                            {'symbol': symbol, 'date': date_iso, 'type': data_type},
+                            {'$set': payload},
+                            upsert=True
+                        )
+                    )
+
+        # Execute bulk operations in batches
+        if aggregate_ops and symbol_aggregates_collection is not None:
+            print(f"[persist] Executing {len(aggregate_ops)} aggregate operations...")
+            symbol_aggregates_collection.bulk_write(aggregate_ops, ordered=False)
+            print(f"[persist] ✓ Aggregates saved")
+
+        if daily_ops and symbol_daily_collection is not None:
+            batch_size = 1000
+            print(f"[persist] Executing {len(daily_ops)} daily operations in batches of {batch_size}...")
+            for i in range(0, len(daily_ops), batch_size):
+                batch = daily_ops[i:i + batch_size]
+                symbol_daily_collection.bulk_write(batch, ordered=False)
+                print(f"[persist] ✓ Saved batch {i//batch_size + 1}/{(len(daily_ops) + batch_size - 1)//batch_size}")
+            
     except Exception as exc:
         print(f"⚠️ Failed to persist consolidated results for {data_type}: {exc}")
 
@@ -588,9 +645,52 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
         name_lookup = unique_df.set_index(symbol_col)[name_col].to_dict()
     df_all_pivot['Company Name'] = df_all_pivot['Symbol'].map(name_lookup)
 
-    # Override with symbol_name_map if provided (for PR alignment with MCAP)
+    # For PR data: Replace company names (in Symbol column) with ticker symbols from MCAP
     if data_type == 'pr' and symbol_name_map:
-        df_all_pivot['Company Name'] = df_all_pivot['Symbol'].map(symbol_name_map).fillna(df_all_pivot['Company Name'])
+        # symbol_name_map is CompanyName → TickerSymbol mapping
+        # df_all_pivot['Symbol'] currently contains company names (from SECURITY column)
+        # Map them to ticker symbols so they match MCAP symbols
+        original_companies = df_all_pivot['Symbol'].copy()
+        before_count = len(df_all_pivot)
+        
+        # Create normalized mapping for better matching
+        # Normalize: uppercase, remove extra spaces, punctuation
+        def normalize_name(name):
+            if not name:
+                return ''
+            return ''.join(c.upper() for c in str(name) if c.isalnum() or c.isspace()).strip()
+        
+        # Build normalized lookup: normalized_name → ticker_symbol
+        normalized_map = {}
+        for company_name, ticker in symbol_name_map.items():
+            norm_name = normalize_name(company_name)
+            if norm_name:
+                normalized_map[norm_name] = ticker
+        
+        # Try exact match first, then normalized match
+        def find_ticker(pr_company_name):
+            # Try exact match
+            if pr_company_name in symbol_name_map:
+                return symbol_name_map[pr_company_name]
+            # Try normalized match
+            norm_pr = normalize_name(pr_company_name)
+            return normalized_map.get(norm_pr)
+        
+        df_all_pivot['Symbol'] = original_companies.apply(find_ticker)
+        # Keep original company name
+        df_all_pivot['Company Name'] = original_companies
+        # Remove rows where mapping failed (no matching MCAP symbol)
+        df_all_pivot = df_all_pivot[df_all_pivot['Symbol'].notna()]
+        after_count = len(df_all_pivot)
+        matched_count = after_count
+        unmatched_count = before_count - after_count
+        
+        if log_fn:
+            log_fn(f"✓ PR symbol mapping: {matched_count}/{before_count} matched ({100*matched_count/before_count:.1f}%), {unmatched_count} unmatched")
+            if unmatched_count > 0 and unmatched_count <= 10:
+                # Show samples of unmatched names
+                unmatched_samples = original_companies[~original_companies.isin(df_all_pivot['Company Name'].values)].head(10).tolist()
+                log_fn(f"  Unmatched samples: {', '.join(unmatched_samples[:5])}")
 
     # Get available date columns
     available_cols = [c for c in date_cols if c in df_all_pivot.columns]
@@ -1447,8 +1547,37 @@ def nse_symbol_dashboard():
             batch_symbols = symbol_batches[batch_idx]
             print(f"[symbol-dashboard] Processing batch {batch_idx + 1}/{total_batches} ({len(batch_symbols)} symbols)")
             
+            # Load aggregates data for this batch
+            symbol_pr_data = {}
+            symbol_mcap_data = {}
+            if symbol_aggregates_collection is not None:
+                try:
+                    pr_count = 0
+                    for doc in symbol_aggregates_collection.find({'symbol': {'$in': batch_symbols}, 'type': 'pr'}):
+                        sym = doc.get('symbol')
+                        if sym:
+                            pr_count += 1
+                            symbol_pr_data[sym] = {'days_with_data': doc.get('days_with_data', 0), 'avg_pr': doc.get('average')}
+                            if sym not in symbol_mcap_data:
+                                symbol_mcap_data[sym] = {}
+                            symbol_mcap_data[sym]['total_traded_value'] = doc.get('average')
+                    
+                    mcap_count = 0
+                    for doc in symbol_aggregates_collection.find({'symbol': {'$in': batch_symbols}, 'type': 'mcap'}):
+                        sym = doc.get('symbol')
+                        if sym:
+                            mcap_count += 1
+                            if sym not in symbol_mcap_data:
+                                symbol_mcap_data[sym] = {}
+                            symbol_mcap_data[sym]['avg_mcap'] = doc.get('average')
+                    
+                    print(f"[symbol-dashboard] Loaded {mcap_count} MCAP + {pr_count} PR averages for batch {batch_idx + 1}")
+                except Exception as e:
+                    print(f"⚠️ [symbol-dashboard] Error loading aggregates: {e}")
+            
             rows, errors = process_symbol_batch(
-                batch_symbols, as_on, MAX_WORKERS, MAX_TIME_PER_SYMBOL * len(batch_symbols)
+                batch_symbols, as_on, MAX_WORKERS, MAX_TIME_PER_SYMBOL * len(batch_symbols),
+                symbol_pr_data, symbol_mcap_data
             )
             
             # Add index from DB
@@ -1542,15 +1671,37 @@ def nse_symbol_dashboard():
         symbol_mcap_data = {}
         if symbol_aggregates_collection is not None:
             try:
+                pr_count = 0
                 for doc in symbol_aggregates_collection.find({'symbol': {'$in': symbols}, 'type': 'pr'}):
                     sym = doc.get('symbol')
                     if sym:
+                        pr_count += 1
                         symbol_pr_data[sym] = {'days_with_data': doc.get('days_with_data', 0), 'avg_pr': doc.get('average')}
+                        # Also add the PR average (total_traded_value) to symbol_mcap_data
+                        if sym not in symbol_mcap_data:
+                            symbol_mcap_data[sym] = {}
+                        symbol_mcap_data[sym]['total_traded_value'] = doc.get('average')
+                print(f"[dashboard] Loaded {pr_count} PR averages from DB")
+                
+                mcap_count = 0
                 for doc in symbol_aggregates_collection.find({'symbol': {'$in': symbols}, 'type': 'mcap'}):
                     sym = doc.get('symbol')
                     if sym:
-                        symbol_mcap_data[sym] = {'avg_mcap': doc.get('average')}
-            except Exception:
+                        mcap_count += 1
+                        if sym not in symbol_mcap_data:
+                            symbol_mcap_data[sym] = {}
+                        symbol_mcap_data[sym]['avg_mcap'] = doc.get('average')
+                print(f"[dashboard] Loaded {mcap_count} MCAP averages from DB")
+                
+                if mcap_count == 0 and pr_count == 0:
+                    print("⚠️ [dashboard] No averages found in DB! You need to export Excel first with fast_mode=false to save averages.")
+                else:
+                    # Show a sample of what was loaded
+                    sample_sym = next(iter(symbol_mcap_data.keys())) if symbol_mcap_data else None
+                    if sample_sym:
+                        print(f"[dashboard] Sample data for {sample_sym}: {symbol_mcap_data[sample_sym]}")
+            except Exception as e:
+                print(f"⚠️ [dashboard] Error loading aggregates from DB: {e}")
                 pass
 
         fetcher = SymbolMetricsFetcher()
@@ -1672,7 +1823,7 @@ def nse_symbol_dashboard():
         return jsonify({'error': str(e)}), 500
 
 
-def process_symbol_batch(symbols, as_on, max_workers, timeout):
+def process_symbol_batch(symbols, as_on, max_workers, timeout, symbol_pr_data=None, symbol_mcap_data=None):
     """Process a batch of symbols with 10 workers for parallel processing."""
     fetcher = SymbolMetricsFetcher()
     try:
@@ -1681,6 +1832,11 @@ def process_symbol_batch(symbols, as_on, max_workers, timeout):
         # Larger chunk size so each worker handles more symbols at once
         chunk_size = max(10, len(symbols) // 10)  # Divide work among 10 workers
         print(f"[batch-processing] Fetching {len(symbols)} symbols with {effective_workers} workers, chunk_size={chunk_size}")
+        
+        # Filter to only the symbols in this batch
+        batch_pr_data = {s: symbol_pr_data.get(s) for s in symbols if symbol_pr_data and s in symbol_pr_data} if symbol_pr_data else {}
+        batch_mcap_data = {s: symbol_mcap_data.get(s) for s in symbols if symbol_mcap_data and s in symbol_mcap_data} if symbol_mcap_data else {}
+        
         result = fetcher.build_dashboard(
             symbols,
             excel_path=None,
@@ -1689,8 +1845,8 @@ def process_symbol_batch(symbols, as_on, max_workers, timeout):
             parallel=True,
             max_workers=effective_workers,
             chunk_size=chunk_size,
-            symbol_pr_data={},
-            symbol_mcap_data={},
+            symbol_pr_data=batch_pr_data,
+            symbol_mcap_data=batch_mcap_data,
             max_time_seconds=timeout
         )
         return result.get('rows', []), result.get('errors', [])
@@ -1807,8 +1963,8 @@ def consolidate_saved():
             start_date_str = payload.get('start_date')
             end_date_str = payload.get('end_date')
             file_type = payload.get('file_type', 'both')
-            # Force fast mode (skip Mongo persistence) to avoid long DB writes
-            fast_mode = True
+            # Allow control of fast mode via payload - default False to persist averages to DB
+            fast_mode = payload.get('fast_mode', False)
             allow_missing = payload.get('allow_missing', True)
 
             if file_type not in ['mcap', 'pr', 'both']:
@@ -1888,13 +2044,18 @@ def consolidate_saved():
                     ))
                     if not fast_mode:
                         persist_start = time.perf_counter()
-                        add_log("Starting MCAP persistence to Mongo...")
+                        add_log("Starting MCAP persistence to Mongo (saving averages)...")
                         persist_consolidated_results(consolidator_mcap, 'mcap', source='cached_db')
-                        add_log(f"Persisted MCAP aggregates in {time.perf_counter() - persist_start:.2f}s")
+                        add_log(f"✓ Persisted {companies_count} MCAP averages to DB in {time.perf_counter() - persist_start:.2f}s")
+                        persisted = True
+                    else:
+                        add_log("⚠️ Skipping MCAP DB persistence (fast_mode=True). Averages NOT saved to MongoDB.")
+                        persisted = False
                     results['mcap'] = {
                         'companies': companies_count,
                         'dates': dates_count,
-                        'files': len(date_iso_list)
+                        'files': len(date_iso_list),
+                        'persisted': persisted
                     }
                     add_log(f"MCAP stage done in {time.perf_counter() - mcap_stage_start:.2f}s")
                 except ValueError as exc:
@@ -1907,8 +2068,11 @@ def consolidate_saved():
             if file_type in ['pr', 'both']:
                 try:
                     pr_stage_start = time.perf_counter()
+                    # IMPORTANT: Reverse the mapping for PR - we need CompanyName → Symbol mapping
+                    # so that PR data (which has company names) can be mapped to ticker symbols
+                    pr_name_to_symbol = {v: k for k, v in mcap_name_map.items()} if mcap_name_map else None
                     consolidator_pr, companies_count_pr, dates_count_pr = make_consolidator_from_cache(
-                        'pr', allowed_symbols=None, symbol_name_map=mcap_name_map
+                        'pr', allowed_symbols=None, symbol_name_map=pr_name_to_symbol
                     )
                     pr_output_path = os.path.join(work_dir, 'Net_Traded_Value.xlsx')
                     add_log(f"Creating PR Excel file: {pr_output_path}")
@@ -1916,13 +2080,18 @@ def consolidate_saved():
                     add_log(f"✓ PR Excel file created: {pr_output_path}")
                     if not fast_mode:
                         persist_start = time.perf_counter()
-                        add_log("Starting PR persistence to Mongo...")
+                        add_log("Starting PR persistence to Mongo (saving averages)...")
                         persist_consolidated_results(consolidator_pr, 'pr', source='cached_db')
-                        add_log(f"Persisted PR aggregates in {time.perf_counter() - persist_start:.2f}s")
+                        add_log(f"✓ Persisted {companies_count_pr} PR averages to DB in {time.perf_counter() - persist_start:.2f}s")
+                        persisted_pr = True
+                    else:
+                        add_log("⚠️ Skipping PR DB persistence (fast_mode=True). Averages NOT saved to MongoDB.")
+                        persisted_pr = False
                     results['pr'] = {
                         'companies': companies_count_pr,
                         'dates': dates_count_pr,
-                        'files': len(date_iso_list)
+                        'files': len(date_iso_list),
+                        'persisted': persisted_pr
                     }
                     add_log(f"PR stage done in {time.perf_counter() - pr_stage_start:.2f}s")
                 except ValueError as exc:

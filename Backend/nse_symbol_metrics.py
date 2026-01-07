@@ -212,12 +212,33 @@ class SymbolMetricsFetcher:
         Optimized with minimum 5 workers per batch for parallel processing.
         
         symbol_pr_data: dict of {symbol: {'days_with_data': int, 'total_trading_days': int, 'avg_pr': float}}
-        symbol_mcap_data: dict of {symbol: {'avg_mcap': float, 'avg_free_float': float}}
+        symbol_mcap_data: dict of {symbol: {'avg_mcap': float, 'avg_free_float': float, 'total_traded_value': float}}
         max_time_seconds: Optional time limit for fetching (returns partial results if exceeded)
         """
         # Ensure minimum 5 workers for optimal parallel processing in batches
         effective_workers = max(5, max_workers) if parallel else 1
         rows, errors = self.fetch_many(symbols, max_symbols=max_symbols, as_of=as_of, parallel=parallel, max_workers=effective_workers, chunk_size=chunk_size, max_time_seconds=max_time_seconds)
+
+        # Override API values with data from symbol_mcap_data if available
+        replaced_mcap = 0
+        replaced_traded = 0
+        if symbol_mcap_data:
+            for row in rows:
+                symbol = row.get('symbol')
+                if symbol and symbol in symbol_mcap_data:
+                    mcap_info = symbol_mcap_data[symbol]
+                    # Replace total_market_cap with avg_mcap from Excel data
+                    if 'avg_mcap' in mcap_info and mcap_info['avg_mcap'] is not None:
+                        row['total_market_cap'] = mcap_info['avg_mcap']
+                        replaced_mcap += 1
+                    # Replace total_traded_value with value from Excel data
+                    if 'total_traded_value' in mcap_info and mcap_info['total_traded_value'] is not None:
+                        row['total_traded_value'] = mcap_info['total_traded_value']
+                        replaced_traded += 1
+            if replaced_mcap > 0 or replaced_traded > 0:
+                print(f"[build_dashboard] ✓ Replaced {replaced_mcap} market cap values and {replaced_traded} traded values from DB")
+            else:
+                print(f"⚠️ [build_dashboard] No values replaced. symbol_mcap_data has {len(symbol_mcap_data)} entries but none matched symbols")
 
         df = pd.DataFrame(rows)
         numeric_fields = ['impact_cost', 'free_float_mcap', 'total_market_cap', 'total_traded_value', 'last_price']
@@ -385,6 +406,19 @@ class SymbolMetricsFetcher:
         """Save dashboard rows to Excel file (extracted for batch processing)."""
         if not rows or not excel_path:
             return
+        
+        # Override API values with data from symbol_mcap_data if available
+        if symbol_mcap_data:
+            for row in rows:
+                symbol = row.get('symbol')
+                if symbol and symbol in symbol_mcap_data:
+                    mcap_info = symbol_mcap_data[symbol]
+                    # Replace total_market_cap with avg_mcap from Excel data
+                    if 'avg_mcap' in mcap_info and mcap_info['avg_mcap'] is not None:
+                        row['total_market_cap'] = mcap_info['avg_mcap']
+                    # Replace total_traded_value with value from Excel data
+                    if 'total_traded_value' in mcap_info and mcap_info['total_traded_value'] is not None:
+                        row['total_traded_value'] = mcap_info['total_traded_value']
         
         df = pd.DataFrame(rows)
         numeric_fields = ['impact_cost', 'free_float_mcap', 'total_market_cap', 'total_traded_value', 'last_price']
