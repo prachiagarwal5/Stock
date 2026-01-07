@@ -6,11 +6,7 @@ import {
     TabBar,
     AlertMessages,
     DownloadTab,
-    HeatmapTab,
-    RangeTab,
-    UploadTab,
-    PreviewTab,
-    MongoTab
+    RangeTab
 } from './components';
 
 // API URL from environment variable with fallback to localhost
@@ -22,7 +18,7 @@ function App() {
     const [preview, setPreview] = useState(null);
     const [error, setError] = useState(null);
     const [success, setSuccess] = useState(null);
-    const [activeTab, setActiveTab] = useState('upload');
+    const [activeTab, setActiveTab] = useState('download');
     const [nseDate, setNseDate] = useState('');
     const [availableDates, setAvailableDates] = useState([]);
     const [nseLoading, setNseLoading] = useState(false);
@@ -31,26 +27,14 @@ function App() {
     const [rangeLoading, setRangeLoading] = useState(false);
     const [rangeProgress, setRangeProgress] = useState(null);
     const [downloadDestination] = useState('local');
-    const [dashboardResult, setDashboardResult] = useState(null);
-    const [dashboardLoading, setDashboardLoading] = useState(false);
-    const [dashboardError, setDashboardError] = useState(null);
-    const [dashboardLimit, setDashboardLimit] = useState(100);
-    const [dashboardPage, setDashboardPage] = useState(1);
-    const [dashboardPageSize, setDashboardPageSize] = useState(150);
-    const [indicesLoading, setIndicesLoading] = useState(false);
     const [exportLoading, setExportLoading] = useState(false);
     const [exportLog, setExportLog] = useState([]);
-    const [heatmapIndex, setHeatmapIndex] = useState('NIFTY 50');
-    const [heatmapData, setHeatmapData] = useState([]);
-    const [heatmapMeta, setHeatmapMeta] = useState(null);
-    const [heatmapLoading, setHeatmapLoading] = useState(false);
-    const [heatmapError, setHeatmapError] = useState(null);
-    const [selectedStock, setSelectedStock] = useState(null);
-    const [popupPosition, setPopupPosition] = useState({ x: 0, y: 0 });
     const [consolidationReady, setConsolidationReady] = useState(false);
     const [consolidationStatus, setConsolidationStatus] = useState(null);
     const [exportedRange, setExportedRange] = useState(null);
-
+    const [dashboardResult, setDashboardResult] = useState(null);
+    const [dashboardLoading, setDashboardLoading] = useState(false);
+    const [dashboardBatchProgress, setDashboardBatchProgress] = useState(null);
     // Reset consolidation status when date range changes
     useEffect(() => {
         if (exportedRange) {
@@ -66,19 +50,6 @@ function App() {
     useEffect(() => {
         fetchAvailableDates();
     }, []);
-
-    // Load dashboard data when tab is active
-    useEffect(() => {
-        if (activeTab === 'dashboard') {
-            loadDashboardData(dashboardLimit);
-        }
-    }, [activeTab, dashboardLimit]);
-
-    useEffect(() => {
-        if (activeTab === 'heatmap') {
-            fetchHeatmapData(heatmapIndex);
-        }
-    }, [activeTab, heatmapIndex]);
 
     const fetchAvailableDates = async () => {
         try {
@@ -99,8 +70,6 @@ function App() {
         }
     };
 
-    // Removed Google Drive logic
-
     // Convert YYYY-MM-DD (from date input) to DD-Mon-YYYY format for API
     const convertDateFormat = (dateStr) => {
         if (!dateStr) return '';
@@ -108,31 +77,6 @@ function App() {
         const date = new Date(year, parseInt(month) - 1, parseInt(day));
         const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
         return `${day}-${months[date.getMonth()]}-${year}`;
-    };
-
-    const fetchHeatmapData = async (indexName) => {
-        setHeatmapLoading(true);
-        setHeatmapError(null);
-        try {
-            const response = await fetch(`${VITE_API_URL}/api/heatmap?index=${encodeURIComponent(indexName)}`);
-            const data = await response.json();
-            if (!response.ok) {
-                throw new Error(data.error || 'Unable to load heatmap');
-            }
-            setHeatmapData(data.constituents || []);
-            setHeatmapMeta({
-                index: data.index,
-                timestamp: data.timestamp,
-                advances: data.advances,
-                availableIndices: data.available_indices
-            });
-        } catch (err) {
-            setHeatmapError(err.message);
-            setHeatmapData([]);
-            setHeatmapMeta(null);
-        } finally {
-            setHeatmapLoading(false);
-        }
     };
 
     // Ask the user where to save a file; fall back to default downloads if picker is unavailable
@@ -487,9 +431,6 @@ function App() {
         }
     };
 
-    // State for batch progress
-    const [dashboardBatchProgress, setDashboardBatchProgress] = useState(null);
-
     const handleBuildDashboard = async () => {
         // Dashboard only available for date range (after MCAP/PR averages are calculated)
         if (!rangeStartDate || !rangeEndDate) {
@@ -672,19 +613,15 @@ function App() {
                         />
                     )}
 
-                    {activeTab === 'heatmap' && (
-                        <HeatmapTab
-                            heatmapIndex={heatmapIndex}
-                            setHeatmapIndex={setHeatmapIndex}
-                            heatmapData={heatmapData}
-                            heatmapMeta={heatmapMeta}
-                            heatmapLoading={heatmapLoading}
-                            heatmapError={heatmapError}
-                            fetchHeatmapData={fetchHeatmapData}
-                            selectedStock={selectedStock}
-                            setSelectedStock={setSelectedStock}
-                            popupPosition={popupPosition}
-                            setPopupPosition={setPopupPosition}
+                    {activeTab === 'download' && (
+                        <DownloadTab
+                            nseDate={nseDate}
+                            setNseDate={setNseDate}
+                            nseLoading={nseLoading}
+                            exportLoading={exportLoading}
+                            exportLog={exportLog}
+                            handleDownloadFromNSE={handleDownloadFromNSE}
+                            handleExportConsolidated={handleExportConsolidated}
                         />
                     )}
 
@@ -708,33 +645,6 @@ function App() {
                             handleBuildDashboard={handleBuildDashboard}
                             handleDownloadDashboard={handleDownloadDashboard}
                         />
-                    )}
-
-                    {activeTab === 'upload' && (
-                        <UploadTab
-                            uploadedFiles={uploadedFiles}
-                            loading={loading}
-                            handleFileChange={handleFileChange}
-                            handlePreview={handlePreview}
-                            handleDownload={handleDownload}
-                        />
-                    )}
-
-                    {activeTab === 'mongo' && (
-                        <MongoTab
-                            dashboardLimit={dashboardLimit}
-                            setDashboardLimit={setDashboardLimit}
-                            dashboardLoading={dashboardLoading}
-                            dashboardError={dashboardError}
-                            dashboardResult={dashboardResult}
-                            indicesLoading={indicesLoading}
-                            loadDashboardData={loadDashboardData}
-                            handleUpdateIndices={handleUpdateIndices}
-                        />
-                    )}
-
-                    {activeTab === 'preview' && (
-                        <PreviewTab preview={preview} />
                     )}
                 </main>
             </div>

@@ -87,44 +87,6 @@ except Exception as e:
     symbol_metrics_collection = None
 
 
-HEATMAP_INDICES = [
-    'NIFTY 50',
-    'NIFTY NEXT 50',
-    'NIFTY MIDCAP 50',
-    'NIFTY MIDCAP 100',
-    'NIFTY MIDCAP 150',
-    'NIFTY SMALLCAP 50',
-    'NIFTY SMALLCAP 100',
-    'NIFTY SMALLCAP 250',
-    'NIFTY MIDSMALLCAP 400',
-    'NIFTY 100',
-    'NIFTY 200',
-    'NIFTY500 MULTICAP 50:25:25',
-    'NIFTY LARGEMIDCAP 250',
-    'NIFTY MIDCAP SELECT'
-]
-
-HEATMAP_TYPE_MAP = {
-    # All of these are broad-market baskets on NSE heatmap
-    'NIFTY 50': 'Broad Market Indices',
-    'NIFTY NEXT 50': 'Broad Market Indices',
-    'NIFTY MIDCAP 50': 'Broad Market Indices',
-    'NIFTY MIDCAP 100': 'Broad Market Indices',
-    'NIFTY MIDCAP 150': 'Broad Market Indices',
-    'NIFTY SMALLCAP 50': 'Broad Market Indices',
-    'NIFTY SMALLCAP 100': 'Broad Market Indices',
-    'NIFTY SMALLCAP 250': 'Broad Market Indices',
-    'NIFTY MIDSMALLCAP 400': 'Broad Market Indices',
-    'NIFTY 100': 'Broad Market Indices',
-    'NIFTY 200': 'Broad Market Indices',
-    'NIFTY500 MULTICAP 50:25:25': 'Broad Market Indices',
-    'NIFTY LARGEMIDCAP 250': 'Broad Market Indices',
-    'NIFTY MIDCAP SELECT': 'Broad Market Indices'
-}
-
-# Cache for generated index files (download endpoint)
-INDEX_FILES = {}
-
 # Custom JSON encoder to handle NaN and Inf values
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -741,72 +703,191 @@ def save_excel_to_database(excel_path, filename, metadata):
         print(f"⚠️ Error saving Excel to database: {e}")
         return None
 
-@app.route('/api/preview', methods=['POST'])
-def preview():
+
+def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
     """
-    Preview endpoint - returns consolidation summary without downloading
+    Format dashboard Excel with required columns and calculations
+    
+    Columns:
+    - Serial No
+    - Symbol
+    - Company name
+    - Index
+    - avg Impact cost
+    - avg total market cap
+    - Avg Free float market cap
+    - Avg daily traded value
+    - Day of Listing
+    - Broader Index (Nifty 500 if in Nifty 50/Next 50/Midcap 150/Smallcap 250)
+    - listed> 6months (Y/N)
+    - listed> 1 months (Y/N)
+    - Ratio of avg free float to avg total market cap
+    - ratio of free float to avg total market cap (current values)
     """
     try:
-        if 'files' not in request.files:
-            return jsonify({'error': 'No files uploaded'}), 400
+        df = pd.DataFrame(rows)
         
-        files = request.files.getlist('files')
+        # Map listingDate to listing_date for consistency
+        if 'listingDate' in df.columns and 'listing_date' not in df.columns:
+            df['listing_date'] = df['listingDate']
         
-        if not files or len(files) == 0:
-            return jsonify({'error': 'No files selected'}), 400
+        # Calculate days since listing
+        def calculate_listing_info(listing_date):
+            if not listing_date or pd.isna(listing_date):
+                return None, 'N', 'N'
+            try:
+                if isinstance(listing_date, str):
+                    list_dt = pd.to_datetime(listing_date)
+                else:
+                    list_dt = listing_date
+                today = datetime.now()
+                days_since = (today - list_dt).days
+                months_since = days_since / 30.44
+                listed_6m = 'Y' if months_since >= 6 else 'N'
+                listed_1m = 'Y' if months_since >= 1 else 'N'
+                return list_dt.strftime('%Y-%m-%d'), listed_6m, listed_1m
+            except:
+                return None, 'N', 'N'
         
-        request_folder = tempfile.mkdtemp()
+        # Determine broader index
+        def get_broader_index(index):
+            if not index or pd.isna(index):
+                return ''
+            index_upper = str(index).upper()
+            nifty_500_indices = ['NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 150', 'NIFTY SMALLCAP 250']
+            for idx in nifty_500_indices:
+                if idx.replace(' ', '') in index_upper.replace(' ', ''):
+                    return 'NIFTY 500'
+            return ''
         
-        try:
-            # Save uploaded files
-            file_count = 0
-            for file in files:
-                if file and allowed_file(file.filename):
-                    filename = secure_filename(file.filename)
-                    filepath = os.path.join(request_folder, filename)
-                    file.save(filepath)
-                    file_count += 1
-            
-            if file_count == 0:
-                return jsonify({'error': 'No valid CSV files uploaded'}), 400
-            
-            # Consolidate data for preview
-            consolidator = MarketCapConsolidator(request_folder)
-            companies_count, dates_count = consolidator.load_and_consolidate_data()
-            
-            # Get preview data (first 10 rows)
-            preview_df = consolidator.df_consolidated.iloc[:10]
-            
-            # Convert all NaN/inf to None recursively
-            preview_data = convert_nan_to_none(preview_df.values.tolist())
-            columns = consolidator.df_consolidated.columns.tolist()
-            dates = [d[0] for d in consolidator.dates_list]
-            
-            response_data = {
-                'success': True,
-                'summary': {
-                    'total_companies': len(consolidator.df_consolidated),
-                    'total_dates': dates_count,
-                    'uploaded_files': file_count,
-                    'dates': dates
-                },
-                'preview': {
-                    'columns': columns,
-                    'data': preview_data
-                }
-            }
-            
-            # Convert any remaining NaN values before returning
-            response_data = convert_nan_to_none(response_data)
-            
-            return jsonify(response_data), 200
+        # Apply calculations
+        listing_info = df.apply(lambda row: calculate_listing_info(row.get('listing_date')), axis=1)
+        df['Day of Listing'] = listing_info.apply(lambda x: x[0] if x else None)
+        df['listed> 6months'] = listing_info.apply(lambda x: x[1] if x else 'N')
+        df['listed> 1 months'] = listing_info.apply(lambda x: x[2] if x else 'N')
         
-        finally:
-            if os.path.exists(request_folder):
-                shutil.rmtree(request_folder)
-    
+        df['Broader Index'] = df.apply(lambda row: get_broader_index(row.get('primary_index')), axis=1)
+        
+        # Calculate ratio of avg free float to avg total market cap
+        df['Ratio of avg free float to avg total market cap'] = df.apply(
+            lambda row: round(row.get('free_float_mcap', 0) / row.get('total_market_cap', 1), 4) 
+            if row.get('total_market_cap') and row.get('total_market_cap') > 0 
+            else None, 
+            axis=1
+        )
+        
+        # Calculate ratio of free float to avg total market cap (current values)
+        df['ratio of free float to avg total market cap'] = df.apply(
+            lambda row: round(row.get('free_float_mcap', 0) / row.get('total_market_cap', 1), 4) 
+            if row.get('total_market_cap') and row.get('total_market_cap') > 0 
+            else None, 
+            axis=1
+        )
+        
+        # Reorder and rename columns
+        output_columns = [
+            ('Serial No', 'serial_no'),
+            ('Symbol', 'symbol'),
+            ('Company name', 'companyName'),
+            ('Index', 'primary_index'),
+            ('avg Impact cost', 'impact_cost'),
+            ('avg total market cap', 'total_market_cap'),
+            ('Avg Free float market cap', 'free_float_mcap'),
+            ('Avg daily traded value', 'total_traded_value'),
+            ('Day of Listing', 'Day of Listing'),
+            ('Broader Index', 'Broader Index'),
+            ('listed> 6months', 'listed> 6months'),
+            ('listed> 1 months', 'listed> 1 months'),
+            ('Ratio of avg free float to avg total market cap', 'Ratio of avg free float to avg total market cap'),
+            ('ratio of free float to avg total market cap', 'ratio of free float to avg total market cap')
+        ]
+        
+        # Add serial numbers
+        df.insert(0, 'serial_no', range(1, len(df) + 1))
+        
+        # Create output dataframe with renamed columns
+        output_df = pd.DataFrame()
+        for new_name, old_name in output_columns:
+            if old_name in df.columns:
+                output_df[new_name] = df[old_name]
+            else:
+                output_df[new_name] = None
+        
+        # Save to Excel using openpyxl engine (most compatible)
+        output_df.to_excel(excel_path, index=False, sheet_name='Dashboard', engine='openpyxl')
+        
+        # Apply formatting
+        from openpyxl import load_workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, numbers
+        
+        wb = load_workbook(excel_path)
+        ws = wb.active
+        
+        # Define styles
+        header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        header_font = Font(bold=True, color='FFFFFF', size=11)
+        header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+        
+        # Format header row (row 1)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_alignment
+            cell.border = thin_border
+        
+        # Set column widths and apply number formatting
+        column_formats = {
+            'A': (8, None),  # Serial No
+            'B': (12, None),  # Symbol
+            'C': (30, None),  # Company name
+            'D': (18, None),  # Index
+            'E': (15, numbers.FORMAT_NUMBER_00),  # avg Impact cost
+            'F': (20, '#,##0.00'),  # avg total market cap
+            'G': (22, '#,##0.00'),  # Avg Free float market cap
+            'H': (20, '#,##0.00'),  # Avg daily traded value
+            'I': (15, None),  # Day of Listing
+            'J': (15, None),  # Broader Index
+            'K': (13, None),  # listed> 6months
+            'L': (13, None),  # listed> 1 months
+            'M': (18, '0.0000'),  # Ratio of avg free float to avg total market cap
+            'N': (18, '0.0000'),  # ratio of free float to avg total market cap
+        }
+        
+        # Apply column formatting
+        for col_letter, (width, num_format) in column_formats.items():
+            ws.column_dimensions[col_letter].width = width
+            if num_format:
+                for row in range(2, ws.max_row + 1):
+                    cell = ws[f'{col_letter}{row}']
+                    cell.number_format = num_format
+                    cell.border = thin_border
+            else:
+                for row in range(2, ws.max_row + 1):
+                    cell = ws[f'{col_letter}{row}']
+                    cell.border = thin_border
+        
+        # Freeze header row
+        ws.freeze_panes = 'A2'
+        
+        # Save formatted workbook
+        wb.save(excel_path)
+        
+        print(f"✅ Created dashboard Excel with {len(output_df)} rows and formatting")
+        return True
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f"⚠️ Error formatting dashboard Excel: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 
 @app.route('/api/download-nse', methods=['POST'])
 def download_nse_data():
@@ -1264,108 +1345,6 @@ def download_nse_range():
         print(f"Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/dashboard-data', methods=['GET'])
-def dashboard_data():
-    """Return consolidated dashboard data from Mongo (aggregates + symbol metrics)."""
-    if db is None:
-        return jsonify({'error': 'Database not connected'}), 500
-
-    try:
-        limit = int(request.args.get('limit', 500))
-        limit = max(1, min(limit, 1000))
-
-        def _clean(doc):
-            doc = dict(doc)
-            doc.pop('file_data', None)
-            if '_id' in doc:
-                doc['_id'] = str(doc['_id'])
-            if isinstance(doc.get('updated_at'), datetime):
-                doc['updated_at'] = doc['updated_at'].isoformat()
-            if isinstance(doc.get('as_on'), datetime):
-                doc['as_on'] = doc['as_on'].isoformat()
-            return doc
-
-        # Get MCAP aggregates
-        agg_mcap = []
-        if symbol_aggregates_collection is not None:
-            agg_mcap = list(symbol_aggregates_collection.find({'type': 'mcap'}).sort('average', -1).limit(limit))
-
-        # Get PR aggregates
-        agg_pr = []
-        if symbol_aggregates_collection is not None:
-            agg_pr = list(symbol_aggregates_collection.find({'type': 'pr'}).sort('average', -1).limit(limit))
-
-        # Get symbol metrics
-        metrics = []
-        if symbol_metrics_collection is not None:
-            metrics = list(symbol_metrics_collection.find({}).sort([('as_on', -1), ('symbol', 1)]).limit(limit))
-
-        # Build merged dashboard data
-        # Create lookup maps
-        mcap_map = {doc.get('symbol'): doc for doc in agg_mcap if doc.get('symbol')}
-        pr_map = {doc.get('symbol'): doc for doc in agg_pr if doc.get('symbol')}
-        metrics_map = {doc.get('symbol'): doc for doc in metrics if doc.get('symbol')}
-
-        # Get all unique symbols
-        all_symbols = set(mcap_map.keys()) | set(pr_map.keys()) | set(metrics_map.keys())
-
-        # Build merged records
-        merged_data = []
-        for symbol in all_symbols:
-            mcap_doc = mcap_map.get(symbol, {})
-            pr_doc = pr_map.get(symbol, {})
-            metrics_doc = metrics_map.get(symbol, {})
-
-            merged_record = {
-                'symbol': symbol,
-                'company_name': mcap_doc.get('company_name') or pr_doc.get('company_name') or metrics_doc.get('company_name') or symbol,
-                # MCAP data
-                'avg_mcap': mcap_doc.get('average'),
-                'mcap_days_with_data': mcap_doc.get('days_with_data'),
-                'mcap_date_range': mcap_doc.get('date_range'),
-                # PR data
-                'avg_pr': pr_doc.get('average'),
-                'pr_days_with_data': pr_doc.get('days_with_data'),
-                'pr_date_range': pr_doc.get('date_range'),
-                # Metrics data
-                'impact_cost': metrics_doc.get('impact_cost'),
-                'free_float_mcap': metrics_doc.get('free_float_mcap') or metrics_doc.get('ffmc'),
-                'traded_value': metrics_doc.get('traded_value') or metrics_doc.get('avg_traded_value'),
-                'primary_index': metrics_doc.get('primary_index') or metrics_doc.get('index'),
-                'pe_ratio': metrics_doc.get('pe_ratio') or metrics_doc.get('pe'),
-                'pb_ratio': metrics_doc.get('pb_ratio') or metrics_doc.get('pb'),
-                'dividend_yield': metrics_doc.get('dividend_yield'),
-                'last_price': metrics_doc.get('last_price') or metrics_doc.get('ltp'),
-                'pct_change': metrics_doc.get('pct_change') or metrics_doc.get('pChange'),
-                'as_on': metrics_doc.get('as_on'),
-                'updated_at': mcap_doc.get('updated_at') or pr_doc.get('updated_at') or metrics_doc.get('updated_at')
-            }
-            merged_data.append(merged_record)
-
-        # Sort by avg_mcap descending
-        merged_data.sort(key=lambda x: x.get('avg_mcap') or 0, reverse=True)
-        merged_data = merged_data[:limit]
-
-        return jsonify({
-            'success': True,
-            'aggregates': {
-                'mcap': [_clean(x) for x in agg_mcap],
-                'pr': [_clean(x) for x in agg_pr]
-            },
-            'metrics': [_clean(x) for x in metrics],
-            'merged': [_clean(x) for x in merged_data],
-            'counts': {
-                'mcap': len(agg_mcap),
-                'pr': len(agg_pr),
-                'metrics': len(metrics),
-                'merged': len(merged_data)
-            },
-            'limit': limit
-        }), 200
-    except Exception as e:
-        print(f"Error fetching dashboard data: {e}")
-        return jsonify({'error': str(e)}), 500
-
 
 @app.route('/api/nse-symbol-dashboard', methods=['POST'])
 def nse_symbol_dashboard():
@@ -1474,6 +1453,20 @@ def nse_symbol_dashboard():
             
             # Add index from DB
             index_map = primary_index_map_from_db(batch_symbols)
+            
+            # Enrich with aggregates data
+            if symbol_aggregates_collection is not None:
+                try:
+                    for doc in symbol_aggregates_collection.find({'symbol': {'$in': batch_symbols}, 'type': 'pr'}):
+                        sym = doc.get('symbol')
+                        if sym:
+                            for row in rows:
+                                if row.get('symbol') == sym:
+                                    row['days_with_data'] = doc.get('days_with_data', 0)
+                                    break
+                except Exception as exc:
+                    print(f"⚠️ Failed to fetch days_with_data: {exc}")
+            
             for row in rows:
                 sym = row.get('symbol')
                 if sym and sym in index_map:
@@ -1496,13 +1489,10 @@ def nse_symbol_dashboard():
                     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
                     excel_path = temp_file.name
                     temp_file.close()
-                    df = pd.DataFrame(rows)
-                    preferred_cols = ['symbol', 'company_name', 'primary_index', 'impact_cost', 
-                                      'free_float_mcap', 'traded_value', 'last_price', 'pct_change']
-                    existing = [c for c in preferred_cols if c in df.columns]
-                    other = [c for c in df.columns if c not in preferred_cols]
-                    df = df[existing + other]
-                    df.to_excel(excel_path, index=False, sheet_name='Dashboard')
+                    
+                    # Use formatted Excel output
+                    format_dashboard_excel(rows, excel_path, start_date=start_date_str, end_date=end_date_str)
+                    
                     db_id = save_excel_to_database(excel_path, download_name, {
                         'symbols': len(rows),
                         'batch': batch_idx+1,
@@ -1584,6 +1574,20 @@ def nse_symbol_dashboard():
                 )
                 batch_rows = result.get('rows', [])
                 batch_errors = result.get('errors', [])
+                
+                # Enrich with aggregates data (days_with_data)
+                if symbol_aggregates_collection is not None:
+                    try:
+                        for doc in symbol_aggregates_collection.find({'symbol': {'$in': batch_symbols}, 'type': 'pr'}):
+                            sym = doc.get('symbol')
+                            if sym:
+                                for row in batch_rows:
+                                    if row.get('symbol') == sym:
+                                        row['days_with_data'] = doc.get('days_with_data', 0)
+                                        break
+                    except Exception as exc:
+                        print(f"⚠️ Failed to fetch days_with_data for batch: {exc}")
+                
                 # Add primary_index
                 for row in batch_rows:
                     sym = row.get('symbol')
@@ -1620,14 +1624,10 @@ def nse_symbol_dashboard():
                 excel_path = temp_file.name
                 temp_file.close()
                 
-                df = pd.DataFrame(all_rows)
-                preferred_cols = ['symbol', 'company_name', 'primary_index', 'impact_cost', 
-                                  'free_float_mcap', 'traded_value', 'last_price', 'pct_change']
-                existing = [c for c in preferred_cols if c in df.columns]
-                other = [c for c in df.columns if c not in preferred_cols]
-                df = df[existing + other]
-                
-                df.to_excel(excel_path, index=False, sheet_name='Dashboard')
+                # Use formatted Excel output with date range if available
+                start_dt = data.get('start_date')
+                end_dt = data.get('end_date')
+                format_dashboard_excel(all_rows, excel_path, start_date=start_dt, end_date=end_dt)
                 
                 db_id = save_excel_to_database(excel_path, download_name, {
                     'symbols': len(all_rows),
@@ -1698,91 +1698,6 @@ def process_symbol_batch(symbols, as_on, max_workers, timeout):
         return [], [{'error': str(exc)}]
 
 
-@app.route('/api/update-indices', methods=['POST'])
-def update_indices():
-    if symbol_metrics_collection is None:
-        return jsonify({'error': 'Database not connected'}), 500
-
-    try:
-        # Build primary index map only from existing Mongo data (no NSE API calls)
-        symbol_index_map = {}
-        cursor = symbol_metrics_collection.find({}, {
-            'symbol': 1,
-            'primary_index': 1,
-            'index': 1,
-            'indexList': 1,
-            'updated_at': 1,
-            'as_on': 1
-        }).sort([
-            ('updated_at', -1),
-            ('as_on', -1)
-        ])
-
-        for doc in cursor:
-            sym = doc.get('symbol')
-            if not sym or sym in symbol_index_map:
-                continue
-            idx = doc.get('primary_index') or doc.get('index')
-            if not idx:
-                idx_list = doc.get('indexList')
-                if isinstance(idx_list, (list, tuple)) and idx_list:
-                    idx = idx_list[0]
-            if idx:
-                symbol_index_map[sym] = idx
-
-        if not symbol_index_map:
-            return jsonify({'error': 'No index data found in database'}), 404
-
-        bulk_ops = [
-            UpdateOne(
-                {'symbol': symbol},
-                {'$set': {'primary_index': primary_index, 'updated_at': datetime.now().isoformat()}},
-                upsert=True
-            )
-            for symbol, primary_index in symbol_index_map.items()
-        ]
-
-        if bulk_ops:
-            symbol_metrics_collection.bulk_write(bulk_ops, ordered=False)
-
-        csv_buffer = StringIO()
-        writer = csv.writer(csv_buffer)
-        writer.writerow(['symbol', 'primary_index'])
-        for sym, idx in sorted(symbol_index_map.items()):
-            writer.writerow([sym, idx])
-        csv_content = csv_buffer.getvalue()
-
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        file_name = f'indices_{timestamp}.csv'
-        INDEX_FILES['latest'] = {'name': file_name, 'content': csv_content}
-
-        return jsonify({
-            'message': 'Indices updated from DB',
-            'count': len(symbol_index_map),
-            'errors': [],
-            'download_path': '/api/download-indices',
-            'file_saved': file_name
-        }), 200
-    except Exception as e:
-        print(f"Error in update_indices: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/download-indices', methods=['GET'])
-def download_indices():
-    cached = INDEX_FILES.get('latest')
-    if not cached:
-        return jsonify({'error': 'No index file available. Run update first.'}), 404
-    buf = BytesIO()
-    buf.write(cached['content'].encode('utf-8'))
-    buf.seek(0)
-    return send_file(
-        buf,
-        mimetype='text/csv',
-        as_attachment=True,
-        download_name=cached['name']
-    )
-
 @app.route('/api/nse-symbol-dashboard/download', methods=['GET'])
 def download_symbol_dashboard_file():
     if excel_results_collection is None:
@@ -1811,240 +1726,56 @@ def download_symbol_dashboard_file():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/excel-results', methods=['GET'])
-def get_excel_results():
-    """Get list of all Excel files stored in database"""
-    if excel_results_collection is None:
-        return jsonify({'error': 'Database not connected'}), 500
-    
-    try:
-        # Use only exclusion for file_data to avoid MongoDB projection error
-        results = list(excel_results_collection.find({}, {'file_data': 0}).sort('created_at', -1))
-        # Convert ObjectId to string and datetime to ISO format
-        for result in results:
-            result['_id'] = str(result['_id'])
-            if 'created_at' in result:
-                result['created_at'] = result['created_at'].isoformat()
-        return jsonify({
-            'success': True,
-            'count': len(results),
-            'results': results
-        }), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/excel-results/<file_id>', methods=['GET'])
-def download_excel_result(file_id):
-    """Download Excel file from database"""
-    if excel_results_collection is None:
-        return jsonify({'error': 'Database not connected'}), 500
-    
+@app.route('/api/nse-symbol-dashboard/save-excel', methods=['POST'])
+def nse_symbol_dashboard_save_excel():
+    """
+    Accepts all dashboard rows from the frontend and generates a single Excel file for all batches.
+    Returns the download_url for the complete file.
+    """
     try:
-        from bson.objectid import ObjectId
+        data = request.get_json() or {}
+        rows = data.get('rows', [])
+        as_on = data.get('as_on') or datetime.now().strftime('%Y-%m-%d')
+        start_date = data.get('start_date')
+        end_date = data.get('end_date')
         
-        # Find file in database
-        doc = excel_results_collection.find_one({'_id': ObjectId(file_id)})
+        if not rows or not isinstance(rows, list):
+            return jsonify({'error': 'No rows provided'}), 400
+            
+        download_name = f"Symbol_Dashboard_All_{len(rows)}.xlsx"
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+        excel_path = temp_file.name
+        temp_file.close()
         
-        if not doc:
-            return jsonify({'error': 'File not found'}), 404
+        # Use formatted Excel output with date range
+        format_dashboard_excel(rows, excel_path, start_date=start_date, end_date=end_date)
         
-        # Return binary file data
-        return send_file(
-            BytesIO(doc['file_data']),
-            mimetype=doc.get('file_type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
-            as_attachment=True,
-            download_name=doc.get('filename', 'download.xlsx')
-        )
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/excel-results/<file_id>', methods=['DELETE'])
-def delete_excel_result(file_id):
-    """Delete Excel file from database"""
-    if excel_results_collection is None:
-        return jsonify({'error': 'Database not connected'}), 500
-    
-    try:
-        from bson.objectid import ObjectId
-        
-        # Delete file from database
-        result = excel_results_collection.delete_one({'_id': ObjectId(file_id)})
-        
-        if result.deleted_count == 0:
-            return jsonify({'error': 'File not found'}), 404
-        
-        return jsonify({
-            'success': True,
-            'message': 'File deleted successfully'
-        }), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/excel-results/info/<file_id>', methods=['GET'])
-def get_excel_info(file_id):
-    """Get metadata about stored Excel file"""
-    if excel_results_collection is None:
-        return jsonify({'error': 'Database not connected'}), 500
-    
-    try:
-        from bson.objectid import ObjectId
-        
-        # Find file in database
-        doc = excel_results_collection.find_one({'_id': ObjectId(file_id)}, {
-            'file_data': 0
+        db_id = save_excel_to_database(excel_path, download_name, {
+            'symbols': len(rows),
+            'as_on': as_on,
+            'all_batches': True,
+            'start_date': start_date,
+            'end_date': end_date
         })
         
-        if not doc:
-            return jsonify({'error': 'File not found'}), 404
+        download_url = None
+        if db_id:
+            download_url = f"/api/nse-symbol-dashboard/download?id={db_id}"
         
-        doc['_id'] = str(doc['_id'])
-        if 'created_at' in doc:
-            doc['created_at'] = doc['created_at'].isoformat()
+        os.remove(excel_path)
         
         return jsonify({
             'success': True,
-            'file': doc
+            'file': download_name,
+            'file_id': str(db_id) if db_id else None,
+            'download_url': download_url,
+            'symbols': len(rows)
         }), 200
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/consolidate', methods=['POST'])
-def consolidate():
-    """
-    Enhanced consolidate endpoint with download destination option
-    
-    Expected form data:
-    - files: Multiple CSV files
-    - download_destination: 'local' or 'google_drive'
-    - corporate_actions: JSON string with corporate actions config (optional)
-    """
-    global google_drive_service
-    
-    try:
-        # Check if files were uploaded
-        if 'files' not in request.files:
-            return jsonify({'error': 'No files uploaded'}), 400
-        
-        files = request.files.getlist('files')
-        download_destination = request.form.get('download_destination', 'local')
-        
-        if not files or len(files) == 0:
-            return jsonify({'error': 'No files selected'}), 400
-        
-        # Validate download destination
-        if download_destination not in ['local', 'google_drive']:
-            return jsonify({'error': 'Invalid download destination. Use "local" or "google_drive"'}), 400
-        
-        # Create temporary directory for this request
-        request_folder = tempfile.mkdtemp()
-        
-        try:
-            # Save uploaded files
-            file_count = 0
-            for file in files:
-                if file and allowed_file(file.filename):
-                    filename = secure_filename(file.filename)
-                    filepath = os.path.join(request_folder, filename)
-                    file.save(filepath)
-                    file_count += 1
-            
-            if file_count == 0:
-                return jsonify({'error': 'No valid CSV files uploaded'}), 400
-            
-            # Consolidate data
-            consolidator = MarketCapConsolidator(request_folder)
-            companies_count, dates_count = consolidator.load_and_consolidate_data()
-            
-
-            # Create output file in temp folder
-            output_path = os.path.join(request_folder, 'Finished_Product.xlsx')
-            consolidator.format_excel_output(output_path)
-
-            # Also save a copy as nosubject/Market_Cap.xlsx for dashboard use
-            try:
-                nosubject_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject')
-                if not os.path.exists(nosubject_dir):
-                    os.makedirs(nosubject_dir)
-                market_cap_dest = os.path.join(nosubject_dir, 'Market_Cap.xlsx')
-                shutil.copy2(output_path, market_cap_dest)
-                print(f"✓ Market_Cap.xlsx copied to {market_cap_dest}")
-            except Exception as exc:
-                print(f"⚠️ Could not copy Market_Cap.xlsx to nosubject/: {exc}")
-
-            # Persist per-symbol values and averages (uploaded files consolidation)
-            persist_consolidated_results(consolidator, 'mcap', source='upload_consolidation')
-            
-            # Prepare metadata
-            metadata = {
-                'companies_count': companies_count,
-                'dates_count': dates_count,
-                'dates': [d[0] for d in consolidator.dates_list],
-                'files_consolidated': file_count,
-                'consolidated_at': datetime.now().isoformat()
-            }
-            
-            # Handle different download destinations
-            if download_destination == 'google_drive':
-                # Upload to Google Drive
-                if google_drive_service is None or not google_drive_service.is_authenticated():
-                    # Try to authenticate
-                    credentials_path = os.getenv('GOOGLE_CREDENTIALS_PATH', 'credentials.json')
-                    if not os.path.exists(credentials_path):
-                        return jsonify({
-                            'error': 'Google Drive not configured',
-                            'message': 'Please add credentials.json to enable Google Drive uploads'
-                        }), 400
-                    
-                    google_drive_service = GoogleDriveService(credentials_path)
-                    if not google_drive_service.authenticate():
-                        return jsonify({
-                            'error': 'Google Drive authentication failed'
-                        }), 400
-                
-                # Upload file to Google Drive
-                upload_result = google_drive_service.upload_file(
-                    output_path,
-                    'Finished_Product.xlsx'
-                )
-                
-                if upload_result is None:
-                    return jsonify({
-                        'error': 'Failed to upload to Google Drive'
-                    }), 500
-                
-                # Save metadata to database if available
-                if excel_results_collection is not None:
-                    db_id = save_excel_to_database(output_path, 'Finished_Product.xlsx', metadata)
-                
-                return jsonify({
-                    'success': True,
-                    'destination': 'google_drive',
-                    'message': 'File uploaded to Google Drive successfully',
-                    'file_name': upload_result['file_name'],
-                    'file_id': upload_result['file_id'],
-                    'web_link': upload_result['web_link'],
-                    'metadata': metadata
-                }), 200
-            
-            else:  # local download
-                # Save Excel to MongoDB before sending
-                db_id = save_excel_to_database(output_path, 'Finished_Product.xlsx', metadata)
-                
-                # Send file to client
-                return send_file(
-                    output_path,
-                    mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    as_attachment=True,
-                    download_name='Finished_Product.xlsx'
-                )
-        
-        finally:
-            # Cleanup
-            if os.path.exists(request_folder):
-                shutil.rmtree(request_folder)
-    
-    except Exception as e:
+        print(f"[symbol-dashboard][save-excel][error] {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
@@ -2292,231 +2023,6 @@ def consolidate_saved():
         print(f"[consolidate-saved][error] {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/google-drive-files', methods=['GET'])
-def get_google_drive_files():
-    """
-    List all files in Google Drive Automation folder
-    """
-    try:
-        if google_drive_service is None or not google_drive_service.is_authenticated():
-            return jsonify({
-                'error': 'Google Drive not authenticated',
-                'files': []
-            }), 400
-        
-        files = google_drive_service.list_files_in_automation_folder()
-        
-        return jsonify({
-            'success': True,
-            'count': len(files),
-            'files': files
-        }), 200
-    
-    except Exception as e:
-        return jsonify({
-            'error': str(e),
-            'files': []
-        }), 500
-
-@app.route('/api/google-drive-status', methods=['GET'])
-def google_drive_status():
-    """
-    Check Google Drive integration status
-    """
-    try:
-        is_authenticated = (
-            google_drive_service is not None and 
-            google_drive_service.is_authenticated()
-        )
-        
-        if is_authenticated:
-            automation_folder = google_drive_service.get_or_create_automation_folder()
-        else:
-            automation_folder = None
-        
-        return jsonify({
-            'authenticated': is_authenticated,
-            'service_initialized': google_drive_service is not None,
-            'automation_folder_id': automation_folder,
-            'credentials_file': 'credentials.json' if os.path.exists('credentials.json') else None
-        }), 200
-    
-    except Exception as e:
-        return jsonify({
-            'error': str(e),
-            'authenticated': False
-        }), 500
-
-
-@app.route('/api/heatmap', methods=['GET'])
-def heatmap_view():
-    """
-    Return live index constituents for building an NSE-style heatmap.
-    
-    Query params:
-        - index: Name of index (default: 'NIFTY 50')
-    
-    Example: /api/heatmap?index=NIFTY%20MIDCAP%2050
-    """
-    try:
-        index_name = request.args.get('index', 'NIFTY 50')
-        if index_name not in HEATMAP_INDICES:
-            return jsonify({
-                'error': 'Unsupported index',
-                'available_indices': HEATMAP_INDICES
-            }), 400
-
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json,text/plain,*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Referer': 'https://www.nseindia.com/market-data/live-market-indices'
-        }
-
-        sess = _make_session()
-        _prime_cookies(sess, headers)
-
-        type_name = HEATMAP_TYPE_MAP.get(index_name, 'Broad Market Indices')
-        heatmap_url = f"https://www.nseindia.com/api/heatmap-symbols?type={quote_plus(type_name)}&indices={quote_plus(index_name)}"
-        
-        print(f"[heatmap] Fetching: {heatmap_url}")
-        resp = sess.get(heatmap_url, headers=headers, timeout=20)
-
-        # Fallback to equity-stockIndices if heatmap-symbols fails
-        used_fallback = False
-        data_list = None
-        if resp.status_code == 200:
-            try:
-                data_list = resp.json()
-                if isinstance(data_list, list) and len(data_list) > 0:
-                    print(f"[heatmap] Got {len(data_list)} symbols from heatmap-symbols API")
-            except Exception as e:
-                print(f"[heatmap] Failed to parse JSON: {e}")
-                data_list = None
-
-        if data_list is None or (isinstance(data_list, list) and len(data_list) == 0):
-            used_fallback = True
-            fallback_url = f"https://www.nseindia.com/api/equity-stockIndices?index={quote_plus(index_name)}"
-            print(f"[heatmap] Fallback to: {fallback_url}")
-            resp = sess.get(fallback_url, headers=headers, timeout=20)
-            if resp.status_code != 200:
-                return jsonify({'error': f'NSE responded with {resp.status_code}'}), resp.status_code
-            try:
-                data_obj = resp.json() if resp.content else {}
-                rows = data_obj.get('data') or []
-                print(f"[heatmap] Got {len(rows)} symbols from fallback API")
-            except Exception:
-                return jsonify({'error': 'Invalid response from NSE'}), 502
-            data_list = rows
-
-        constituents = []
-        for row in data_list:
-            sym = row.get('symbol') or row.get('symbolName') or row.get('identifier') or row.get('securitySymbol')
-            if not sym:
-                continue
-            
-            # Handle both heatmap-symbols and equity-stockIndices response formats
-            last_price = row.get('lastPrice') or row.get('last')
-            p_change = row.get('pChange') or row.get('perChange')
-            change_val = row.get('change')
-            high_val = row.get('high') or row.get('dayHigh')
-            low_val = row.get('low') or row.get('dayLow')
-            volume = row.get('totalTradedVolume') or row.get('tradedQuantity')
-            traded_value = row.get('quantityTraded') or row.get('totalTradedValue') or row.get('turnoverinlacs')
-            vwap = row.get('vwap')
-            
-            constituents.append({
-                'symbol': sym,
-                'series': row.get('series'),
-                'lastPrice': _safe_float(last_price),
-                'pChange': _safe_float(p_change),
-                'change': _safe_float(change_val),
-                'previousClose': _safe_float(row.get('previousClose')),
-                'open': _safe_float(row.get('open')),
-                'high': _safe_float(high_val),
-                'low': _safe_float(low_val),
-                'totalTradedVolume': _safe_float(volume),
-                'totalTradedValue': _safe_float(traded_value),
-                'vwap': _safe_float(vwap),
-                'lastUpdatedTime': row.get('lastUpdatedTime')
-            })
-
-        # Derive advances/declines from constituents
-        advances = {'advances': 0, 'declines': 0, 'unchanged': 0}
-        for item in constituents:
-            pc = item.get('pChange')
-            if pc is None:
-                advances['unchanged'] += 1
-                continue
-            if pc > 0:
-                advances['advances'] += 1
-            elif pc < 0:
-                advances['declines'] += 1
-            else:
-                advances['unchanged'] += 1
-
-        payload = {
-            'success': True,
-            'index': index_name,
-            'timestamp': constituents[0].get('lastUpdatedTime') if constituents else None,
-            'count': len(constituents),
-            'advances': advances,
-            'constituents': constituents,
-            'available_indices': HEATMAP_INDICES,
-            'source': 'heatmap-symbols' if not used_fallback else 'equity-stockIndices'
-        }
-        return jsonify(convert_nan_to_none(payload)), 200
-
-    except Exception as exc:
-        print(f"[heatmap] Error: {exc}")
-        return jsonify({'error': str(exc)}), 500
-
-@app.route('/api/nse-symbol-dashboard/save-excel', methods=['POST'])
-def nse_symbol_dashboard_save_excel():
-    """
-    Accepts all dashboard rows from the frontend and generates a single Excel file for all batches.
-    Returns the download_url for the complete file.
-    """
-    try:
-        data = request.get_json() or {}
-        rows = data.get('rows', [])
-        as_on = data.get('as_on') or datetime.now().strftime('%Y-%m-%d')
-        if not rows or not isinstance(rows, list):
-            return jsonify({'error': 'No rows provided'}), 400
-        download_name = f"Symbol_Dashboard_All_{len(rows)}.xlsx"
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
-        excel_path = temp_file.name
-        temp_file.close()
-        df = pd.DataFrame(rows)
-        preferred_cols = ['symbol', 'company_name', 'primary_index', 'impact_cost', 
-                          'free_float_mcap', 'traded_value', 'last_price', 'pct_change']
-        existing = [c for c in preferred_cols if c in df.columns]
-        other = [c for c in df.columns if c not in preferred_cols]
-        df = df[existing + other]
-        df.to_excel(excel_path, index=False, sheet_name='Dashboard')
-        db_id = save_excel_to_database(excel_path, download_name, {
-            'symbols': len(rows),
-            'as_on': as_on,
-            'all_batches': True
-        })
-        download_url = None
-        if db_id:
-            download_url = f"/api/nse-symbol-dashboard/download?id={db_id}"
-        os.remove(excel_path)
-        return jsonify({
-            'success': True,
-            'file': download_name,
-            'file_id': str(db_id) if db_id else None,
-            'download_url': download_url,
-            'symbols': len(rows)
-        }), 200
-    except Exception as e:
-        print(f"[symbol-dashboard][save-excel][error] {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     import os
