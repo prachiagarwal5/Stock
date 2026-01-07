@@ -1673,17 +1673,22 @@ def nse_symbol_dashboard():
 
 
 def process_symbol_batch(symbols, as_on, max_workers, timeout):
-    """Process a batch of symbols and return rows, errors."""
+    """Process a batch of symbols with 10 workers for parallel processing."""
     fetcher = SymbolMetricsFetcher()
     try:
+        # Use exactly 10 workers for optimal parallel processing
+        effective_workers = 10
+        # Larger chunk size so each worker handles more symbols at once
+        chunk_size = max(10, len(symbols) // 10)  # Divide work among 10 workers
+        print(f"[batch-processing] Fetching {len(symbols)} symbols with {effective_workers} workers, chunk_size={chunk_size}")
         result = fetcher.build_dashboard(
             symbols,
             excel_path=None,
             max_symbols=None,
             as_of=as_on,
             parallel=True,
-            max_workers=max_workers,
-            chunk_size=5,
+            max_workers=effective_workers,
+            chunk_size=chunk_size,
             symbol_pr_data={},
             symbol_mcap_data={},
             max_time_seconds=timeout

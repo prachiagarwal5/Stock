@@ -147,6 +147,7 @@ class SymbolMetricsFetcher:
         """
         Fetch symbol data with optional timeout protection.
         max_time_seconds: If set, stop fetching after this many seconds and return partial results.
+        Each batch uses minimum 5 workers for optimal parallel processing.
         """
         rows = []
         errors = []
@@ -174,7 +175,12 @@ class SymbolMetricsFetcher:
                     break
                     
                 batch = capped_symbols[i:i + (chunk_size or len(capped_symbols))]
-                with ThreadPoolExecutor(max_workers=min(max_workers, len(batch))) as executor:
+                # Use minimum 5 workers per batch for optimal parallel processing
+                workers_for_batch = max(5, min(max_workers, len(batch)))
+                batch_num = (i // (chunk_size or len(capped_symbols))) + 1
+                total_batches = (len(capped_symbols) + (chunk_size or len(capped_symbols)) - 1) // (chunk_size or len(capped_symbols))
+                print(f"[fetch-symbols] Sub-batch {batch_num}/{total_batches}: {len(batch)} symbols with {workers_for_batch} parallel workers")
+                with ThreadPoolExecutor(max_workers=workers_for_batch) as executor:
                     for status, payload in executor.map(_worker, batch):
                         if status == 'ok':
                             rows.append(payload)
@@ -203,12 +209,15 @@ class SymbolMetricsFetcher:
     def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=50, chunk_size=100, symbol_pr_data=None, symbol_mcap_data=None, max_time_seconds=None):
         """
         Build dashboard with additional calculated columns.
+        Optimized with minimum 5 workers per batch for parallel processing.
         
         symbol_pr_data: dict of {symbol: {'days_with_data': int, 'total_trading_days': int, 'avg_pr': float}}
         symbol_mcap_data: dict of {symbol: {'avg_mcap': float, 'avg_free_float': float}}
         max_time_seconds: Optional time limit for fetching (returns partial results if exceeded)
         """
-        rows, errors = self.fetch_many(symbols, max_symbols=max_symbols, as_of=as_of, parallel=parallel, max_workers=max_workers, chunk_size=chunk_size, max_time_seconds=max_time_seconds)
+        # Ensure minimum 5 workers for optimal parallel processing in batches
+        effective_workers = max(5, max_workers) if parallel else 1
+        rows, errors = self.fetch_many(symbols, max_symbols=max_symbols, as_of=as_of, parallel=parallel, max_workers=effective_workers, chunk_size=chunk_size, max_time_seconds=max_time_seconds)
 
         df = pd.DataFrame(rows)
         numeric_fields = ['impact_cost', 'free_float_mcap', 'total_market_cap', 'total_traded_value', 'last_price']
