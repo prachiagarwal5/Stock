@@ -6,12 +6,22 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from concurrent.futures import ThreadPoolExecutor
 import xlsxwriter
+import io
 
 
 # Indices that qualify for NIFTY 500 broader index
 NIFTY_500_INDICES = {
-    'NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 150', 'NIFTY SMALLCAP 250',
-    'NIFTY50', 'NIFTYNEXT50', 'NIFTYMIDCAP150', 'NIFTYSMALLCAP250'
+    'NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 150', 'NIFTY SMALLCAP 250', 'NIFTY MICROCAP 250',
+    'NIFTY50', 'NIFTYNEXT50', 'NIFTYMIDCAP150', 'NIFTYSMALLCAP250', 'NIFTYMICROCAP250'
+}
+
+# Nifty Index Constituent CSV URLs
+NIFTY_INDEX_URLS = {
+    'NIFTY 50': 'https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv',
+    'NIFTY NEXT 50': 'https://www.niftyindices.com/IndexConstituent/ind_niftynext50list.csv',
+    'NIFTY MIDCAP 150': 'https://www.niftyindices.com/IndexConstituent/ind_niftymidcap150list.csv',
+    'NIFTY SMALLCAP 250': 'https://www.niftyindices.com/IndexConstituent/ind_niftysmallcap250list.csv',
+    'NIFTY MICROCAP 250': 'https://www.niftyindices.com/IndexConstituent/ind_niftymicrocap250_list.csv'
 }
 
 
@@ -28,6 +38,81 @@ class SymbolMetricsFetcher:
             'Connection': 'keep-alive'
         }
         self._prime_cookies(self.session)
+        self.index_mapping = {}  # Cache for symbol -> indices mapping
+
+    def fetch_nifty_indices(self, max_retries=3):
+        """
+        Fetch all Nifty index constituent CSV files and build a mapping
+        of symbol -> list of index names.
+        Includes retry logic for failed requests.
+        
+        Args:
+            max_retries: Maximum number of retry attempts for each index (default: 3)
+            
+        Returns: dict {symbol: [index_name1, index_name2, ...]}
+        """
+        symbol_to_indices = {}
+        
+        # Headers to mimic browser request
+        csv_headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0'
+        }
+        
+        for index_name, csv_url in NIFTY_INDEX_URLS.items():
+            success = False
+            last_error = None
+            
+            for attempt in range(max_retries):
+                try:
+                    if attempt > 0:
+                        print(f"[fetch_nifty_indices] Retry {attempt}/{max_retries-1} for {index_name}...")
+                    else:
+                        print(f"[fetch_nifty_indices] Fetching {index_name} constituents...")
+                    
+                    response = requests.get(csv_url, headers=csv_headers, timeout=30)
+                    response.raise_for_status()
+                    
+                    # Parse CSV content
+                    csv_content = io.StringIO(response.text)
+                    df = pd.read_csv(csv_content)
+                    
+                    # The CSV typically has columns like 'Symbol', 'Company Name', 'Industry', etc.
+                    # We need the 'Symbol' column
+                    if 'Symbol' in df.columns:
+                        symbols = df['Symbol'].dropna().unique()
+                        for symbol in symbols:
+                            symbol = str(symbol).strip()
+                            if symbol not in symbol_to_indices:
+                                symbol_to_indices[symbol] = []
+                            symbol_to_indices[symbol].append(index_name)
+                        print(f"[fetch_nifty_indices] ✓ {index_name}: {len(symbols)} symbols")
+                        success = True
+                        break
+                    else:
+                        print(f"[fetch_nifty_indices] ⚠️ {index_name}: 'Symbol' column not found in CSV")
+                        last_error = "'Symbol' column not found"
+                        break
+                        
+                except Exception as e:
+                    last_error = str(e)
+                    if attempt < max_retries - 1:
+                        time.sleep(1)  # Brief pause before retry
+                    continue
+            
+            if not success and last_error:
+                print(f"[fetch_nifty_indices] ✗ Failed to fetch {index_name} after {max_retries} attempts: {last_error}")
+        
+        print(f"[fetch_nifty_indices] ✓ Total unique symbols mapped: {len(symbol_to_indices)}")
+        return symbol_to_indices
 
     def _make_session(self, user_agent=None):
         sess = requests.Session()
@@ -206,7 +291,7 @@ class SymbolMetricsFetcher:
 
         return rows, errors
 
-    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=50, chunk_size=100, symbol_pr_data=None, symbol_mcap_data=None, max_time_seconds=None):
+    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=50, chunk_size=100, symbol_pr_data=None, symbol_mcap_data=None, max_time_seconds=None, fetch_indices_from_csv=False, nifty_indices_collection=None):
         """
         Build dashboard with additional calculated columns.
         Optimized with minimum 5 workers per batch for parallel processing.
@@ -214,11 +299,61 @@ class SymbolMetricsFetcher:
         symbol_pr_data: dict of {symbol: {'days_with_data': int, 'total_trading_days': int, 'avg_pr': float}}
         symbol_mcap_data: dict of {symbol: {'avg_mcap': float, 'avg_free_float': float, 'total_traded_value': float}}
         max_time_seconds: Optional time limit for fetching (returns partial results if exceeded)
+        fetch_indices_from_csv: If True, fetch index data from Nifty indices CSV files (not recommended for production)
+        nifty_indices_collection: MongoDB collection for fetching stored index data (recommended)
         """
+        # Fetch index mapping from DB (preferred) or CSV files (fallback)
+        if nifty_indices_collection is not None:
+            print("[build_dashboard] Fetching index data from MongoDB...")
+            try:
+                self.index_mapping = {}
+                for doc in nifty_indices_collection.find({}):
+                    symbol = doc.get('symbol')
+                    indices = doc.get('indices', [])
+                    if symbol and indices:
+                        self.index_mapping[symbol] = indices
+                print(f"[build_dashboard] ✓ Loaded {len(self.index_mapping)} symbols from DB")
+            except Exception as e:
+                print(f"[build_dashboard] ⚠️ Failed to load from DB: {e}")
+                self.index_mapping = {}
+        elif fetch_indices_from_csv:
+            print("[build_dashboard] Fetching index data from Nifty indices CSV files...")
+            self.index_mapping = self.fetch_nifty_indices()
+        else:
+            self.index_mapping = {}
+        
         # Ensure minimum 5 workers for optimal parallel processing in batches
         effective_workers = max(5, max_workers) if parallel else 1
         rows, errors = self.fetch_many(symbols, max_symbols=max_symbols, as_of=as_of, parallel=parallel, max_workers=effective_workers, chunk_size=chunk_size, max_time_seconds=max_time_seconds)
 
+        # Store API indices before overriding
+        for row in rows:
+            row['index_from_api'] = row.get('index')
+            row['indexList_from_api'] = row.get('indexList', [])
+
+        # Override index data with DB/CSV data if available
+        if self.index_mapping:
+            replaced_index_count = 0
+            not_found_symbols = []
+            for row in rows:
+                symbol = row.get('symbol')
+                if symbol and symbol in self.index_mapping:
+                    csv_indices = self.index_mapping[symbol]
+                    # Replace index and indexList with data from DB/CSV
+                    row['index'] = csv_indices[0] if csv_indices else None
+                    row['indexList'] = csv_indices
+                    replaced_index_count += 1
+                elif symbol:
+                    not_found_symbols.append(symbol)
+            
+            if replaced_index_count > 0:
+                source = "MongoDB" if nifty_indices_collection is not None else "Nifty CSV files"
+                print(f"[build_dashboard] ✓ Replaced index data for {replaced_index_count}/{len(rows)} symbols from {source}")
+            if not_found_symbols and len(not_found_symbols) <= 10:
+                print(f"[build_dashboard] ⚠️ {len(not_found_symbols)} symbols not found in DB: {', '.join(not_found_symbols)}")
+            elif not_found_symbols:
+                print(f"[build_dashboard] ⚠️ {len(not_found_symbols)} symbols not found in index database")
+        
         # Override API values with data from symbol_mcap_data if available
         replaced_mcap = 0
         replaced_traded = 0
@@ -256,7 +391,7 @@ class SymbolMetricsFetcher:
                     return ''
                 indices = index_list if isinstance(index_list, list) else [index_list]
                 for idx in indices:
-                    if idx and any(ni in idx.upper().replace(' ', '') for ni in ['NIFTY50', 'NIFTYNEXT50', 'NIFTYMIDCAP150', 'NIFTYSMALLCAP250']):
+                    if idx and any(ni in idx.upper().replace(' ', '') for ni in ['NIFTY50', 'NIFTYNEXT50', 'NIFTYMIDCAP150', 'NIFTYSMALLCAP250', 'NIFTYMICROCAP250']):
                         return 'Nifty 500'
                     if idx and idx.upper() in NIFTY_500_INDICES:
                         return 'Nifty 500'
@@ -311,13 +446,22 @@ class SymbolMetricsFetcher:
             else:
                 df_copy['indexList'] = ''
 
+            # Convert API indices to string for Excel
+            if 'indexList_from_api' in df_copy.columns:
+                df_copy['indexList_from_api'] = df_copy['indexList_from_api'].apply(lambda x: ', '.join(x) if isinstance(x, list) else (x or ''))
+            else:
+                df_copy['indexList_from_api'] = ''
+
             if 'index' not in df_copy.columns:
                 df_copy['index'] = ''
+            
+            if 'index_from_api' not in df_copy.columns:
+                df_copy['index_from_api'] = ''
 
             # Reorder columns for better readability
             preferred_order = [
                 'symbol', 'companyName', 'series', 'status', 
-                'Broader Index', 'index', 'indexList',
+                'Broader Index', 'index', 'indexList', 'index_from_api', 'indexList_from_api',
                 'listingDate', 'listed> 6months', 'listed> 1 months',
                 'impact_cost', 'free_float_mcap', 'total_market_cap', 
                 'total_traded_value', 'last_price',
@@ -372,8 +516,10 @@ class SymbolMetricsFetcher:
                     'series': (8, text_fmt),
                     'status': (10, text_fmt),
                     'Broader Index': (15, text_fmt),
-                    'index': (18, text_fmt),
-                    'indexList': (30, text_fmt),
+                    'index': (20, text_fmt),
+                    'indexList': (35, text_fmt),
+                    'index_from_api': (20, text_fmt),
+                    'indexList_from_api': (35, text_fmt),
                     'listingDate': (14, date_fmt),
                     'listed> 6months': (12, text_fmt),
                     'listed> 1 months': (12, text_fmt),

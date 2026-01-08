@@ -66,6 +66,7 @@ try:
     symbol_daily_collection = db['symbol_daily']  # per-symbol, per-date values (mcap/pr)
     symbol_aggregates_collection = db['symbol_aggregates']  # per-symbol averages
     symbol_metrics_collection = db['symbol_metrics']  # Symbol dashboard metrics
+    nifty_indices_collection = db['nifty_indices']  # Nifty index constituent mappings
     # speed-critical indexes
     symbol_daily_collection.create_index(
         [('symbol', 1), ('type', 1), ('date', 1)], name='symbol_type_date', unique=True
@@ -76,6 +77,7 @@ try:
         name='symbol_type_range', unique=False
     )
     bhavcache_collection.create_index([('type', 1), ('date', 1)], name='type_date_cache')
+    nifty_indices_collection.create_index([('symbol', 1)], name='symbol_idx', unique=True)
     print("✅ MongoDB connected successfully")
 except Exception as e:
     print(f"⚠️ MongoDB connection failed: {e}")
@@ -85,6 +87,7 @@ except Exception as e:
     symbol_daily_collection = None
     symbol_aggregates_collection = None
     symbol_metrics_collection = None
+    nifty_indices_collection = None
 
 
 # Custom JSON encoder to handle NaN and Inf values
@@ -849,12 +852,14 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             except:
                 return None, 'N', 'N'
         
-        # Determine broader index
-        def get_broader_index(index):
+        # Determine broader index (use DB index if available, fallback to primary_index or API index)
+        def get_broader_index(row):
+            # Try DB index first, then primary_index, then API index
+            index = row.get('index') or row.get('primary_index') or row.get('index_from_api')
             if not index or pd.isna(index):
                 return ''
             index_upper = str(index).upper()
-            nifty_500_indices = ['NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 150', 'NIFTY SMALLCAP 250']
+            nifty_500_indices = ['NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 150', 'NIFTY SMALLCAP 250', 'NIFTY MICROCAP 250']
             for idx in nifty_500_indices:
                 if idx.replace(' ', '') in index_upper.replace(' ', ''):
                     return 'NIFTY 500'
@@ -866,7 +871,7 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
         df['listed> 6months'] = listing_info.apply(lambda x: x[1] if x else 'N')
         df['listed> 1 months'] = listing_info.apply(lambda x: x[2] if x else 'N')
         
-        df['Broader Index'] = df.apply(lambda row: get_broader_index(row.get('primary_index')), axis=1)
+        df['Broader Index'] = df.apply(get_broader_index, axis=1)
         
         # Calculate ratio of avg free float to avg total market cap
         df['Ratio of avg free float to avg total market cap'] = df.apply(
@@ -889,7 +894,10 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             ('Serial No', 'serial_no'),
             ('Symbol', 'symbol'),
             ('Company name', 'companyName'),
-            ('Index', 'primary_index'),
+            ('Index (DB)', 'index'),  # Index from Nifty DB
+            ('Index List (DB)', 'indexList'),  # All indices from DB
+            ('Index (API)', 'index_from_api'),  # Original API index
+            ('Index List (API)', 'indexList_from_api'),  # Original API index list
             ('avg Impact cost', 'impact_cost'),
             ('avg total market cap', 'total_market_cap'),
             ('Avg Free float market cap', 'free_float_mcap'),
@@ -947,17 +955,20 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             'A': (8, None),  # Serial No
             'B': (12, None),  # Symbol
             'C': (30, None),  # Company name
-            'D': (18, None),  # Index
-            'E': (15, numbers.FORMAT_NUMBER_00),  # avg Impact cost
-            'F': (20, '#,##0.00'),  # avg total market cap
-            'G': (22, '#,##0.00'),  # Avg Free float market cap
-            'H': (20, '#,##0.00'),  # Avg daily traded value
-            'I': (15, None),  # Day of Listing
-            'J': (15, None),  # Broader Index
-            'K': (13, None),  # listed> 6months
-            'L': (13, None),  # listed> 1 months
-            'M': (18, '0.0000'),  # Ratio of avg free float to avg total market cap
-            'N': (18, '0.0000'),  # ratio of free float to avg total market cap
+            'D': (20, None),  # Index (DB)
+            'E': (30, None),  # Index List (DB)
+            'F': (20, None),  # Index (API)
+            'G': (30, None),  # Index List (API)
+            'H': (15, numbers.FORMAT_NUMBER_00),  # avg Impact cost
+            'I': (20, '#,##0.00'),  # avg total market cap
+            'J': (22, '#,##0.00'),  # Avg Free float market cap
+            'K': (20, '#,##0.00'),  # Avg daily traded value
+            'L': (15, None),  # Day of Listing
+            'M': (15, None),  # Broader Index
+            'N': (13, None),  # listed> 6months
+            'O': (13, None),  # listed> 1 months
+            'P': (18, '0.0000'),  # Ratio of avg free float to avg total market cap
+            'Q': (18, '0.0000'),  # ratio of free float to avg total market cap
         }
         
         # Apply column formatting
@@ -1721,7 +1732,9 @@ def nse_symbol_dashboard():
                     chunk_size=5,
                     symbol_pr_data=batch_pr,
                     symbol_mcap_data=batch_mcap,
-                    max_time_seconds=None
+                    max_time_seconds=None,
+                    fetch_indices_from_csv=False,
+                    nifty_indices_collection=nifty_indices_collection
                 )
                 batch_rows = result.get('rows', [])
                 batch_errors = result.get('errors', [])
@@ -1847,7 +1860,9 @@ def process_symbol_batch(symbols, as_on, max_workers, timeout, symbol_pr_data=No
             chunk_size=chunk_size,
             symbol_pr_data=batch_pr_data,
             symbol_mcap_data=batch_mcap_data,
-            max_time_seconds=timeout
+            max_time_seconds=timeout,
+            fetch_indices_from_csv=False,
+            nifty_indices_collection=nifty_indices_collection
         )
         return result.get('rows', []), result.get('errors', [])
     except Exception as exc:
@@ -2190,6 +2205,155 @@ def consolidate_saved():
 
     except Exception as e:
         print(f"[consolidate-saved][error] {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/nifty-indices/fetch-and-store', methods=['POST'])
+def fetch_and_store_nifty_indices():
+    """
+    Fetch Nifty indices from CSV files and store in MongoDB.
+    This should be called when user clicks the 'Refresh Indices' button.
+    """
+    if nifty_indices_collection is None:
+        return jsonify({'error': 'Database not connected'}), 500
+    
+    try:
+        print("[fetch-and-store-indices] Starting index fetch from CSV files...")
+        fetcher = SymbolMetricsFetcher()
+        
+        # Fetch indices from CSV with retry logic
+        index_mapping = fetcher.fetch_nifty_indices()
+        
+        if not index_mapping:
+            return jsonify({'error': 'Failed to fetch any indices from CSV files'}), 500
+        
+        # Prepare bulk operations for MongoDB
+        bulk_operations = []
+        timestamp = datetime.now()
+        
+        for symbol, indices in index_mapping.items():
+            bulk_operations.append(
+                UpdateOne(
+                    {'symbol': symbol},
+                    {
+                        '$set': {
+                            'symbol': symbol,
+                            'indices': indices,
+                            'primary_index': indices[0] if indices else None,
+                            'last_updated': timestamp
+                        }
+                    },
+                    upsert=True
+                )
+            )
+        
+        # Execute bulk write
+        if bulk_operations:
+            result = nifty_indices_collection.bulk_write(bulk_operations)
+            print(f"[fetch-and-store-indices] ✓ Stored {len(index_mapping)} symbols in DB")
+            print(f"[fetch-and-store-indices] Matched: {result.matched_count}, Modified: {result.modified_count}, Upserted: {result.upserted_count}")
+            
+            # Count symbols per index
+            index_counts = {}
+            for indices in index_mapping.values():
+                for idx in indices:
+                    index_counts[idx] = index_counts.get(idx, 0) + 1
+            
+            return jsonify({
+                'success': True,
+                'total_symbols': len(index_mapping),
+                'timestamp': timestamp.isoformat(),
+                'index_distribution': index_counts,
+                'stats': {
+                    'matched': result.matched_count,
+                    'modified': result.modified_count,
+                    'upserted': result.upserted_count
+                }
+            })
+        else:
+            return jsonify({'error': 'No data to store'}), 400
+            
+    except Exception as e:
+        print(f"[fetch-and-store-indices] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/nifty-indices/status', methods=['GET'])
+def get_nifty_indices_status():
+    """
+    Get the status of stored Nifty indices in DB.
+    Returns count of symbols and last update timestamp.
+    """
+    if nifty_indices_collection is None:
+        return jsonify({'error': 'Database not connected'}), 500
+    
+    try:
+        total_count = nifty_indices_collection.count_documents({})
+        
+        # Get last updated timestamp
+        latest_doc = nifty_indices_collection.find_one(
+            {},
+            sort=[('last_updated', -1)]
+        )
+        
+        last_updated = latest_doc.get('last_updated') if latest_doc else None
+        
+        # Count by index
+        pipeline = [
+            {'$unwind': '$indices'},
+            {'$group': {
+                '_id': '$indices',
+                'count': {'$sum': 1}
+            }},
+            {'$sort': {'_id': 1}}
+        ]
+        
+        index_distribution = {}
+        for doc in nifty_indices_collection.aggregate(pipeline):
+            index_distribution[doc['_id']] = doc['count']
+        
+        return jsonify({
+            'total_symbols': total_count,
+            'last_updated': last_updated.isoformat() if last_updated else None,
+            'index_distribution': index_distribution,
+            'has_data': total_count > 0
+        })
+        
+    except Exception as e:
+        print(f"[nifty-indices-status] Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/nifty-indices/get-symbol-indices', methods=['GET'])
+def get_symbol_indices():
+    """
+    Get indices for specific symbols from DB.
+    Query param: symbols (comma-separated)
+    """
+    if nifty_indices_collection is None:
+        return jsonify({'error': 'Database not connected'}), 500
+    
+    symbols_param = request.args.get('symbols', '')
+    if not symbols_param:
+        return jsonify({'error': 'Missing symbols parameter'}), 400
+    
+    try:
+        symbols = [s.strip() for s in symbols_param.split(',') if s.strip()]
+        
+        results = {}
+        for doc in nifty_indices_collection.find({'symbol': {'$in': symbols}}):
+            results[doc['symbol']] = {
+                'indices': doc.get('indices', []),
+                'primary_index': doc.get('primary_index'),
+                'last_updated': doc.get('last_updated').isoformat() if doc.get('last_updated') else None
+            }
+        
+        return jsonify(results)
+        
+    except Exception as e:
+        print(f"[get-symbol-indices] Error: {e}")
         return jsonify({'error': str(e)}), 500
 
 

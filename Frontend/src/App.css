@@ -5,7 +5,9 @@
     box-sizing: border-box;
 }
 
-html, body, #root {
+html,
+body,
+#root {
     height: 100vh;
     overflow: hidden;
 }
@@ -56,6 +58,7 @@ body {
         opacity: 0;
         transform: translateX(-30px) scale(0.95);
     }
+
     to {
         opacity: 1;
         transform: translateX(0) scale(1);
@@ -143,6 +146,7 @@ body {
         opacity: 0;
         transform: translateY(15px) scale(0.95);
     }
+
     to {
         opacity: 1;
         transform: translateY(0) scale(1);
@@ -361,15 +365,19 @@ body {
     padding: 0 1.5rem;
     height: 60px;
     display: flex;
-    align-items: center;
+    flex-direction: column;
+    justify-content: center;
     flex-shrink: 0;
     box-sizing: border-box;
+    position: relative;
 }
 
 .header-content {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 0.875rem;
+    width: 100%;
 }
 
 .header-icon {
@@ -399,6 +407,158 @@ body {
     opacity: 0.9;
     margin: 0;
     margin-top: 2px;
+}
+
+/* Header Actions */
+.header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-left: auto;
+}
+
+/* Refresh Indices Button */
+.refresh-indices-btn {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    background: rgba(255, 255, 255, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 8px;
+    color: white;
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    white-space: nowrap;
+}
+
+.refresh-indices-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.3);
+    border-color: rgba(255, 255, 255, 0.4);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.refresh-indices-btn:active:not(:disabled) {
+    transform: translateY(0);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+}
+
+.refresh-indices-btn:disabled {
+    opacity: 0.7;
+    cursor: not-allowed;
+}
+
+.refresh-indices-btn svg {
+    stroke: currentColor;
+    transition: transform 0.3s ease;
+}
+
+.refresh-indices-btn.loading svg {
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.refresh-indices-btn svg.spinning {
+    animation: spin 1s linear infinite;
+}
+
+/* Index Status Banner */
+.index-status-banner {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    background: white;
+    padding: 0.75rem 1.5rem;
+    border-bottom: 1px solid #e5e7eb;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    animation: slideDown 0.3s ease;
+    z-index: 50;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+}
+
+@keyframes slideDown {
+    from {
+        transform: translateY(-100%);
+        opacity: 0;
+    }
+
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+.index-status-banner.success {
+    border-left: 4px solid #10b981;
+}
+
+.index-status-banner.error {
+    border-left: 4px solid #ef4444;
+}
+
+.status-message {
+    flex: 1;
+    color: #1f2937;
+    font-weight: 500;
+    font-size: 0.875rem;
+}
+
+.index-status-banner.success .status-message {
+    color: #059669;
+}
+
+.index-status-banner.error .status-message {
+    color: #dc2626;
+}
+
+.status-details {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.status-detail-item {
+    font-size: 0.75rem;
+    padding: 0.25rem 0.5rem;
+    background: #f3f4f6;
+    border-radius: 4px;
+    color: #6b7280;
+}
+
+.status-close {
+    background: none;
+    border: none;
+    color: #9ca3af;
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 0;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    transition: all 0.2s ease;
+}
+
+.status-close:hover {
+    background: #f3f4f6;
+    color: #6b7280;
 }
 
 /* Main Content - Scrollable Container */
@@ -438,6 +598,7 @@ body {
     from {
         opacity: 0;
     }
+
     to {
         opacity: 1;
     }
@@ -474,6 +635,7 @@ body {
         opacity: 0;
         transform: translateY(-10px);
     }
+
     to {
         opacity: 1;
         transform: translateY(0);
@@ -1175,7 +1337,9 @@ body {
 }
 
 @keyframes spin {
-    to { transform: rotate(360deg); }
+    to {
+        transform: rotate(360deg);
+    }
 }
 
 /* Steps List */
