@@ -90,7 +90,7 @@ class SymbolMetricsFetcher:
                     if 'Symbol' in df.columns:
                         symbols = df['Symbol'].dropna().unique()
                         for symbol in symbols:
-                            symbol = str(symbol).strip()
+                            symbol = str(symbol).strip().upper()
                             if symbol not in symbol_to_indices:
                                 symbol_to_indices[symbol] = []
                             symbol_to_indices[symbol].append(index_name)
@@ -309,6 +309,8 @@ class SymbolMetricsFetcher:
                 self.index_mapping = {}
                 for doc in nifty_indices_collection.find({}):
                     symbol = doc.get('symbol')
+                    if symbol:
+                        symbol = str(symbol).strip().upper()
                     indices = doc.get('indices', [])
                     if symbol and indices:
                         self.index_mapping[symbol] = indices
@@ -336,7 +338,7 @@ class SymbolMetricsFetcher:
             replaced_index_count = 0
             not_found_symbols = []
             for row in rows:
-                symbol = row.get('symbol')
+                symbol = str(row.get('symbol') or '').strip().upper()
                 if symbol and symbol in self.index_mapping:
                     csv_indices = self.index_mapping[symbol]
                     # Replace index and indexList with data from DB/CSV

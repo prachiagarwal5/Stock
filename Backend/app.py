@@ -2233,6 +2233,8 @@ def fetch_and_store_nifty_indices():
         timestamp = datetime.now()
         
         for symbol, indices in index_mapping.items():
+            # Standardize symbol for storage
+            symbol = str(symbol).strip().upper()
             bulk_operations.append(
                 UpdateOne(
                     {'symbol': symbol},
