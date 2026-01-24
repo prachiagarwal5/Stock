@@ -1,3 +1,5 @@
+import React, { useState } from 'react';
+
 const RangeTab = ({
     rangeStartDate,
     setRangeStartDate,
@@ -20,6 +22,7 @@ const RangeTab = ({
     pipelineLoading,
     pipelineStage
 }) => {
+
     return (
         <section className="section range-tab-section">
             <div className="section-header">
@@ -424,7 +427,9 @@ const RangeTab = ({
                                         display: 'flex',
                                         alignItems: 'center',
                                         justifyContent: 'space-between',
-                                        marginBottom: '20px'
+                                        marginBottom: '20px',
+                                        flexWrap: 'wrap',
+                                        gap: '12px'
                                     }}>
                                         <h4 style={{
                                             color: '#e74c3c',
@@ -435,7 +440,7 @@ const RangeTab = ({
                                             fontSize: '1.2rem',
                                             fontWeight: '700'
                                         }}>
-                                            <span style={{ fontSize: '1.4rem' }}>⚠️</span> Failed Symbols
+                                            <span style={{ fontSize: '1.4rem' }}>⚠️</span> Failed Symbols (NSE API 404)
                                         </h4>
                                         <span style={{
                                             background: '#ffeaea',
@@ -446,7 +451,12 @@ const RangeTab = ({
                                             fontSize: '0.95rem',
                                             border: '2px solid #ffd6d6'
                                         }}>
-                                            {dashboardResult.errors.length} errors
+                                            {(() => {
+                                                const filtered404Errors = dashboardResult.errors.filter(err =>
+                                                    err.error && err.error.includes('404')
+                                                );
+                                                return `${filtered404Errors.length} error${filtered404Errors.length !== 1 ? 's' : ''}`;
+                                            })()}
                                         </span>
                                     </div>
                                     <div style={{
@@ -491,30 +501,36 @@ const RangeTab = ({
                                                     </tr>
                                                 </thead>
                                                 <tbody>
-                                                    {dashboardResult.errors.map((err, idx) => (
-                                                        <tr key={idx} style={{
-                                                            borderBottom: '1px solid #f5f5f5',
-                                                            background: idx % 2 === 0 ? '#fff' : '#fafafa',
-                                                            transition: 'background 0.2s ease'
-                                                        }}>
-                                                            <td style={{
-                                                                padding: '14px 18px',
-                                                                fontWeight: '700',
-                                                                color: '#e74c3c',
-                                                                width: '25%'
+                                                    {(() => {
+                                                        const errorsToDisplay = dashboardResult.errors.filter(err =>
+                                                            err.error && err.error.includes('404')
+                                                        );
+
+                                                        return errorsToDisplay.map((err, idx) => (
+                                                            <tr key={idx} style={{
+                                                                borderBottom: '1px solid #f5f5f5',
+                                                                background: idx % 2 === 0 ? '#fff' : '#fafafa',
+                                                                transition: 'background 0.2s ease'
                                                             }}>
-                                                                {err.symbol || 'N/A'}
-                                                            </td>
-                                                            <td style={{
-                                                                padding: '14px 18px',
-                                                                color: '#666',
-                                                                lineHeight: '1.5',
-                                                                fontSize: '0.92rem'
-                                                            }}>
-                                                                {err.error || 'Unknown error'}
-                                                            </td>
-                                                        </tr>
-                                                    ))}
+                                                                <td style={{
+                                                                    padding: '14px 18px',
+                                                                    fontWeight: '700',
+                                                                    color: '#e74c3c',
+                                                                    width: '25%'
+                                                                }}>
+                                                                    {err.symbol || 'N/A'}
+                                                                </td>
+                                                                <td style={{
+                                                                    padding: '14px 18px',
+                                                                    color: '#666',
+                                                                    lineHeight: '1.5',
+                                                                    fontSize: '0.92rem'
+                                                                }}>
+                                                                    {err.error || 'Unknown error'}
+                                                                </td>
+                                                            </tr>
+                                                        ));
+                                                    })()}
                                                 </tbody>
                                             </table>
                                         </div>
@@ -529,7 +545,7 @@ const RangeTab = ({
                                         borderRadius: '12px',
                                         border: '1px solid #f0f0f0'
                                     }}>
-                                        💡 Symbols that failed to fetch data or are missing mandatory index mapping are listed above.
+                                        💡 Symbols that failed to fetch data or are missing mandatory index mapping are listed above. Use the "Show 404 Errors Only" filter to view NSE API errors.
                                     </div>
                                 </div>
                             </div>
