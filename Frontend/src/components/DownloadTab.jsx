@@ -9,23 +9,7 @@ const DownloadTab = ({
     handleDownloadFromNSE,
     handleExportConsolidated
 }) => {
-    const handleExecuteAll = async () => {
-        try {
-            console.log('Starting all processes...');
-            const response = await fetch('/api/execute-all', { method: 'POST' });
-            if (response.ok) {
-                const result = await response.json();
-                console.log('All processes completed:', result);
-                alert('All processes completed successfully!');
-            } else {
-                console.error('Error executing processes:', response.statusText);
-                alert('Error executing processes. Please check logs.');
-            }
-        } catch (error) {
-            console.error('Error:', error);
-            alert('An unexpected error occurred.');
-        }
-    };
+
 
     return (
         <section className="section">
@@ -60,7 +44,7 @@ const DownloadTab = ({
                         </svg>
                     </div>
                     <span>
-                        Downloads CM - Bhavcopy (PR.zip) from NSE and extracts the CSV file. 
+                        Downloads CM - Bhavcopy (PR.zip) from NSE and extracts the CSV file.
                         Saved as <code>mcapDDMMYYYY.csv</code> in Backend/nosubject/ folder.
                     </span>
                 </div>
@@ -68,7 +52,7 @@ const DownloadTab = ({
                 <div className="button-row">
                     <button
                         className="btn btn-primary"
-                        onClick={handleExecuteAll}
+                        onClick={handleDownloadFromNSE}
                         disabled={nseLoading || exportLoading || !nseDate}
                     >
                         {nseLoading || exportLoading ? (
@@ -89,25 +73,14 @@ const DownloadTab = ({
                     </button>
                 </div>
 
-                {exportLog.length > 0 && (
-                    <div className="log-panel">
-                        <h4>Export Progress</h4>
-                        <ul>
-                            {exportLog.map((line, idx) => (
-                                <li key={idx}>{line}</li>
-                            ))}
-                        </ul>
-                    </div>
-                )}
             </div>
 
             <div className="card card-muted">
                 <h4 className="card-title">How it works</h4>
                 <ol className="steps-list">
                     <li>Select a date from the dropdown</li>
-                    <li>Click "Execute All Processes" to fetch data from NSE and generate report</li>
-                    <li>Monitor the progress in the log panel</li>
-                    <li>Download links will be available upon completion</li>
+                    <li>Click "Execute All Processes" to download NSE data for the selected date</li>
+                    <li>Data will be saved automatically to the backend</li>
                 </ol>
             </div>
         </section>

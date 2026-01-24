@@ -700,18 +700,6 @@ function App() {
                         />
                     )}
 
-                    {activeTab === 'download' && (
-                        <DownloadTab
-                            nseDate={nseDate}
-                            setNseDate={setNseDate}
-                            nseLoading={nseLoading}
-                            exportLoading={exportLoading}
-                            exportLog={exportLog}
-                            handleDownloadFromNSE={handleDownloadFromNSE}
-                            handleExportConsolidated={handleExportConsolidated}
-                        />
-                    )}
-
                     {activeTab === 'range' && (
                         <RangeTab
                             rangeStartDate={rangeStartDate}

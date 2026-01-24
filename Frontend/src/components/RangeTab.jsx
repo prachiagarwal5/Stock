@@ -73,7 +73,7 @@ const RangeTab = ({
                         className="btn btn-secondary btn-large"
                         style={{ background: '#ffe0b2', color: '#176a3a', fontWeight: 'bold', borderRadius: '12px', boxShadow: '0 2px 12px rgba(44,62,80,0.10)' }}
                         onClick={handleDownloadRangeFromNSE}
-                        disabled={rangeLoading || !rangeStartDate || !rangeEndDate}
+                        disabled={pipelineLoading || rangeLoading || !rangeStartDate || !rangeEndDate}
                         title="Download and save all CSVs to backend storage"
                     >
                         <span style={{ fontSize: '1.3rem' }}>⬇️</span> {rangeLoading ? 'Downloading...' : 'Download Range'}
@@ -82,7 +82,7 @@ const RangeTab = ({
                         className="btn btn-success btn-large"
                         style={{ background: '#b2dfdb', color: '#176a3a', fontWeight: 'bold', borderRadius: '12px', boxShadow: '0 2px 12px rgba(44,62,80,0.10)' }}
                         onClick={() => handleExportConsolidated('range')}
-                        disabled={exportLoading || !rangeStartDate || !rangeEndDate}
+                        disabled={pipelineLoading || exportLoading || !rangeStartDate || !rangeEndDate}
                         title="Build Excel (MCAP + PR) from saved CSVs in the selected range"
                     >
                         <span style={{ fontSize: '1.3rem' }}>📑</span> {exportLoading ? 'Exporting...' : 'Export Range Excel'}
@@ -91,7 +91,7 @@ const RangeTab = ({
                         className="btn btn-outline btn-large"
                         style={{ background: '#e0f2f1', color: '#176a3a', fontWeight: 'bold', borderRadius: '12px', boxShadow: '0 2px 12px rgba(44,62,80,0.10)' }}
                         onClick={handleBuildDashboard}
-                        disabled={dashboardLoading || !consolidationReady || !rangeStartDate || !rangeEndDate}
+                        disabled={pipelineLoading || dashboardLoading || !consolidationReady || !rangeStartDate || !rangeEndDate}
                         title={!rangeStartDate || !rangeEndDate ? "Select date range first" : (consolidationReady ? "Build symbol dashboard for top 1000 companies by Market Cap average" : "Export Excel first to calculate MCAP & PR averages")}
                     >
                         <span style={{ fontSize: '1.3rem' }}>📊</span> {dashboardLoading ? 'Building...' : consolidationReady ? 'Build Dashboard' : 'Build Dashboard (Export First)'}
@@ -310,103 +310,226 @@ const RangeTab = ({
             )}
 
             {dashboardResult && (
-                <div className="dashboard-panel card card-subtle" style={{ marginBottom: '24px', padding: '28px 32px', borderRadius: '18px', boxShadow: '0 2px 12px rgba(44,62,80,0.08)' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '18px' }}>
-                        <h3 style={{ fontWeight: '700', fontSize: '1.35rem', margin: '0', display: 'flex', alignItems: 'center' }}>
-                            <span style={{ fontSize: '1.5rem', marginRight: '10px' }}>📊</span> Symbol Dashboard
-                        </h3>
-                        <span style={{ background: '#f5faff', color: '#2d7ff9', border: '2px solid #e0e7ff', borderRadius: '18px', padding: '6px 18px', fontWeight: 'bold', fontSize: '1rem' }}>
+                <div className="dashboard-panel" style={{
+                    marginBottom: '32px',
+                    padding: '40px',
+                    borderRadius: '24px',
+                    background: 'linear-gradient(135deg, #f8fbff 0%, #ffffff 100%)',
+                    boxShadow: '0 8px 32px rgba(45, 127, 249, 0.12), 0 2px 8px rgba(0, 0, 0, 0.04)',
+                    border: '1px solid rgba(45, 127, 249, 0.08)'
+                }}>
+                    <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        marginBottom: '32px',
+                        paddingBottom: '24px',
+                        borderBottom: '2px solid #f0f5ff'
+                    }}>
+                        <div>
+                            <h3 style={{
+                                fontWeight: '800',
+                                fontSize: '1.75rem',
+                                margin: '0 0 8px 0',
+                                display: 'flex',
+                                alignItems: 'center',
+                                background: 'linear-gradient(135deg, #2d7ff9 0%, #1bb76e 100%)',
+                                WebkitBackgroundClip: 'text',
+                                WebkitTextFillColor: 'transparent',
+                                backgroundClip: 'text'
+                            }}>
+                                <span style={{ fontSize: '2rem', marginRight: '12px', filter: 'none', WebkitTextFillColor: 'initial' }}>📊</span>
+                                Symbol Dashboard
+                            </h3>
+                            <p style={{
+                                margin: 0,
+                                color: '#6b7280',
+                                fontSize: '0.95rem',
+                                fontWeight: '500'
+                            }}>
+                                Comprehensive market insights for top companies
+                            </p>
+                        </div>
+                        <div style={{
+                            background: 'linear-gradient(135deg, #2d7ff9 0%, #176a3a 100%)',
+                            color: '#fff',
+                            borderRadius: '20px',
+                            padding: '12px 24px',
+                            fontWeight: 'bold',
+                            fontSize: '1.1rem',
+                            boxShadow: '0 4px 16px rgba(45, 127, 249, 0.3)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px'
+                        }}>
+                            <span style={{ fontSize: '1.2rem' }}>🏢</span>
                             {dashboardResult.symbols_used || dashboardResult.count || 0} symbols
-                        </span>
-                    </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: '18px', marginBottom: '18px' }}>
-                        <div style={{ background: '#eafaf3', borderRadius: '12px', padding: '18px', textAlign: 'center', border: '2px solid #1bb76e22' }}>
-                            <div style={{ fontWeight: '600', color: '#7b8a8b', fontSize: '1.05rem', marginBottom: '8px' }}>IMPACT COST (AVG)</div>
-                            <div style={{ fontWeight: 'bold', fontSize: '2rem', color: '#222' }}>{dashboardResult.averages?.impact_cost ?? 'N/A'}</div>
-                        </div>
-                        <div style={{ background: '#eafaf3', borderRadius: '12px', padding: '18px', textAlign: 'center', border: '2px solid #1bb76e22' }}>
-                            <div style={{ fontWeight: '600', color: '#7b8a8b', fontSize: '1.05rem', marginBottom: '8px' }}>FREE FLOAT MCAP (AVG)</div>
-                            <div style={{ fontWeight: 'bold', fontSize: '2rem', color: '#222' }}>{dashboardResult.averages?.free_float_mcap ?? 'N/A'}</div>
-                        </div>
-                        <div style={{ background: '#eafaf3', borderRadius: '12px', padding: '18px', textAlign: 'center', border: '2px solid #1bb76e22' }}>
-                            <div style={{ fontWeight: '600', color: '#7b8a8b', fontSize: '1.05rem', marginBottom: '8px' }}>TOTAL MCAP (AVG)</div>
-                            <div style={{ fontWeight: 'bold', fontSize: '2rem', color: '#222' }}>{dashboardResult.averages?.total_market_cap ?? 'N/A'}</div>
-                        </div>
-                        <div style={{ background: '#eafaf3', borderRadius: '12px', padding: '18px', textAlign: 'center', border: '2px solid #1bb76e22' }}>
-                            <div style={{ fontWeight: '600', color: '#7b8a8b', fontSize: '1.05rem', marginBottom: '8px' }}>TRADED VALUE (AVG)</div>
-                            <div style={{ fontWeight: 'bold', fontSize: '2rem', color: '#222' }}>{dashboardResult.averages?.total_traded_value ?? 'N/A'}</div>
                         </div>
                     </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
                         <button
                             className="btn btn-warning btn-large"
-                            style={{ background: '#ffa726', color: '#fff', fontWeight: 'bold', borderRadius: '10px', fontSize: '1.08rem', padding: '12px 32px', boxShadow: '0 2px 8px rgba(44,62,80,0.08)' }}
+                            style={{
+                                background: 'linear-gradient(135deg, #ffa726 0%, #fb8c00 100%)',
+                                color: '#fff',
+                                fontWeight: '700',
+                                borderRadius: '16px',
+                                fontSize: '1.1rem',
+                                padding: '16px 36px',
+                                boxShadow: '0 6px 24px rgba(255, 167, 38, 0.35)',
+                                border: 'none',
+                                cursor: 'pointer',
+                                transition: 'all 0.3s ease',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '10px'
+                            }}
                             onClick={handleDownloadDashboard}
                             disabled={!dashboardResult.download_url}
                         >
-                            <span style={{ fontSize: '1.2rem', marginRight: '8px' }}>⬇️</span> Download Dashboard Excel
+                            <span style={{ fontSize: '1.3rem' }}>⬇️</span> Download Dashboard Excel
+                        </button>
+                        <button
+                            className="btn btn-success btn-large"
+                            style={{
+                                background: 'linear-gradient(135deg, #66bb6a 0%, #43a047 100%)',
+                                color: '#fff',
+                                fontWeight: '700',
+                                borderRadius: '16px',
+                                fontSize: '1.1rem',
+                                padding: '16px 36px',
+                                boxShadow: '0 6px 24px rgba(76, 175, 80, 0.35)',
+                                border: 'none',
+                                cursor: 'pointer',
+                                transition: 'all 0.3s ease',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '10px'
+                            }}
+                            onClick={() => handleExportConsolidated('range')}
+                            disabled={exportLoading || !rangeStartDate || !rangeEndDate}
+                        >
+                            <span style={{ fontSize: '1.3rem' }}>📑</span> Export Range Excel
                         </button>
                         {dashboardResult.errors && dashboardResult.errors.length > 0 && (
-                            <div style={{ marginTop: '16px' }}>
-                                <span style={{ background: '#ffeaea', color: '#e74c3c', borderRadius: '18px', padding: '8px 18px', fontWeight: 'bold', fontSize: '1rem', border: '2px solid #ffd6d6' }}>
-                                    {dashboardResult.errors.length} symbols failed
-                                </span>
-
+                            <div style={{ marginTop: '0', width: '100%' }}>
                                 <div style={{
-                                    marginTop: '16px',
-                                    background: '#fff',
-                                    border: '1px solid #ffd6d6',
-                                    borderRadius: '12px',
-                                    padding: '16px',
-                                    boxShadow: '0 2px 8px rgba(231, 76, 60, 0.05)'
+                                    background: 'linear-gradient(135deg, #fff5f5 0%, #ffffff 100%)',
+                                    borderRadius: '20px',
+                                    padding: '24px 28px',
+                                    border: '1px solid rgba(231, 76, 60, 0.15)',
+                                    boxShadow: '0 4px 20px rgba(231, 76, 60, 0.08)'
                                 }}>
-                                    <h4 style={{
-                                        color: '#e74c3c',
-                                        marginTop: 0,
-                                        marginBottom: '12px',
+                                    <div style={{
                                         display: 'flex',
                                         alignItems: 'center',
-                                        gap: '8px',
-                                        fontSize: '1.1rem'
+                                        justifyContent: 'space-between',
+                                        marginBottom: '20px'
                                     }}>
-                                        <span>⚠️</span> List of Failed Symbols
-                                    </h4>
-                                    <div style={{
-                                        maxHeight: '250px',
-                                        overflowY: 'auto',
-                                        border: '1px solid #f5f5f5',
-                                        borderRadius: '8px'
-                                    }}>
-                                        <table style={{
-                                            width: '100%',
-                                            borderCollapse: 'collapse',
-                                            fontSize: '0.92rem'
+                                        <h4 style={{
+                                            color: '#e74c3c',
+                                            margin: 0,
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '10px',
+                                            fontSize: '1.2rem',
+                                            fontWeight: '700'
                                         }}>
-                                            <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}>
-                                                <tr style={{ background: '#f8f9fa', textAlign: 'left' }}>
-                                                    <th style={{ padding: '10px 12px', borderBottom: '2px solid #eee', color: '#666' }}>Symbol</th>
-                                                    <th style={{ padding: '10px 12px', borderBottom: '2px solid #eee', color: '#666' }}>Reason / Error</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody>
-                                                {dashboardResult.errors.map((err, idx) => (
-                                                    <tr key={idx} style={{
-                                                        borderBottom: '1px solid #f5f5f5',
-                                                        background: idx % 2 === 0 ? '#fff' : '#fffcfc'
-                                                    }}>
-                                                        <td style={{ padding: '10px 12px', fontWeight: 'bold', color: '#333', width: '30%' }}>
-                                                            {err.symbol || 'N/A'}
-                                                        </td>
-                                                        <td style={{ padding: '10px 12px', color: '#666', lineHeight: '1.4' }}>
-                                                            {err.error || 'Unknown error'}
-                                                        </td>
-                                                    </tr>
-                                                ))}
-                                            </tbody>
-                                        </table>
+                                            <span style={{ fontSize: '1.4rem' }}>⚠️</span> Failed Symbols
+                                        </h4>
+                                        <span style={{
+                                            background: '#ffeaea',
+                                            color: '#e74c3c',
+                                            borderRadius: '16px',
+                                            padding: '8px 18px',
+                                            fontWeight: 'bold',
+                                            fontSize: '0.95rem',
+                                            border: '2px solid #ffd6d6'
+                                        }}>
+                                            {dashboardResult.errors.length} errors
+                                        </span>
                                     </div>
-                                    <div style={{ marginTop: '12px', fontSize: '0.85rem', color: '#888', fontStyle: 'italic' }}>
-                                        * Symbols failing to fetch data or missing mandatory index mapping are listed above.
+                                    <div style={{
+                                        background: '#fff',
+                                        borderRadius: '16px',
+                                        overflow: 'hidden',
+                                        border: '1px solid #f5f5f5',
+                                        boxShadow: '0 2px 8px rgba(0, 0, 0, 0.03)'
+                                    }}>
+                                        <div style={{
+                                            maxHeight: '300px',
+                                            overflowY: 'auto'
+                                        }}>
+                                            <table style={{
+                                                width: '100%',
+                                                borderCollapse: 'collapse',
+                                                fontSize: '0.95rem'
+                                            }}>
+                                                <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}>
+                                                    <tr style={{
+                                                        background: 'linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%)',
+                                                        textAlign: 'left'
+                                                    }}>
+                                                        <th style={{
+                                                            padding: '14px 18px',
+                                                            borderBottom: '2px solid #e0e0e0',
+                                                            color: '#555',
+                                                            fontWeight: '700',
+                                                            fontSize: '0.9rem',
+                                                            textTransform: 'uppercase',
+                                                            letterSpacing: '0.5px'
+                                                        }}>Symbol</th>
+                                                        <th style={{
+                                                            padding: '14px 18px',
+                                                            borderBottom: '2px solid #e0e0e0',
+                                                            color: '#555',
+                                                            fontWeight: '700',
+                                                            fontSize: '0.9rem',
+                                                            textTransform: 'uppercase',
+                                                            letterSpacing: '0.5px'
+                                                        }}>Reason / Error</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {dashboardResult.errors.map((err, idx) => (
+                                                        <tr key={idx} style={{
+                                                            borderBottom: '1px solid #f5f5f5',
+                                                            background: idx % 2 === 0 ? '#fff' : '#fafafa',
+                                                            transition: 'background 0.2s ease'
+                                                        }}>
+                                                            <td style={{
+                                                                padding: '14px 18px',
+                                                                fontWeight: '700',
+                                                                color: '#e74c3c',
+                                                                width: '25%'
+                                                            }}>
+                                                                {err.symbol || 'N/A'}
+                                                            </td>
+                                                            <td style={{
+                                                                padding: '14px 18px',
+                                                                color: '#666',
+                                                                lineHeight: '1.5',
+                                                                fontSize: '0.92rem'
+                                                            }}>
+                                                                {err.error || 'Unknown error'}
+                                                            </td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                    <div style={{
+                                        marginTop: '16px',
+                                        fontSize: '0.88rem',
+                                        color: '#999',
+                                        fontStyle: 'italic',
+                                        padding: '12px 16px',
+                                        background: '#fafafa',
+                                        borderRadius: '12px',
+                                        border: '1px solid #f0f0f0'
+                                    }}>
+                                        💡 Symbols that failed to fetch data or are missing mandatory index mapping are listed above.
                                     </div>
                                 </div>
                             </div>
