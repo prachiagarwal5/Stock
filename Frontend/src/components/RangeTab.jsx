@@ -347,9 +347,69 @@ const RangeTab = ({
                             <span style={{ fontSize: '1.2rem', marginRight: '8px' }}>⬇️</span> Download Dashboard Excel
                         </button>
                         {dashboardResult.errors && dashboardResult.errors.length > 0 && (
-                            <span style={{ background: '#ffeaea', color: '#e74c3c', borderRadius: '18px', padding: '8px 18px', fontWeight: 'bold', fontSize: '1rem', border: '2px solid #ffd6d6' }}>
-                                {dashboardResult.errors.length} symbols failed
-                            </span>
+                            <div style={{ marginTop: '16px' }}>
+                                <span style={{ background: '#ffeaea', color: '#e74c3c', borderRadius: '18px', padding: '8px 18px', fontWeight: 'bold', fontSize: '1rem', border: '2px solid #ffd6d6' }}>
+                                    {dashboardResult.errors.length} symbols failed
+                                </span>
+
+                                <div style={{
+                                    marginTop: '16px',
+                                    background: '#fff',
+                                    border: '1px solid #ffd6d6',
+                                    borderRadius: '12px',
+                                    padding: '16px',
+                                    boxShadow: '0 2px 8px rgba(231, 76, 60, 0.05)'
+                                }}>
+                                    <h4 style={{
+                                        color: '#e74c3c',
+                                        marginTop: 0,
+                                        marginBottom: '12px',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '8px',
+                                        fontSize: '1.1rem'
+                                    }}>
+                                        <span>⚠️</span> List of Failed Symbols
+                                    </h4>
+                                    <div style={{
+                                        maxHeight: '250px',
+                                        overflowY: 'auto',
+                                        border: '1px solid #f5f5f5',
+                                        borderRadius: '8px'
+                                    }}>
+                                        <table style={{
+                                            width: '100%',
+                                            borderCollapse: 'collapse',
+                                            fontSize: '0.92rem'
+                                        }}>
+                                            <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}>
+                                                <tr style={{ background: '#f8f9fa', textAlign: 'left' }}>
+                                                    <th style={{ padding: '10px 12px', borderBottom: '2px solid #eee', color: '#666' }}>Symbol</th>
+                                                    <th style={{ padding: '10px 12px', borderBottom: '2px solid #eee', color: '#666' }}>Reason / Error</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {dashboardResult.errors.map((err, idx) => (
+                                                    <tr key={idx} style={{
+                                                        borderBottom: '1px solid #f5f5f5',
+                                                        background: idx % 2 === 0 ? '#fff' : '#fffcfc'
+                                                    }}>
+                                                        <td style={{ padding: '10px 12px', fontWeight: 'bold', color: '#333', width: '30%' }}>
+                                                            {err.symbol || 'N/A'}
+                                                        </td>
+                                                        <td style={{ padding: '10px 12px', color: '#666', lineHeight: '1.4' }}>
+                                                            {err.error || 'Unknown error'}
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    <div style={{ marginTop: '12px', fontSize: '0.85rem', color: '#888', fontStyle: 'italic' }}>
+                                        * Symbols failing to fetch data or missing mandatory index mapping are listed above.
+                                    </div>
+                                </div>
+                            </div>
                         )}
                     </div>
                 </div>

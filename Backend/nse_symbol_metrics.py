@@ -353,10 +353,19 @@ class SymbolMetricsFetcher:
             if replaced_index_count > 0:
                 source = "MongoDB" if nifty_indices_collection is not None else "Nifty CSV files"
                 print(f"[build_dashboard] ✓ Replaced index data for {replaced_index_count}/{len(rows)} symbols from {source}")
-            if not_found_symbols and len(not_found_symbols) <= 10:
-                print(f"[build_dashboard] ⚠️ {len(not_found_symbols)} symbols not found in DB: {', '.join(not_found_symbols)}")
-            elif not_found_symbols:
-                print(f"[build_dashboard] ⚠️ {len(not_found_symbols)} symbols not found in index database")
+            
+            if not_found_symbols:
+                if len(not_found_symbols) <= 10:
+                    print(f"[build_dashboard] ⚠️ {len(not_found_symbols)} symbols not found in DB: {', '.join(not_found_symbols)}")
+                else:
+                    print(f"[build_dashboard] ⚠️ {len(not_found_symbols)} symbols not found in index database")
+                
+                # Report these as informational errors to the frontend
+                for sym in not_found_symbols:
+                    errors.append({
+                        'symbol': sym,
+                        'error': 'Symbol not found in Nifty Index database. Index data cleared.'
+                    })
         
         # Override API values with data from symbol_mcap_data if available
         replaced_mcap = 0
