@@ -15,7 +15,10 @@ const RangeTab = ({
     handleDownloadRangeFromNSE,
     handleExportConsolidated,
     handleBuildDashboard,
-    handleDownloadDashboard
+    handleDownloadDashboard,
+    handleFullPipeline,
+    pipelineLoading,
+    pipelineStage
 }) => {
     return (
         <section className="section range-tab-section">
@@ -56,7 +59,16 @@ const RangeTab = ({
                     </span>
                 </div>
 
-                <div className="action-row action-row-spaced" style={{ display: 'flex', gap: '18px', marginBottom: '24px' }}>
+                <div className="action-row action-row-spaced" style={{ display: 'flex', gap: '18px', marginBottom: '24px', flexWrap: 'wrap' }}>
+                    <button
+                        className="btn btn-primary btn-large"
+                        style={{ background: 'linear-gradient(135deg, #2d7ff9 0%, #176a3a 100%)', color: '#fff', fontWeight: '800', borderRadius: '12px', boxShadow: '0 4px 15px rgba(45, 127, 249, 0.3)', flex: '1 1 100%', marginBottom: '10px' }}
+                        onClick={handleFullPipeline}
+                        disabled={pipelineLoading || rangeLoading || exportLoading || dashboardLoading || !rangeStartDate || !rangeEndDate}
+                        title="Run Download -> Export -> Dashboard in one go"
+                    >
+                        <span style={{ fontSize: '1.4rem', marginRight: '8px' }}>🚀</span> {pipelineLoading ? 'Running Pipeline...' : 'Run Full Pipeline (One-Click)'}
+                    </button>
                     <button
                         className="btn btn-secondary btn-large"
                         style={{ background: '#ffe0b2', color: '#176a3a', fontWeight: 'bold', borderRadius: '12px', boxShadow: '0 2px 12px rgba(44,62,80,0.10)' }}
@@ -86,12 +98,43 @@ const RangeTab = ({
                     </button>
                 </div>
 
+                {/* Full Pipeline Progress Indicator */}
+                {pipelineLoading && (
+                    <div style={{
+                        background: 'linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%)',
+                        borderRadius: '16px',
+                        padding: '24px 28px',
+                        marginBottom: '24px',
+                        border: '2px solid #64b5f6',
+                        boxShadow: '0 4px 20px rgba(33, 150, 243, 0.15)'
+                    }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                            <div className="pipeline-spinner" style={{
+                                width: '40px',
+                                height: '40px',
+                                border: '4px solid #e0e0e0',
+                                borderTop: '4px solid #2196f3',
+                                borderRadius: '50%',
+                                animation: 'spin 1s linear infinite'
+                            }} />
+                            <div>
+                                <div style={{ fontWeight: 'bold', fontSize: '1.2rem', color: '#1565c0' }}>
+                                    ⚡ Pipeline Running...
+                                </div>
+                                <div style={{ color: '#0d47a1', fontSize: '1.05rem', marginTop: '4px', fontWeight: '600' }}>
+                                    Current Stage: {pipelineStage}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
                 {/* Dashboard Building Progress Indicator */}
                 {dashboardLoading && (
-                    <div style={{ 
-                        background: 'linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%)', 
-                        borderRadius: '16px', 
-                        padding: '24px 28px', 
+                    <div style={{
+                        background: 'linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%)',
+                        borderRadius: '16px',
+                        padding: '24px 28px',
                         marginBottom: '24px',
                         border: '2px solid #81c784',
                         boxShadow: '0 4px 20px rgba(76, 175, 80, 0.15)'
@@ -110,19 +153,19 @@ const RangeTab = ({
                                     🔄 Building Dashboard...
                                 </div>
                                 <div style={{ color: '#558b2f', fontSize: '0.95rem', marginTop: '4px' }}>
-                                    {dashboardBatchProgress 
+                                    {dashboardBatchProgress
                                         ? `Batch ${dashboardBatchProgress.currentBatch}/${dashboardBatchProgress.totalBatches}: ${dashboardBatchProgress.status}`
                                         : 'Initializing...'}
                                 </div>
                             </div>
                         </div>
-                        
+
                         {/* Progress Bar */}
                         {dashboardBatchProgress && (
                             <div style={{ marginBottom: '16px' }}>
-                                <div style={{ 
-                                    background: '#fff', 
-                                    borderRadius: '10px', 
+                                <div style={{
+                                    background: '#fff',
+                                    borderRadius: '10px',
                                     height: '24px',
                                     overflow: 'hidden',
                                     border: '1px solid #a5d6a7'
@@ -148,10 +191,10 @@ const RangeTab = ({
                                 </div>
                             </div>
                         )}
-                        
-                        <div style={{ 
-                            background: '#fff', 
-                            borderRadius: '10px', 
+
+                        <div style={{
+                            background: '#fff',
+                            borderRadius: '10px',
                             padding: '14px 18px',
                             border: '1px solid #a5d6a7'
                         }}>

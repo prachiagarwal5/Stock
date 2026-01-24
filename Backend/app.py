@@ -309,7 +309,7 @@ def upsert_symbol_metrics(row, source='nse_symbol_metrics'):
         print(f"⚠️ Failed to upsert symbol_metrics for {row.get('symbol')}: {exc}")
 
 
-def persist_consolidated_results(consolidator, data_type, source='consolidation'):
+def persist_consolidated_results(consolidator, data_type, source='consolidation', skip_daily=False):
     """Store per-symbol per-date values and averages into MongoDB using bulk operations."""
     if consolidator is None:
         return
@@ -350,6 +350,8 @@ def persist_consolidated_results(consolidator, data_type, source='consolidation'
                     'source': source,
                     'updated_at': datetime.now().isoformat()
                 }
+                if hasattr(consolidator, 'avg_ff_col'):
+                    payload['avg_free_float'] = _safe_float(row.get(consolidator.avg_ff_col))
                 aggregate_ops.append(
                     UpdateOne(
                         {'symbol': symbol, 'type': data_type},
@@ -392,7 +394,7 @@ def persist_consolidated_results(consolidator, data_type, source='consolidation'
             symbol_aggregates_collection.bulk_write(aggregate_ops, ordered=False)
             print(f"[persist] ✓ Aggregates saved")
 
-        if daily_ops and symbol_daily_collection is not None:
+        if daily_ops and symbol_daily_collection is not None and not skip_daily:
             batch_size = 1000
             print(f"[persist] Executing {len(daily_ops)} daily operations in batches of {batch_size}...")
             for i in range(0, len(daily_ops), batch_size):
@@ -854,14 +856,15 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
         
         # Determine broader index (use DB index if available, fallback to primary_index or API index)
         def get_broader_index(row):
-            # Try DB index first, then primary_index, then API index
-            index = row.get('index') or row.get('primary_index') or row.get('index_from_api')
+            # Strictly use Index (DB) per user request
+            index = row.get('index')
             if not index or pd.isna(index):
                 return ''
-            index_upper = str(index).upper()
-            nifty_500_indices = ['NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 150', 'NIFTY SMALLCAP 250', 'NIFTY MICROCAP 250']
-            for idx in nifty_500_indices:
-                if idx.replace(' ', '') in index_upper.replace(' ', ''):
+            index_upper = str(index).upper().replace(' ', '')
+            # Only Nifty 50, Next 50, Midcap 150, Smallcap 250 qualify for NIFTY 500 broader label
+            qualifying_indices = ['NIFTY50', 'NIFTYNEXT50', 'NIFTYMIDCAP150', 'NIFTYSMALLCAP250']
+            for q_idx in qualifying_indices:
+                if q_idx == index_upper:
                     return 'NIFTY 500'
             return ''
         
@@ -895,9 +898,7 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             ('Symbol', 'symbol'),
             ('Company name', 'companyName'),
             ('Index (DB)', 'index'),  # Index from Nifty DB
-            ('Index List (DB)', 'indexList'),  # All indices from DB
             ('Index (API)', 'index_from_api'),  # Original API index
-            ('Index List (API)', 'indexList_from_api'),  # Original API index list
             ('avg Impact cost', 'impact_cost'),
             ('avg total market cap', 'total_market_cap'),
             ('Avg Free float market cap', 'free_float_mcap'),
@@ -956,19 +957,17 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             'B': (12, None),  # Symbol
             'C': (30, None),  # Company name
             'D': (20, None),  # Index (DB)
-            'E': (30, None),  # Index List (DB)
-            'F': (20, None),  # Index (API)
-            'G': (30, None),  # Index List (API)
-            'H': (15, numbers.FORMAT_NUMBER_00),  # avg Impact cost
-            'I': (20, '#,##0.00'),  # avg total market cap
-            'J': (22, '#,##0.00'),  # Avg Free float market cap
-            'K': (20, '#,##0.00'),  # Avg daily traded value
-            'L': (15, None),  # Day of Listing
-            'M': (15, None),  # Broader Index
-            'N': (13, None),  # listed> 6months
-            'O': (13, None),  # listed> 1 months
-            'P': (18, '0.0000'),  # Ratio of avg free float to avg total market cap
-            'Q': (18, '0.0000'),  # ratio of free float to avg total market cap
+            'E': (20, None),  # Index (API)
+            'F': (15, numbers.FORMAT_NUMBER_00),  # avg Impact cost
+            'G': (20, '#,##0.00'),  # avg total market cap
+            'H': (22, '#,##0.00'),  # Avg Free float market cap
+            'I': (20, '#,##0.00'),  # Avg daily traded value
+            'J': (15, None),  # Day of Listing
+            'K': (15, None),  # Broader Index
+            'L': (13, None),  # listed> 6months
+            'M': (13, None),  # listed> 1 months
+            'N': (18, '0.0000'),  # Ratio of avg free float to avg total market cap
+            'O': (18, '0.0000'),  # ratio of free float to avg total market cap
         }
         
         # Apply column formatting
@@ -1702,6 +1701,7 @@ def nse_symbol_dashboard():
                         if sym not in symbol_mcap_data:
                             symbol_mcap_data[sym] = {}
                         symbol_mcap_data[sym]['avg_mcap'] = doc.get('average')
+                        symbol_mcap_data[sym]['avg_free_float'] = doc.get('avg_free_float')
                 print(f"[dashboard] Loaded {mcap_count} MCAP averages from DB")
                 
                 if mcap_count == 0 and pr_count == 0:
@@ -1980,6 +1980,7 @@ def consolidate_saved():
             file_type = payload.get('file_type', 'both')
             # Allow control of fast mode via payload - default False to persist averages to DB
             fast_mode = payload.get('fast_mode', False)
+            skip_daily = payload.get('skip_daily', True) # Default to True for faster performance
             allow_missing = payload.get('allow_missing', True)
 
             if file_type not in ['mcap', 'pr', 'both']:
@@ -2059,8 +2060,8 @@ def consolidate_saved():
                     ))
                     if not fast_mode:
                         persist_start = time.perf_counter()
-                        add_log("Starting MCAP persistence to Mongo (saving averages)...")
-                        persist_consolidated_results(consolidator_mcap, 'mcap', source='cached_db')
+                        add_log(f"Starting MCAP persistence to Mongo (saving averages, skip_daily={skip_daily})...")
+                        persist_consolidated_results(consolidator_mcap, 'mcap', source='cached_db', skip_daily=skip_daily)
                         add_log(f"✓ Persisted {companies_count} MCAP averages to DB in {time.perf_counter() - persist_start:.2f}s")
                         persisted = True
                     else:
@@ -2095,8 +2096,8 @@ def consolidate_saved():
                     add_log(f"✓ PR Excel file created: {pr_output_path}")
                     if not fast_mode:
                         persist_start = time.perf_counter()
-                        add_log("Starting PR persistence to Mongo (saving averages)...")
-                        persist_consolidated_results(consolidator_pr, 'pr', source='cached_db')
+                        add_log(f"Starting PR persistence to Mongo (saving averages, skip_daily={skip_daily})...")
+                        persist_consolidated_results(consolidator_pr, 'pr', source='cached_db', skip_daily=skip_daily)
                         add_log(f"✓ Persisted {companies_count_pr} PR averages to DB in {time.perf_counter() - persist_start:.2f}s")
                         persisted_pr = True
                     else:

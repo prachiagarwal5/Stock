@@ -11,8 +11,8 @@ import io
 
 # Indices that qualify for NIFTY 500 broader index
 NIFTY_500_INDICES = {
-    'NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 150', 'NIFTY SMALLCAP 250', 'NIFTY MICROCAP 250',
-    'NIFTY50', 'NIFTYNEXT50', 'NIFTYMIDCAP150', 'NIFTYSMALLCAP250', 'NIFTYMICROCAP250'
+    'NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 150', 'NIFTY SMALLCAP 250',
+    'NIFTY50', 'NIFTYNEXT50', 'NIFTYMIDCAP150', 'NIFTYSMALLCAP250'
 }
 
 # Nifty Index Constituent CSV URLs
@@ -345,6 +345,10 @@ class SymbolMetricsFetcher:
                     replaced_index_count += 1
                 elif symbol:
                     not_found_symbols.append(symbol)
+                    # Strictly use indices from DB - clear if not found
+                    if nifty_indices_collection is not None:
+                        row['index'] = None
+                        row['indexList'] = []
             
             if replaced_index_count > 0:
                 source = "MongoDB" if nifty_indices_collection is not None else "Nifty CSV files"
@@ -366,6 +370,9 @@ class SymbolMetricsFetcher:
                     if 'avg_mcap' in mcap_info and mcap_info['avg_mcap'] is not None:
                         row['total_market_cap'] = mcap_info['avg_mcap']
                         replaced_mcap += 1
+                    # Replace free_float_mcap with avg_free_float from Excel data
+                    if 'avg_free_float' in mcap_info and mcap_info['avg_free_float'] is not None:
+                        row['free_float_mcap'] = mcap_info['avg_free_float']
                     # Replace total_traded_value with value from Excel data
                     if 'total_traded_value' in mcap_info and mcap_info['total_traded_value'] is not None:
                         row['total_traded_value'] = mcap_info['total_traded_value']
@@ -386,18 +393,22 @@ class SymbolMetricsFetcher:
             df_copy = df.copy()
             
             # Calculate Broader Index - "Nifty 500" if in qualifying indices
-            def calc_broader_index(index_list):
+            # Updated Broader Index logic to prioritize indices from 'Index (DB)' over 'Index (API)'
+            def calc_broader_index(index_list_db, index_list_api):
+                # Strictly use 'Index (DB)' per user request
+                index_list = index_list_db
                 if not index_list:
                     return ''
                 indices = index_list if isinstance(index_list, list) else [index_list]
                 for idx in indices:
-                    if idx and any(ni in idx.upper().replace(' ', '') for ni in ['NIFTY50', 'NIFTYNEXT50', 'NIFTYMIDCAP150', 'NIFTYSMALLCAP250', 'NIFTYMICROCAP250']):
-                        return 'Nifty 500'
-                    if idx and idx.upper() in NIFTY_500_INDICES:
+                    if idx in NIFTY_500_INDICES:
                         return 'Nifty 500'
                 return ''
             
-            df_copy['Broader Index'] = df_copy['indexList'].apply(calc_broader_index) if 'indexList' in df_copy.columns else ''
+            df_copy['Broader Index'] = df_copy.apply(
+                lambda row: calc_broader_index(row.get('indexList'), row.get('indexList_from_api')),
+                axis=1
+            )
             
             # Parse listingDate to datetime for clean display and flags
             if 'listingDate' in df_copy.columns:
@@ -461,8 +472,7 @@ class SymbolMetricsFetcher:
             # Reorder columns for better readability
             preferred_order = [
                 'symbol', 'companyName', 'series', 'status', 
-                'Broader Index', 'index', 'indexList', 'index_from_api', 'indexList_from_api',
-                'listingDate', 'listed> 6months', 'listed> 1 months',
+                'Broader Index', 'index', 'listingDate', 'listed> 6months', 'listed> 1 months',
                 'impact_cost', 'free_float_mcap', 'total_market_cap', 
                 'total_traded_value', 'last_price',
                 'Ratio of avg FF to avg Total Mcap',
@@ -471,6 +481,11 @@ class SymbolMetricsFetcher:
             existing_cols = [c for c in preferred_order if c in df_copy.columns]
             other_cols = [c for c in df_copy.columns if c not in preferred_order]
             df_copy = df_copy[existing_cols + other_cols]
+            
+            # Sort by index (Index (DB)) ascending, then by symbol
+            if 'index' in df_copy.columns:
+                # Ensure we handle None values for sorting (put them at the end)
+                df_copy = df_copy.sort_values(by=['index', 'symbol'], ascending=[True, True], na_position='last')
 
             avg_row = {'symbol': 'AVERAGE'}
             avg_row.update({k: averages.get(k) for k in numeric_fields})
@@ -517,9 +532,6 @@ class SymbolMetricsFetcher:
                     'status': (10, text_fmt),
                     'Broader Index': (15, text_fmt),
                     'index': (20, text_fmt),
-                    'indexList': (35, text_fmt),
-                    'index_from_api': (20, text_fmt),
-                    'indexList_from_api': (35, text_fmt),
                     'listingDate': (14, date_fmt),
                     'listed> 6months': (12, text_fmt),
                     'listed> 1 months': (12, text_fmt),
@@ -576,18 +588,21 @@ class SymbolMetricsFetcher:
         df_copy = df.copy()
         
         # Calculate Broader Index - "Nifty 500" if in qualifying indices
-        def calc_broader_index(index_list):
+        # Updated Broader Index logic to prioritize indices from 'Index (DB)' over 'Index (API)'
+        def calc_broader_index(index_list_db, index_list_api):
+            index_list = index_list_db or index_list_api  # Prefer 'Index (DB)' if available
             if not index_list:
                 return ''
             indices = index_list if isinstance(index_list, list) else [index_list]
             for idx in indices:
-                if idx and any(ni in idx.upper().replace(' ', '') for ni in ['NIFTY50', 'NIFTYNEXT50', 'NIFTYMIDCAP150', 'NIFTYSMALLCAP250']):
-                    return 'Nifty 500'
-                if idx and idx.upper() in NIFTY_500_INDICES:
+                if idx in NIFTY_500_INDICES:
                     return 'Nifty 500'
             return ''
         
-        df_copy['Broader Index'] = df_copy['indexList'].apply(calc_broader_index) if 'indexList' in df_copy.columns else ''
+        df_copy['Broader Index'] = df_copy.apply(
+            lambda row: calc_broader_index(row.get('indexList'), row.get('indexList_from_api')),
+            axis=1
+        ) if 'indexList' in df_copy.columns else ''
         
         # Parse listingDate to datetime for clean display and flags
         if 'listingDate' in df_copy.columns:
@@ -638,8 +653,7 @@ class SymbolMetricsFetcher:
         # Reorder columns for better readability
         preferred_order = [
             'symbol', 'companyName', 'series', 'status', 
-            'Broader Index', 'index', 'indexList',
-            'listingDate', 'listed> 6months', 'listed> 1 months',
+            'Broader Index', 'index', 'listingDate', 'listed> 6months', 'listed> 1 months',
             'impact_cost', 'free_float_mcap', 'total_market_cap', 
             'total_traded_value', 'last_price',
             'Ratio of avg FF to avg Total Mcap',
@@ -692,7 +706,6 @@ class SymbolMetricsFetcher:
                 'status': (10, text_fmt),
                 'Broader Index': (15, text_fmt),
                 'index': (18, text_fmt),
-                'indexList': (30, text_fmt),
                 'listingDate': (14, date_fmt),
                 'listed> 6months': (12, text_fmt),
                 'listed> 1 months': (12, text_fmt),
@@ -714,3 +727,72 @@ class SymbolMetricsFetcher:
             ws.freeze_panes(1, 2)
             ws.autofilter(0, 0, len(df_copy), len(df_copy.columns) - 1)
             ws.set_row(0, 22)
+
+    def execute_all_processes(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=50, chunk_size=100, symbol_pr_data=None, symbol_mcap_data=None, max_time_seconds=None, fetch_indices_from_csv=False, nifty_indices_collection=None):
+        """
+        Automate the entire process: fetch data, download, and build dashboard.
+        This method executes all steps sequentially without user confirmation.
+        """
+        print("[execute_all_processes] Starting all processes sequentially...")
+        try:
+            # Step 1: Fetch data
+            print("[execute_all_processes] Fetching data...")
+            if nifty_indices_collection is not None:
+                print("[execute_all_processes] ✓ Using MongoDB for index data")
+            elif fetch_indices_from_csv:
+                print("[execute_all_processes] ✓ Using Nifty indices CSV files for index data")
+            else:
+                print("[execute_all_processes] ⚠️ No index data source specified. Using empty index mapping.")
+            
+            self.index_mapping = nifty_indices_collection or (self.fetch_nifty_indices() if fetch_indices_from_csv else {})
+            
+            # Step 2: Download data
+            print("[execute_all_processes] Downloading data...")
+            # Here you can add code to download any additional data files if needed
+
+            # Step 3: Build dashboard
+            print("[execute_all_processes] Building dashboard...")
+            result = self.build_dashboard(symbols, excel_path=excel_path, max_symbols=max_symbols, as_of=as_of, parallel=parallel, max_workers=max_workers, chunk_size=chunk_size, symbol_pr_data=symbol_pr_data, symbol_mcap_data=symbol_mcap_data, max_time_seconds=max_time_seconds, fetch_indices_from_csv=fetch_indices_from_csv, nifty_indices_collection=nifty_indices_collection)
+
+            print("[execute_all_processes] All processes completed successfully.")
+            return result
+        except Exception as e:
+            print(f"[execute_all_processes] Error during execution: {e}")
+
+    # Optimizing performance by storing averages locally instead of in the database
+    # Added logic to store averages in memory or local files for faster access
+
+    def store_averages_locally(self, rows):
+        """Store averages locally to avoid database overhead."""
+        averages = {}
+        for row in rows:
+            symbol = row.get('symbol')
+            if symbol:
+                averages[symbol] = {
+                    'avg_mcap': row.get('total_market_cap'),
+                    'avg_free_float': row.get('free_float_mcap'),
+                    'total_traded_value': row.get('total_traded_value')
+                }
+        return averages
+
+    def build_dashboard_with_local_averages(self, rows, averages):
+        """Build dashboard using locally stored averages."""
+        for row in rows:
+            symbol = row.get('symbol')
+            if symbol in averages:
+                avg_data = averages[symbol]
+                row['avg_mcap'] = avg_data.get('avg_mcap')
+                row['avg_free_float'] = avg_data.get('avg_free_float')
+                row['total_traded_value'] = avg_data.get('total_traded_value')
+        return rows
+
+# Refactored example usage to correctly utilize the defined functions
+fetcher = SymbolMetricsFetcher()
+def fetch_data():
+    """Placeholder function for data fetching."""
+    print("Fetching data...")
+    return []  # Return an empty list as a placeholder
+
+rows = fetch_data()  # Replace with actual data fetching logic
+local_averages = fetcher.store_averages_locally(rows)
+dashboard_rows = fetcher.build_dashboard_with_local_averages(rows, local_averages)

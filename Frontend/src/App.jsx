@@ -15,6 +15,8 @@ const VITE_API_URL = import.meta.env.VITE_API_URL;
 function App() {
     const [uploadedFiles, setUploadedFiles] = useState([]);
     const [loading, setLoading] = useState(false);
+    const [pipelineLoading, setPipelineLoading] = useState(false);
+    const [pipelineStage, setPipelineStage] = useState('');
     const [preview, setPreview] = useState(null);
     const [error, setError] = useState(null);
     const [success, setSuccess] = useState(null);
@@ -220,8 +222,8 @@ function App() {
         }
     };
 
-    const handleExportConsolidated = async (scope = 'date') => {
-        const payload = { file_type: 'both', fast_mode: false }; // persist averages to DB
+    const handleExportConsolidated = async (scope = 'date', skipDaily = true) => {
+        const payload = { file_type: 'both', fast_mode: false, skip_daily: skipDaily }; // persist averages to DB
         setExportLog(['Starting export...']);
 
         if (scope === 'range') {
@@ -586,6 +588,91 @@ function App() {
         }
     };
 
+    const handleFullPipeline = async () => {
+        if (!rangeStartDate || !rangeEndDate) {
+            setError('Please select both start and end dates');
+            return;
+        }
+
+        if (rangeStartDate > rangeEndDate) {
+            setError('Start date cannot be after end date');
+            return;
+        }
+
+        setPipelineLoading(true);
+        setError(null);
+        setSuccess(null);
+        setRangeProgress(null);
+        setDashboardResult(null);
+
+        try {
+            // Step 1: Download Range
+            setPipelineStage('Downloading data from NSE...');
+            const downloadRes = await fetch(`${VITE_API_URL}/api/download-nse-range`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    start_date: convertDateFormat(rangeStartDate),
+                    end_date: convertDateFormat(rangeEndDate),
+                    save_to_file: true,
+                    refresh_mode: 'missing_only'
+                })
+            });
+
+            if (!downloadRes.ok) {
+                const errorData = await downloadRes.json();
+                throw new Error(`Download failed: ${errorData.error}`);
+            }
+
+            const downloadData = await downloadRes.json();
+            setRangeProgress({
+                summary: downloadData.summary,
+                entries: downloadData.entries || [],
+                errors: downloadData.errors || []
+            });
+
+            // Step 2: Export Consolidated (calculates averages)
+            setPipelineStage('Calculating averages (Optimized)...');
+            const exportRes = await fetch(`${VITE_API_URL}/api/consolidate-saved`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    start_date: convertDateFormat(rangeStartDate),
+                    end_date: convertDateFormat(rangeEndDate),
+                    file_type: 'both',
+                    fast_mode: false,
+                    skip_daily: true
+                })
+            });
+
+            if (!exportRes.ok) {
+                const errData = await exportRes.json();
+                throw new Error(`Consolidation failed: ${errData.error}`);
+            }
+
+            const headerLog = exportRes.headers.get('x-export-log');
+            if (headerLog) setExportLog(headerLog.split('\n'));
+
+            setConsolidationReady(true);
+            setExportedRange({ start: rangeStartDate, end: rangeEndDate });
+            setConsolidationStatus({
+                ready: true,
+                message: `Averages calculated for ${rangeStartDate} to ${rangeEndDate}`
+            });
+
+            // Step 3: Build Dashboard
+            setPipelineStage('Building Symbol Dashboard...');
+            await handleBuildDashboard();
+
+            setSuccess('✅ Full pipeline completed successfully!');
+        } catch (err) {
+            setError(err.message);
+        } finally {
+            setPipelineLoading(false);
+            setPipelineStage('');
+        }
+    };
+
     return (
         <div className="app">
             <TabBar activeTab={activeTab} setActiveTab={setActiveTab} />
@@ -644,6 +731,9 @@ function App() {
                             handleExportConsolidated={handleExportConsolidated}
                             handleBuildDashboard={handleBuildDashboard}
                             handleDownloadDashboard={handleDownloadDashboard}
+                            handleFullPipeline={handleFullPipeline}
+                            pipelineLoading={pipelineLoading}
+                            pipelineStage={pipelineStage}
                         />
                     )}
                 </main>

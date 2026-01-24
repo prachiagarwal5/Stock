@@ -45,8 +45,10 @@ class MarketCapConsolidator:
         else:
             self.symbol_col = 'Symbol'
             self.value_col = 'Market Cap(Rs.)'
+            self.free_float_col = 'Free Float Market Cap'
             self.name_col = 'Security Name'
             self.avg_col = 'Average Market Cap'
+            self.avg_ff_col = 'Average Free Float'
         self.days_col = 'Days With Data'
 
     def _load_corporate_actions(self):
@@ -141,7 +143,10 @@ class MarketCapConsolidator:
             if self.symbol_col not in df_local.columns or self.value_col not in df_local.columns:
                 return None, None, {'file': csv_file, 'status': 'skipped', 'reason': 'missing columns', 'rows': 0, 'elapsed': time.perf_counter() - start}
 
-            df_local = df_local[[self.symbol_col, self.name_col, self.value_col]].copy()
+            if self.file_type == 'mcap':
+                df_local = df_local[[self.symbol_col, self.name_col, self.value_col, self.free_float_col]].copy()
+            else:
+                df_local = df_local[[self.symbol_col, self.name_col, self.value_col]].copy()
             df_local['_date_str'] = date_str_local
 
             sym_upper = df_local[self.symbol_col].astype(str).str.upper()
@@ -169,7 +174,11 @@ class MarketCapConsolidator:
                 df_local['Company Name'] = df_local[self.name_col].astype(str).str.strip()
 
             df_local['Value'] = pd.to_numeric(df_local[self.value_col], errors='coerce')
-            df_local = df_local[['Symbol', 'Company Name', 'Value', '_date_str']]
+            if self.file_type == 'mcap':
+                df_local['FF_Value'] = pd.to_numeric(df_local[self.free_float_col], errors='coerce')
+                df_local = df_local[['Symbol', 'Company Name', 'Value', 'FF_Value', '_date_str']]
+            else:
+                df_local = df_local[['Symbol', 'Company Name', 'Value', '_date_str']]
             elapsed = time.perf_counter() - start
             if df_local is None or df_local.empty:
                 return None, date_str_local, {'file': csv_file, 'status': 'empty after mapping', 'rows': 0, 'elapsed': elapsed}
@@ -229,6 +238,13 @@ class MarketCapConsolidator:
 
         pivot = df_all.pivot(index='Symbol', columns='_date_str', values='Value')
         pivot.reset_index(inplace=True)
+        
+        if self.file_type == 'mcap':
+            pivot_ff = df_all.pivot(index='Symbol', columns='_date_str', values='FF_Value')
+            pivot_ff.reset_index(inplace=True)
+            # Add prefix to FF columns to avoid collision if necessary, but we only need the average
+            ff_avg = pivot_ff[sorted_dates].mean(axis=1)
+            pivot[self.avg_ff_col] = ff_avg
 
         name_lookup = df_all.dropna(subset=['Company Name']).drop_duplicates(subset=['Symbol'], keep='last').set_index('Symbol')['Company Name'].to_dict()
         pivot['Company Name'] = pivot['Symbol'].map(name_lookup).fillna(pivot['Symbol'])
@@ -240,7 +256,10 @@ class MarketCapConsolidator:
         pivot[self.days_col] = numeric_dates.count(axis=1) if not numeric_dates.empty else 0
         pivot[self.avg_col] = numeric_dates.mean(axis=1) if not numeric_dates.empty else None
 
-        columns_order = ['Symbol', 'Company Name', self.days_col, self.avg_col] + date_cols
+        if self.file_type == 'mcap':
+            columns_order = ['Symbol', 'Company Name', self.days_col, self.avg_col, self.avg_ff_col] + date_cols
+        else:
+            columns_order = ['Symbol', 'Company Name', self.days_col, self.avg_col] + date_cols
         self.df_consolidated = pivot[columns_order]
 
         self.df_consolidated = self.df_consolidated[~self.df_consolidated['Symbol'].apply(self._is_summary_symbol)]
