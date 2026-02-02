@@ -66,6 +66,7 @@ try:
     symbol_daily_collection = db['symbol_daily']  # per-symbol, per-date values (mcap/pr)
     symbol_aggregates_collection = db['symbol_aggregates']  # per-symbol averages
     symbol_metrics_collection = db['symbol_metrics']  # Symbol dashboard metrics
+    symbol_metrics_daily_collection = db['symbol_metrics_daily']  # Daily impact_cost and free_float_mcap
     nifty_indices_collection = db['nifty_indices']  # Nifty index constituent mappings
     # speed-critical indexes
     symbol_daily_collection.create_index(
@@ -77,6 +78,7 @@ try:
         name='symbol_type_range', unique=False
     )
     bhavcache_collection.create_index([('type', 1), ('date', 1)], name='type_date_cache')
+    symbol_metrics_daily_collection.create_index([('symbol', 1), ('date', 1)], name='symbol_date_daily', unique=True)
     nifty_indices_collection.create_index([('symbol', 1)], name='symbol_idx', unique=True)
     print("✅ MongoDB connected successfully")
 except Exception as e:
@@ -87,6 +89,7 @@ except Exception as e:
     symbol_daily_collection = None
     symbol_aggregates_collection = None
     symbol_metrics_collection = None
+    symbol_metrics_daily_collection = None
     nifty_indices_collection = None
 
 
@@ -305,6 +308,25 @@ def upsert_symbol_metrics(row, source='nse_symbol_metrics'):
             {'$set': payload},
             upsert=True
         )
+        
+        # Also store daily impact_cost and free_float_mcap values
+        if symbol_metrics_daily_collection is not None:
+            daily_payload = {
+                'symbol': symbol,
+                'company_name': row.get('companyName'),
+                'date': as_on,
+                'impact_cost': _safe_float(row.get('impact_cost')),
+                'free_float_mcap': _safe_float(row.get('free_float_mcap')),
+                'total_market_cap': _safe_float(row.get('total_market_cap')),
+                'total_traded_value': _safe_float(row.get('total_traded_value')),
+                'source': source,
+                'updated_at': datetime.now().isoformat()
+            }
+            symbol_metrics_daily_collection.update_one(
+                {'symbol': symbol, 'date': as_on},
+                {'$set': daily_payload},
+                upsert=True
+            )
     except Exception as exc:
         print(f"⚠️ Failed to upsert symbol_metrics for {row.get('symbol')}: {exc}")
 
@@ -780,6 +802,66 @@ def consolidation_status():
             'message': f'Error checking status: {e}'
         }), 200
 
+def calculate_averages_from_db(symbols, start_date=None, end_date=None):
+    """
+    Calculate averages for impact_cost, free_float_mcap, total_market_cap, and total_traded_value
+    from the symbol_metrics_daily collection.
+    
+    Args:
+        symbols: List of symbols to calculate averages for
+        start_date: Start date (YYYY-MM-DD format) - if None, uses all available dates
+        end_date: End date (YYYY-MM-DD format) - if None, uses all available dates
+        
+    Returns:
+        Dictionary mapping symbol to averages: {symbol: {avg_impact_cost, avg_free_float_mcap, ...}}
+    """
+    if symbol_metrics_daily_collection is None or not symbols:
+        return {}
+    
+    try:
+        # Build query
+        query = {'symbol': {'$in': symbols}}
+        if start_date or end_date:
+            date_filter = {}
+            if start_date:
+                date_filter['$gte'] = start_date
+            if end_date:
+                date_filter['$lte'] = end_date
+            query['date'] = date_filter
+        
+        # Aggregate to calculate averages per symbol
+        pipeline = [
+            {'$match': query},
+            {
+                '$group': {
+                    '_id': '$symbol',
+                    'avg_impact_cost': {'$avg': '$impact_cost'},
+                    'avg_free_float_mcap': {'$avg': '$free_float_mcap'},
+                    'avg_total_market_cap': {'$avg': '$total_market_cap'},
+                    'avg_total_traded_value': {'$avg': '$total_traded_value'},
+                    'count': {'$sum': 1}
+                }
+            }
+        ]
+        
+        result = {}
+        for doc in symbol_metrics_daily_collection.aggregate(pipeline):
+            symbol = doc['_id']
+            result[symbol] = {
+                'avg_impact_cost': doc.get('avg_impact_cost'),
+                'avg_free_float_mcap': doc.get('avg_free_float_mcap'),
+                'avg_total_market_cap': doc.get('avg_total_market_cap'),
+                'avg_total_traded_value': doc.get('avg_total_traded_value'),
+                'days_count': doc.get('count', 0)
+            }
+        
+        print(f"[calculate_averages_from_db] Calculated averages for {len(result)} symbols from DB")
+        return result
+    except Exception as exc:
+        print(f"⚠️ Failed to calculate averages from DB: {exc}")
+        return {}
+
+
 def save_excel_to_database(excel_path, filename, metadata):
     """Save Excel file to MongoDB"""
     if excel_results_collection is None:
@@ -811,17 +893,18 @@ def save_excel_to_database(excel_path, filename, metadata):
 
 def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
     """
-    Format dashboard Excel with required columns and calculations
+    Format dashboard Excel with required columns and calculations.
+    Now includes average values calculated from database (symbol_metrics_daily collection).
     
     Columns:
     - Serial No
     - Symbol
     - Company name
     - Index
-    - avg Impact cost
-    - avg total market cap
-    - Avg Free float market cap
-    - Avg daily traded value
+    - avg Impact cost (calculated from DB if date range provided)
+    - avg total market cap (calculated from DB if date range provided)
+    - Avg Free float market cap (calculated from DB if date range provided)
+    - Avg daily traded value (calculated from DB if date range provided)
     - Day of Listing
     - Broader Index (Nifty 500 if in Nifty 50/Next 50/Midcap 150/Smallcap 250)
     - listed> 6months (Y/N)
@@ -831,6 +914,29 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
     """
     try:
         df = pd.DataFrame(rows)
+        
+        # Calculate averages from database if date range is provided
+        if start_date or end_date:
+            symbols = df['symbol'].tolist() if 'symbol' in df.columns else []
+            if symbols:
+                print(f"[format_dashboard_excel] Calculating averages from DB for {len(symbols)} symbols (date range: {start_date} to {end_date})")
+                db_averages = calculate_averages_from_db(symbols, start_date, end_date)
+                
+                # Replace current values with calculated averages
+                if db_averages:
+                    for idx, row in df.iterrows():
+                        symbol = row.get('symbol')
+                        if symbol in db_averages:
+                            avg_data = db_averages[symbol]
+                            if avg_data.get('avg_impact_cost') is not None:
+                                df.at[idx, 'impact_cost'] = avg_data['avg_impact_cost']
+                            if avg_data.get('avg_free_float_mcap') is not None:
+                                df.at[idx, 'free_float_mcap'] = avg_data['avg_free_float_mcap']
+                            if avg_data.get('avg_total_market_cap') is not None:
+                                df.at[idx, 'total_market_cap'] = avg_data['avg_total_market_cap']
+                            if avg_data.get('avg_total_traded_value') is not None:
+                                df.at[idx, 'total_traded_value'] = avg_data['avg_total_traded_value']
+                    print(f"[format_dashboard_excel] ✓ Replaced values with DB averages for {len(db_averages)} symbols")
         
         # Map listingDate to listing_date for consistency
         if 'listingDate' in df.columns and 'listing_date' not in df.columns:
