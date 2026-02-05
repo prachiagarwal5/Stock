@@ -95,7 +95,7 @@ const RangeTab = ({
                         style={{ background: '#e0f2f1', color: '#176a3a', fontWeight: 'bold', borderRadius: '12px', boxShadow: '0 2px 12px rgba(44,62,80,0.10)' }}
                         onClick={handleBuildDashboard}
                         disabled={pipelineLoading || dashboardLoading || !consolidationReady || !rangeStartDate || !rangeEndDate}
-                        title={!rangeStartDate || !rangeEndDate ? "Select date range first" : (consolidationReady ? "Build symbol dashboard for top 1000 companies by Market Cap average" : "Export Excel first to calculate MCAP & PR averages")}
+                        title={!rangeStartDate || !rangeEndDate ? "Select date range first" : (consolidationReady ? "Build symbol dashboard for top 1100 companies by Market Cap average" : "Export Excel first to calculate MCAP & PR averages")}
                     >
                         <span style={{ fontSize: '1.3rem' }}>📊</span> {dashboardLoading ? 'Building...' : consolidationReady ? 'Build Dashboard' : 'Build Dashboard (Export First)'}
                     </button>
@@ -225,7 +225,7 @@ const RangeTab = ({
                 {consolidationReady ? (
                     <div className="consolidation-details" style={{ marginBottom: '18px' }}>
                         <span className="pill pill-success" style={{ background: '#1bb76e', color: '#fff', borderRadius: '8px', padding: '4px 12px', marginRight: '8px' }}>Dashboard Ready</span>
-                        <span className="consolidation-hint" style={{ color: '#176a3a' }}>Top 1000 companies by MCAP average</span>
+                        <span className="consolidation-hint" style={{ color: '#176a3a' }}>Top 1100 companies by MCAP average</span>
                     </div>
                 ) : (
                     <div style={{ background: '#fff8e1', borderRadius: '12px', padding: '18px 24px', marginTop: '12px', border: '1px solid #ffe0b2', marginBottom: '18px' }}>

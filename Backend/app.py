@@ -60,7 +60,9 @@ dotenv.load_dotenv()
 
 # MongoDB connection
 try:
-    mongo_uri = os.getenv('mongo_URI')
+    # Hardcoded MongoDB connection string (as per user request)
+    mongo_uri = "mongodb+srv://prachiagrawal509:BSzCRUTG8F7voUBv@cluster0.kfbej.mongodb.net/?appName=Cluster0/Stocks"
+    
     mongo_client = MongoClient(mongo_uri)
     db = mongo_client['Stocks']
     excel_results_collection = db['excel_results']
@@ -334,8 +336,8 @@ def upsert_symbol_metrics(row, source='nse_symbol_metrics'):
 
 
 def persist_consolidated_results(consolidator, data_type, source='consolidation', skip_daily=False):
-    """Store per-symbol per-date values and averages into MongoDB using bulk operations."""
-    if consolidator is None:
+    """Store per-symbol per-date values and averages into MongoDB using bulk operations with memory optimization."""
+    if consolidator is None or consolidator.df_consolidated is None:
         return
     try:
         from pymongo import UpdateOne
@@ -350,83 +352,96 @@ def persist_consolidated_results(consolidator, data_type, source='consolidation'
             except Exception:
                 date_range = None
 
-        # Collect all aggregate operations
-        aggregate_ops = []
-        daily_ops = []
+        # CHUNKED PROCESSING to avoid OOM
+        SYMBOL_BATCH_SIZE = 200 
+        total_rows = len(consolidator.df_consolidated)
         
-        for _, row in consolidator.df_consolidated.iterrows():
-            symbol = str(row.get('Symbol') or '').strip()
-            company_name = str(row.get('Company Name') or '').strip()
-            if not symbol:
-                continue
+        print(f"[persist] Starting chunked persistence for {total_rows} symbols ({data_type})...")
+        
+        for i in range(0, total_rows, SYMBOL_BATCH_SIZE):
+            batch_df = consolidator.df_consolidated.iloc[i : i + SYMBOL_BATCH_SIZE]
+            aggregate_ops = []
+            daily_ops = []
+            
+            for _, row in batch_df.iterrows():
+                symbol = str(row.get('Symbol') or '').strip()
+                company_name = str(row.get('Company Name') or '').strip()
+                if not symbol:
+                    continue
 
-            # Prepare aggregate upsert
-            avg_val = row.get(consolidator.avg_col)
-            days_val = row.get(consolidator.days_col)
-            if symbol_aggregates_collection is not None:
-                payload = {
-                    'symbol': symbol,
-                    'company_name': company_name,
-                    'type': data_type,
-                    'days_with_data': int(days_val or 0),
-                    'average': _safe_float(avg_val),
-                    'date_range': date_range,
-                    'source': source,
-                    'updated_at': datetime.now().isoformat()
-                }
-                if hasattr(consolidator, 'avg_ff_col'):
-                    payload['avg_free_float'] = _safe_float(row.get(consolidator.avg_ff_col))
-                aggregate_ops.append(
-                    UpdateOne(
-                        {'symbol': symbol, 'type': data_type},
-                        {'$set': payload},
-                        upsert=True
-                    )
-                )
-
-            # Prepare daily upserts
-            if symbol_daily_collection is not None:
-                for date_str in date_cols:
-                    val = row.get(date_str)
-                    if val in (None, ''):
-                        continue
-                    try:
-                        date_iso = datetime.strptime(date_str, '%d-%m-%Y').strftime('%Y-%m-%d')
-                    except Exception:
-                        continue
-                    
+                # Prepare aggregate upsert
+                avg_val = row.get(consolidator.avg_col)
+                days_val = row.get(consolidator.days_col)
+                if symbol_aggregates_collection is not None:
                     payload = {
                         'symbol': symbol,
                         'company_name': company_name,
-                        'date': date_iso,
                         'type': data_type,
-                        'value': _safe_float(val),
+                        'days_with_data': int(days_val or 0),
+                        'average': _safe_float(avg_val),
+                        'date_range': date_range,
                         'source': source,
                         'updated_at': datetime.now().isoformat()
                     }
-                    daily_ops.append(
+                    if hasattr(consolidator, 'avg_ff_col'):
+                        payload['avg_free_float'] = _safe_float(row.get(consolidator.avg_ff_col))
+                    aggregate_ops.append(
                         UpdateOne(
-                            {'symbol': symbol, 'date': date_iso, 'type': data_type},
+                            {'symbol': symbol, 'type': data_type},
                             {'$set': payload},
                             upsert=True
                         )
                     )
 
-        # Execute bulk operations in batches
-        if aggregate_ops and symbol_aggregates_collection is not None:
-            print(f"[persist] Executing {len(aggregate_ops)} aggregate operations...")
-            symbol_aggregates_collection.bulk_write(aggregate_ops, ordered=False)
-            print(f"[persist] ✓ Aggregates saved")
+                # Prepare daily upserts
+                if symbol_daily_collection is not None and not skip_daily:
+                    for date_str in date_cols:
+                        val = row.get(date_str)
+                        if val in (None, ''):
+                            continue
+                        try:
+                            date_iso = datetime.strptime(date_str, '%d-%m-%Y').strftime('%Y-%m-%d')
+                        except Exception:
+                            continue
+                        
+                        payload = {
+                            'symbol': symbol,
+                            'company_name': company_name,
+                            'date': date_iso,
+                            'type': data_type,
+                            'value': _safe_float(val),
+                            'source': source,
+                            'updated_at': datetime.now().isoformat()
+                        }
+                        daily_ops.append(
+                            UpdateOne(
+                                {'symbol': symbol, 'date': date_iso, 'type': data_type},
+                                {'$set': payload},
+                                upsert=True
+                            )
+                        )
 
-        if daily_ops and symbol_daily_collection is not None and not skip_daily:
-            batch_size = 1000
-            print(f"[persist] Executing {len(daily_ops)} daily operations in batches of {batch_size}...")
-            for i in range(0, len(daily_ops), batch_size):
-                batch = daily_ops[i:i + batch_size]
-                symbol_daily_collection.bulk_write(batch, ordered=False)
-                print(f"[persist] ✓ Saved batch {i//batch_size + 1}/{(len(daily_ops) + batch_size - 1)//batch_size}")
+            # Execute bulk operations for this batch immediately
+            if aggregate_ops and symbol_aggregates_collection is not None:
+                symbol_aggregates_collection.bulk_write(aggregate_ops, ordered=False)
+            
+            if daily_ops and symbol_daily_collection is not None:
+                symbol_daily_collection.bulk_write(daily_ops, ordered=False)
+            
+            # Explicitly clear lists and batch DF to free memory
+            del aggregate_ops
+            del daily_ops
+            del batch_df
+            gc.collect()
+            
+            processed = min(i + SYMBOL_BATCH_SIZE, total_rows)
+            print(f"[persist] ✓ Batched persistence: {processed}/{total_rows} symbols processed")
+
+        print(f"[persist] ✓ All results persisted for {data_type}")
             
     except Exception as exc:
+        import traceback
+        traceback.print_exc()
         print(f"⚠️ Failed to persist consolidated results for {data_type}: {exc}")
 
 
@@ -514,7 +529,22 @@ def get_cached_csv_bulk(date_iso_list, data_type):
             try:
                 csv_bytes = doc.get('file_data')
                 if csv_bytes:
-                    df = pd.read_csv(BytesIO(csv_bytes))
+                    # Determine columns to load based on data_type
+                    symbol_col = 'SECURITY' if data_type == 'pr' else 'Symbol'
+                    value_col = 'NET_TRDVAL' if data_type == 'pr' else 'Market Cap(Rs.)'
+                    name_col = 'SECURITY' if data_type == 'pr' else 'Security Name'
+
+                    req_cols = [symbol_col, value_col]
+                    if symbol_col != name_col: # Only add if different from symbol_col
+                        req_cols.append(name_col)
+                    
+                    # OPTIMIZATION: Load only necessary columns and specify dtypes
+                    df = pd.read_csv(
+                        BytesIO(csv_bytes),
+                        usecols=req_cols,
+                        dtype={symbol_col: 'category'} # Category saves memory for repeated symbols
+                    )
+                    
                     results[date_iso] = {
                         'df': df,
                         'records': doc.get('records', len(df)),
@@ -601,6 +631,11 @@ def bulk_upsert_symbol_daily_from_df(df, date_iso, data_type, source='nse_downlo
 def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False, log_fn=None, allowed_symbols=None, symbol_name_map=None):
     """Build consolidated dataframe - ULTRA-OPTIMIZED with minimal operations."""
     
+    if bhavcache_collection is None:
+        error_msg = "Database not connected. Check if MONGODB_URI/mongo_uri is correctly set in environment variables."
+        if log_fn: log_fn(f"❌ {error_msg}")
+        raise ValueError(error_msg)
+
     # BULK LOAD all dates at once
     cached_dict = get_cached_csv_bulk(date_iso_list, data_type)
     
@@ -617,10 +652,14 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
         frames.append(df)
 
     if missing_dates and not allow_missing:
-        raise ValueError(f"Missing cached {data_type.upper()} for: {', '.join(missing_dates)}")
+        error_msg = f"No cached {data_type.upper()} data for dates: {', '.join(missing_dates)}. Please 'Download Range' for these dates first."
+        if log_fn: log_fn(f"❌ {error_msg}")
+        raise ValueError(error_msg)
 
     if not frames:
-        raise ValueError(f"No cached {data_type.upper()} data available")
+        error_msg = f"No cached {data_type.upper()} data available for the entire requested range ({date_iso_list[0]} to {date_iso_list[-1]})."
+        if log_fn: log_fn(f"❌ {error_msg}")
+        raise ValueError(error_msg)
 
     # Concatenate all data at once (fast)
     df_all = pd.concat(frames, ignore_index=True)
@@ -1813,9 +1852,9 @@ def nse_symbol_dashboard():
         is_render = os.environ.get('RENDER') == 'true' or os.environ.get('RENDER_SERVICE_NAME')
         
 
-        # Force user requirements: 10 batches of 100 symbols (top 1000 by MCAP)
+        # Force user requirements: 11 batches of 100 symbols (top 1100 by MCAP)
         BATCH_SIZE = 100
-        TOTAL_SYMBOLS = 1000
+        TOTAL_SYMBOLS = 1100
         MAX_TIME_TOTAL = 55
         MAX_TIME_PER_SYMBOL = 1.0
         MAX_WORKERS = 50
@@ -1826,7 +1865,7 @@ def nse_symbol_dashboard():
 
         symbols = provided_symbols[:] if provided_symbols else []
         tag = None
-        # Always use local Excel for top 1000 if no symbols provided
+        # Always use local Excel for top 1100 if no symbols provided
 
         if not symbols:
             market_cap_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject', 'Market_Cap.xlsx')
@@ -1845,7 +1884,7 @@ def nse_symbol_dashboard():
                 df = df[[symbol_col, mcap_col]].dropna()
                 df = df.sort_values(by=mcap_col, ascending=False)
                 symbols = df[symbol_col].astype(str).tolist()[:TOTAL_SYMBOLS]
-                print(f"[symbol-dashboard] Got {len(symbols)} symbols from Market_Cap.xlsx (top 1000 MCAP)")
+                print(f"[symbol-dashboard] Got {len(symbols)} symbols from Market_Cap.xlsx (top 1100 MCAP)")
             except Exception as exc:
                 print(f"⚠️ Failed to fetch symbols from Market_Cap.xlsx: {exc}")
                 return jsonify({'error': f'Failed to fetch symbols from Market_Cap.xlsx: {exc}'}), 400
@@ -1853,7 +1892,7 @@ def nse_symbol_dashboard():
         if not symbols:
             return jsonify({'error': 'No symbols found. Export MCAP Excel first.'}), 400
 
-        symbols = list(dict.fromkeys(symbols))[:TOTAL_SYMBOLS]  # Remove duplicates, force top 1000
+        symbols = list(dict.fromkeys(symbols))[:TOTAL_SYMBOLS]  # Remove duplicates, force top 1100
         total_symbols = len(symbols)
 
         # Always 10 batches of 100
@@ -2459,6 +2498,7 @@ def consolidate_saved():
                         
                     # Now clear consolidator from memory
                     del consolidator_mcap.df_consolidated
+                    del consolidator_mcap
                     gc.collect()
                         
                     results['mcap'] = {
@@ -2501,6 +2541,7 @@ def consolidate_saved():
 
                     # Now clear consolidator from memory
                     del consolidator_pr.df_consolidated
+                    del consolidator_pr
                     gc.collect()
                     results['pr'] = {
                         'companies': companies_count_pr,
@@ -2740,6 +2781,49 @@ def get_symbol_indices():
         print(f"[get-symbol-indices] Error: {e}")
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/api/db-status', methods=['GET'])
+def get_db_status():
+    """Get database collection counts and status."""
+    if db is None:
+        return jsonify({'error': 'Database not connected'}), 500
+    try:
+        status = {}
+        for coll_name in db.list_collection_names():
+            status[coll_name] = db[coll_name].count_documents({})
+        return jsonify({
+            'status': 'connected',
+            'collections': status,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/db-prune', methods=['POST'])
+def prune_db():
+    """Prune old database entries to free up space."""
+    if db is None:
+        return jsonify({'error': 'Database not connected'}), 500
+    try:
+        data = request.get_json() or {}
+        days = int(data.get('days', 60))
+        
+        # 1. Clear excel_results
+        res_excel = db['excel_results'].delete_many({})
+        
+        # 2. Clear old bhavcache
+        cutoff_date = datetime.now() - timedelta(days=days)
+        cutoff_iso = cutoff_date.strftime('%Y-%m-%d')
+        res_cache = db['bhavcache'].delete_many({'date': {'$lt': cutoff_iso}})
+        
+        return jsonify({
+            'message': 'Database pruned successfully',
+            'deleted_excel_results': res_excel.deleted_count,
+            'deleted_old_cache': res_cache.deleted_count,
+            'pruned_before': cutoff_iso
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     import os

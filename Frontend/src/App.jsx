@@ -446,9 +446,9 @@ function App() {
         setDashboardResult(null);
 
         // Configuration for batch processing
-        const TOTAL_SYMBOLS = 1000;
+        const TOTAL_SYMBOLS = 1100;
         const BATCH_SIZE = 100;
-        const TOTAL_BATCHES = 10;
+        const TOTAL_BATCHES = 11;
 
         let allRows = [];
         let allErrors = [];
