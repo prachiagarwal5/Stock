@@ -1865,32 +1865,60 @@ def nse_symbol_dashboard():
 
         symbols = provided_symbols[:] if provided_symbols else []
         tag = None
-        # Always use local Excel for top 1100 if no symbols provided
+        
+        # Dashboard Symbol Fetching Logic:
+        # 1. If symbols provided in payload, use them.
+        # 2. Otherwise, check MongoDB 'symbol_aggregates' for top 1100 by MCAP (Primary).
+        # 3. Fallback to local 'nosubject/Market_Cap.xlsx' if DB is empty or not connected.
 
         if not symbols:
-            market_cap_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject', 'Market_Cap.xlsx')
-            try:
-                df = pd.read_excel(market_cap_path)
-                # Try to find the right columns for symbol and market cap
-                symbol_col = None
-                mcap_col = None
-                for c in df.columns:
-                    if str(c).strip().lower() in ['symbol', 'symbols']:
-                        symbol_col = c
-                    if 'mcap' in str(c).strip().lower() or 'market cap' in str(c).strip().lower():
-                        mcap_col = c
-                if symbol_col is None or mcap_col is None:
-                    return jsonify({'error': 'Could not find symbol or market cap column in Market_Cap.xlsx'}), 400
-                df = df[[symbol_col, mcap_col]].dropna()
-                df = df.sort_values(by=mcap_col, ascending=False)
-                symbols = df[symbol_col].astype(str).tolist()[:TOTAL_SYMBOLS]
-                print(f"[symbol-dashboard] Got {len(symbols)} symbols from Market_Cap.xlsx (top 1100 MCAP)")
-            except Exception as exc:
-                print(f"⚠️ Failed to fetch symbols from Market_Cap.xlsx: {exc}")
-                return jsonify({'error': f'Failed to fetch symbols from Market_Cap.xlsx: {exc}'}), 400
+            # 1. Try MongoDB first (Most robust)
+            if symbol_aggregates_collection is not None:
+                try:
+                    # Fetch top 1100 symbols by average market cap
+                    db_symbols = list(symbol_aggregates_collection.find(
+                        {'type': 'mcap'},
+                        {'symbol': 1, 'average': 1}
+                    ).sort('average', -1).limit(TOTAL_SYMBOLS))
+                    
+                    if db_symbols:
+                        symbols = [s['symbol'] for s in db_symbols]
+                        print(f"[symbol-dashboard] Got {len(symbols)} symbols from MongoDB (top {TOTAL_SYMBOLS} by Avg MCAP)")
+                except Exception as e:
+                    print(f"[symbol-dashboard][mongodb-error] {e}")
+
+            # 2. Fallback to Excel if DB search failed or returned nothing
+            if not symbols:
+                market_cap_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject', 'Market_Cap.xlsx')
+                if os.path.exists(market_cap_path):
+                    try:
+                        df = pd.read_excel(market_cap_path)
+                        # Try to find the right columns for symbol and market cap
+                        symbol_col = None
+                        mcap_col = None
+                        for c in df.columns:
+                            if str(c).strip().lower() in ['symbol', 'symbols']:
+                                symbol_col = c
+                            if 'mcap' in str(c).strip().lower() or 'market cap' in str(c).strip().lower():
+                                mcap_col = c
+                        
+                        if symbol_col and mcap_col:
+                            df = df[[symbol_col, mcap_col]].dropna()
+                            df = df.sort_values(by=mcap_col, ascending=False)
+                            symbols = df[symbol_col].astype(str).tolist()[:TOTAL_SYMBOLS]
+                            print(f"[symbol-dashboard] Got {len(symbols)} symbols from Market_Cap.xlsx (top {TOTAL_SYMBOLS} MCAP)")
+                    except Exception as exc:
+                        print(f"⚠️ Failed to fetch symbols from Market_Cap.xlsx: {exc}")
+                else:
+                    print(f"⚠️ Market_Cap.xlsx not found at {market_cap_path}")
 
         if not symbols:
-            return jsonify({'error': 'No symbols found. Export MCAP Excel first.'}), 400
+            error_msg = (
+                "No symbols found. The dashboard requires the top 1100 symbols by Market Cap. "
+                "Please run a 'Consolidation Export' (with fast_mode=False) first to populate the database "
+                "with symbol rankings."
+            )
+            return jsonify({'error': error_msg}), 400
 
         symbols = list(dict.fromkeys(symbols))[:TOTAL_SYMBOLS]  # Remove duplicates, force top 1100
         total_symbols = len(symbols)
