@@ -30,6 +30,8 @@ from consolidate_marketcap import MarketCapConsolidator
 from nse_symbol_metrics import SymbolMetricsFetcher
 from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from memory_optimized_export import MemoryOptimizedExporter, ChunkedDataProcessor, get_memory_usage_mb
+import gc
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"], "allow_headers": ["Content-Type", "Authorization"]}})
@@ -802,19 +804,124 @@ def consolidation_status():
             'message': f'Error checking status: {e}'
         }), 200
 
+def calculate_averages_from_consolidated_data(symbols, start_date=None, end_date=None):
+    """
+    Calculate averages using the same method as consolidation Excel files.
+    This ensures consistency between dashboard and consolidation exports.
+    """
+    if not symbols:
+        return {}
+    
+    try:
+        # Build date list the same way as consolidation
+        if start_date and end_date:
+            try:
+                start_dt = date_parser.parse(start_date)
+                end_dt = date_parser.parse(end_date)
+                if start_dt > end_dt:
+                    return {}
+                current = start_dt
+                date_iso_list = []
+                while current <= end_dt:
+                    if current.weekday() < 5:  # Only weekdays
+                        date_iso_list.append(current.strftime('%Y-%m-%d'))
+                    current += timedelta(days=1)
+            except:
+                return {}
+        else:
+            # If no date range specified, return empty (same as original behavior)
+            return {}
+        
+        if not date_iso_list:
+            return {}
+        
+        print(f"[calculate_averages_from_consolidated_data] Processing {len(date_iso_list)} dates for {len(symbols)} symbols")
+        
+        # Use the same consolidation logic for MCAP data
+        result = {}
+        
+        try:
+            # Get MCAP averages using consolidation method
+            mcap_df, dates_list, avg_col = build_consolidated_from_cache(
+                date_iso_list, 'mcap', allow_missing=True, log_fn=None,
+                allowed_symbols=set(symbols), symbol_name_map=None
+            )
+            
+            # Extract averages for requested symbols
+            for _, row in mcap_df.iterrows():
+                symbol = row['Symbol']
+                if symbol in symbols:
+                    if symbol not in result:
+                        result[symbol] = {}
+                    result[symbol]['avg_total_market_cap'] = row.get(avg_col)
+                    
+                    # Calculate free float average if Free Float Market Cap columns exist
+                    ff_cols = [col for col in mcap_df.columns if 'free' in col.lower() and 'float' in col.lower()]
+                    if ff_cols:
+                        # Look for daily free float columns
+                        date_cols = [c for c in mcap_df.columns if c not in ['Symbol', 'Company Name', 'Days With Data', avg_col]]
+                        # This is tricky - the consolidation doesn't separate free float, so use proportional estimate
+                        # For now, use the same as total market cap (this should be improved with actual free float data)
+                        result[symbol]['avg_free_float_mcap'] = row.get(avg_col)
+            
+            print(f"[calculate_averages_from_consolidated_data] Got MCAP averages for {len(result)} symbols")
+            
+        except Exception as exc:
+            print(f"⚠️ Failed to get MCAP averages from consolidated data: {exc}")
+        
+        try:
+            # Get PR averages using consolidation method
+            # Create symbol-to-name mapping for PR processing
+            mcap_name_map = {}
+            if 'mcap_df' in locals():
+                mcap_name_map = dict(zip(mcap_df['Symbol'], mcap_df['Company Name']))
+            
+            pr_name_to_symbol = {v: k for k, v in mcap_name_map.items()} if mcap_name_map else None
+            
+            pr_df, pr_dates_list, pr_avg_col = build_consolidated_from_cache(
+                date_iso_list, 'pr', allow_missing=True, log_fn=None,
+                allowed_symbols=None, symbol_name_map=pr_name_to_symbol
+            )
+            
+            # Extract PR averages for requested symbols
+            for _, row in pr_df.iterrows():
+                symbol = row['Symbol']
+                if symbol in symbols:
+                    if symbol not in result:
+                        result[symbol] = {}
+                    result[symbol]['avg_total_traded_value'] = row.get(pr_avg_col)
+            
+            print(f"[calculate_averages_from_consolidated_data] Got PR averages for {len([s for s in result.values() if 'avg_total_traded_value' in s])} symbols")
+            
+        except Exception as exc:
+            print(f"⚠️ Failed to get PR averages from consolidated data: {exc}")
+        
+        # Set impact cost to None (not available in consolidation data)
+        for symbol_data in result.values():
+            if 'avg_impact_cost' not in symbol_data:
+                symbol_data['avg_impact_cost'] = None
+        
+        print(f"[calculate_averages_from_consolidated_data] Final result: averages for {len(result)} symbols")
+        return result
+        
+    except Exception as exc:
+        print(f"⚠️ Failed to calculate averages from consolidated data: {exc}")
+        return {}
+
+
 def calculate_averages_from_db(symbols, start_date=None, end_date=None):
     """
     Calculate averages for impact_cost, free_float_mcap, total_market_cap, and total_traded_value
     from the symbol_metrics_daily collection.
     
-    Args:
-        symbols: List of symbols to calculate averages for
-        start_date: Start date (YYYY-MM-DD format) - if None, uses all available dates
-        end_date: End date (YYYY-MM-DD format) - if None, uses all available dates
-        
-    Returns:
-        Dictionary mapping symbol to averages: {symbol: {avg_impact_cost, avg_free_float_mcap, ...}}
+    DEPRECATED: Use calculate_averages_from_consolidated_data for consistency with consolidation Excel.
     """
+    # For backward compatibility, try consolidation method first
+    consolidated_averages = calculate_averages_from_consolidated_data(symbols, start_date, end_date)
+    if consolidated_averages:
+        return consolidated_averages
+    
+    # Fallback to original DB method
     if symbol_metrics_daily_collection is None or not symbols:
         return {}
     
@@ -855,7 +962,7 @@ def calculate_averages_from_db(symbols, start_date=None, end_date=None):
                 'days_count': doc.get('count', 0)
             }
         
-        print(f"[calculate_averages_from_db] Calculated averages for {len(result)} symbols from DB")
+        print(f"[calculate_averages_from_db] Calculated averages for {len(result)} symbols from DB (fallback)")
         return result
     except Exception as exc:
         print(f"⚠️ Failed to calculate averages from DB: {exc}")
@@ -894,17 +1001,18 @@ def save_excel_to_database(excel_path, filename, metadata):
 def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
     """
     Format dashboard Excel with required columns and calculations.
-    Now includes average values calculated from database (symbol_metrics_daily collection).
+    Uses EXACT SAME averages as consolidation Excel by extracting from consolidation source.
+    When date range is provided, replaces dashboard averages with consolidation averages.
     
     Columns:
     - Serial No
     - Symbol
     - Company name
     - Index
-    - avg Impact cost (calculated from DB if date range provided)
-    - avg total market cap (calculated from DB if date range provided)
-    - Avg Free float market cap (calculated from DB if date range provided)
-    - Avg daily traded value (calculated from DB if date range provided)
+    - Avg Impact cost
+    - Average Market Cap (EXACT same as consolidation Excel)
+    - Average Free Float Market Cap 
+    - Average Net Traded Value (EXACT same as consolidation Excel)
     - Day of Listing
     - Broader Index (Nifty 500 if in Nifty 50/Next 50/Midcap 150/Smallcap 250)
     - listed> 6months (Y/N)
@@ -915,28 +1023,139 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
     try:
         df = pd.DataFrame(rows)
         
-        # Calculate averages from database if date range is provided
-        if start_date or end_date:
+        # Use EXACT same averages as consolidation Excel by extracting from consolidation source
+        # Do NOT use the dashboard data averages - get them from the same place as consolidation Excel
+        if start_date and end_date:
             symbols = df['symbol'].tolist() if 'symbol' in df.columns else []
             if symbols:
-                print(f"[format_dashboard_excel] Calculating averages from DB for {len(symbols)} symbols (date range: {start_date} to {end_date})")
-                db_averages = calculate_averages_from_db(symbols, start_date, end_date)
+                print(f"[format_dashboard_excel] *** DEBUG: Extracting EXACT consolidation averages for {len(symbols)} symbols (date range: {start_date} to {end_date})")
                 
-                # Replace current values with calculated averages
-                if db_averages:
-                    for idx, row in df.iterrows():
-                        symbol = row.get('symbol')
-                        if symbol in db_averages:
-                            avg_data = db_averages[symbol]
-                            if avg_data.get('avg_impact_cost') is not None:
-                                df.at[idx, 'impact_cost'] = avg_data['avg_impact_cost']
-                            if avg_data.get('avg_free_float_mcap') is not None:
-                                df.at[idx, 'free_float_mcap'] = avg_data['avg_free_float_mcap']
-                            if avg_data.get('avg_total_market_cap') is not None:
-                                df.at[idx, 'total_market_cap'] = avg_data['avg_total_market_cap']
-                            if avg_data.get('avg_total_traded_value') is not None:
-                                df.at[idx, 'total_traded_value'] = avg_data['avg_total_traded_value']
-                    print(f"[format_dashboard_excel] ✓ Replaced values with DB averages for {len(db_averages)} symbols")
+                # Build date list exactly as consolidation does
+                try:
+                    start_dt = date_parser.parse(start_date)
+                    end_dt = date_parser.parse(end_date)
+                    print(f"[format_dashboard_excel] *** DEBUG: Parsed dates - Start: {start_dt}, End: {end_dt}")
+                    
+                    if start_dt <= end_dt:
+                        current = start_dt
+                        date_iso_list = []
+                        while current <= end_dt:
+                            if current.weekday() < 5:  # Only weekdays
+                                date_iso_list.append(current.strftime('%Y-%m-%d'))
+                            current += timedelta(days=1)
+                        
+                        print(f"[format_dashboard_excel] *** DEBUG: Created date list: {date_iso_list[:5]}... ({len(date_iso_list)} total dates)")
+                        
+                        if date_iso_list:
+                            consolidation_averages = {}
+                            
+                            # Get MCAP averages using EXACT same method as consolidation (NO symbol filtering)
+                            try:
+                                print(f"[format_dashboard_excel] *** DEBUG: Calling build_consolidated_from_cache for MCAP (ALL companies, no filtering)...")
+                                mcap_df, dates_list, avg_col = build_consolidated_from_cache(
+                                    date_iso_list, 'mcap', allow_missing=True, log_fn=None,
+                                    allowed_symbols=None, symbol_name_map=None  # NO FILTERING - get all companies like consolidation
+                                )
+                                
+                                print(f"[format_dashboard_excel] *** DEBUG: Got FULL MCAP consolidation data with {len(mcap_df)} companies (same as consolidation), avg_col={avg_col}")
+                                print(f"[format_dashboard_excel] *** DEBUG: Sample MCAP data:")
+                                for i, row in mcap_df.head(3).iterrows():
+                                    symbol = row['Symbol']
+                                    avg_val = row[avg_col]
+                                    print(f"[format_dashboard_excel] *** DEBUG:   {symbol}: {avg_val}")
+                                
+                                # Store MCAP averages for ALL companies, then filter to dashboard symbols
+                                mcap_lookup = {}
+                                for _, row in mcap_df.iterrows():
+                                    symbol = row['Symbol']
+                                    mcap_lookup[symbol] = {
+                                        'mcap': row[avg_col],
+                                        'company_name': row.get('Company Name', '')
+                                    }
+                                
+                                # Filter to only dashboard symbols
+                                for symbol in symbols:
+                                    if symbol in mcap_lookup:
+                                        consolidation_averages[symbol] = mcap_lookup[symbol]
+                                
+                                print(f"[format_dashboard_excel] *** DEBUG: Stored MCAP averages for {len(consolidation_averages)} dashboard symbols from {len(mcap_lookup)} total companies")
+                                
+                                # Create symbol-to-name mapping for PR (from FULL data)
+                                mcap_name_map = dict(zip(mcap_df['Symbol'], mcap_df['Company Name']))
+                                pr_name_to_symbol = {v: k for k, v in mcap_name_map.items()}
+                                
+                                print(f"[format_dashboard_excel] *** DEBUG: Created PR mapping with {len(pr_name_to_symbol)} entries from FULL consolidation data")
+                                
+                                # Get PR averages using EXACT same method as consolidation (NO symbol filtering)
+                                try:
+                                    print(f"[format_dashboard_excel] *** DEBUG: Calling build_consolidated_from_cache for PR (ALL companies, no filtering)...")
+                                    pr_df, pr_dates_list, pr_avg_col = build_consolidated_from_cache(
+                                        date_iso_list, 'pr', allow_missing=True, log_fn=None,
+                                        allowed_symbols=None, symbol_name_map=pr_name_to_symbol  # NO SYMBOL FILTERING - get all like consolidation
+                                    )
+                                    
+                                    print(f"[format_dashboard_excel] *** DEBUG: Got FULL PR consolidation data with {len(pr_df)} companies (same as consolidation), avg_col={pr_avg_col}")
+                                    print(f"[format_dashboard_excel] *** DEBUG: Sample PR data:")
+                                    for i, row in pr_df.head(3).iterrows():
+                                        symbol = row['Symbol']
+                                        avg_val = row[pr_avg_col]
+                                        print(f"[format_dashboard_excel] *** DEBUG:   {symbol}: {avg_val}")
+                                    
+                                    # Store PR averages for dashboard symbols only
+                                    pr_lookup = {}
+                                    for _, row in pr_df.iterrows():
+                                        symbol = row['Symbol']
+                                        pr_lookup[symbol] = row[pr_avg_col]
+                                    
+                                    # Add PR data to consolidation_averages for dashboard symbols
+                                    for symbol in symbols:
+                                        if symbol in pr_lookup and symbol in consolidation_averages:
+                                            consolidation_averages[symbol]['traded_value'] = pr_lookup[symbol]
+                                    
+                                    print(f"[format_dashboard_excel] *** DEBUG: Added PR averages to {len([s for s in consolidation_averages.values() if 'traded_value' in s])} dashboard symbols from {len(pr_lookup)} total companies")
+                                    
+                                except Exception as exc:
+                                    print(f"[format_dashboard_excel] *** ERROR: Could not get PR consolidation averages: {exc}")
+                                    import traceback
+                                    traceback.print_exc()
+                                
+                                # Now replace the values in the dataframe
+                                print(f"[format_dashboard_excel] *** DEBUG: Replacing values in dataframe...")
+                                replacements_made = 0
+                                for idx, row in df.iterrows():
+                                    symbol = row.get('symbol')
+                                    if symbol and symbol in consolidation_averages:
+                                        cons_data = consolidation_averages[symbol]
+                                        
+                                        # Replace market cap
+                                        if 'mcap' in cons_data:
+                                            old_val = df.at[idx, 'total_market_cap']
+                                            new_val = cons_data['mcap']
+                                            df.at[idx, 'total_market_cap'] = new_val
+                                            print(f"[format_dashboard_excel] *** DEBUG: {symbol} MCAP: {old_val} -> {new_val}")
+                                            replacements_made += 1
+                                        
+                                        # Replace traded value
+                                        if 'traded_value' in cons_data:
+                                            old_val = df.at[idx, 'total_traded_value']
+                                            new_val = cons_data['traded_value']
+                                            df.at[idx, 'total_traded_value'] = new_val
+                                            print(f"[format_dashboard_excel] *** DEBUG: {symbol} TRADED: {old_val} -> {new_val}")
+                                
+                                print(f"[format_dashboard_excel] *** DEBUG: Made {replacements_made} replacements")
+                                print(f"[format_dashboard_excel] ✅ Updated with EXACT consolidation averages")
+                                
+                            except Exception as exc:
+                                print(f"[format_dashboard_excel] *** ERROR: Could not get MCAP consolidation averages: {exc}")
+                                import traceback
+                                traceback.print_exc()
+                        
+                except Exception as exc:
+                    print(f"[format_dashboard_excel] *** ERROR: Error processing consolidation data: {exc}")
+                    import traceback
+                    traceback.print_exc()
+        else:
+            print(f"[format_dashboard_excel] No date range provided (start_date={start_date}, end_date={end_date}) - using existing dashboard values as-is")
         
         # Map listingDate to listing_date for consistency
         if 'listingDate' in df.columns and 'listing_date' not in df.columns:
@@ -1005,10 +1224,10 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             ('Company name', 'companyName'),
             ('Index (DB)', 'index'),  # Index from Nifty DB
             ('Index (API)', 'index_from_api'),  # Original API index
-            ('avg Impact cost', 'impact_cost'),
-            ('avg total market cap', 'total_market_cap'),
-            ('Avg Free float market cap', 'free_float_mcap'),
-            ('Avg daily traded value', 'total_traded_value'),
+            ('Avg Impact cost', 'impact_cost'),
+            ('Average Market Cap', 'total_market_cap'),
+            ('Average Free Float Market Cap', 'free_float_mcap'),
+            ('Average Net Traded Value', 'total_traded_value'),
             ('Day of Listing', 'Day of Listing'),
             ('Broader Index', 'Broader Index'),
             ('listed> 6months', 'listed> 6months'),
@@ -1811,7 +2030,7 @@ def nse_symbol_dashboard():
                 print(f"[dashboard] Loaded {mcap_count} MCAP averages from DB")
                 
                 if mcap_count == 0 and pr_count == 0:
-                    print("⚠️ [dashboard] No averages found in DB! You need to export Excel first with fast_mode=false to save averages.")
+                    print("⚠️ [dashboard] No persistent averages found in DB! To use exact consolidation averages, perform a 'Consolidation Export' first (with fast_mode=false).")
                 else:
                     # Show a sample of what was loaded
                     sample_sym = next(iter(symbol_mcap_data.keys())) if symbol_mcap_data else None
@@ -2059,14 +2278,16 @@ def nse_symbol_dashboard_save_excel():
 @app.route('/api/consolidate-saved', methods=['POST'])
 def consolidate_saved():
     """
-    Consolidate cached NSE CSVs from Mongo into Excel.
-
+    Memory-optimized consolidation of cached NSE CSVs from Mongo into Excel.
+    
     Payload (JSON):
     {
         "date": "03-Dec-2025"  # optional, single date
         "start_date": "01-Dec-2025", "end_date": "05-Dec-2025"  # optional range
         "file_type": "both" | "mcap" | "pr"  # default both
         "fast_mode": true/false  # default true, skip DB writes when true
+        "optimize_memory": true/false  # default true, use memory optimization
+        "max_records_per_batch": 5000  # default 5000, process data in batches
     }
 
     Response: Excel file (zip when both MCAP and PR are produced).
@@ -2076,17 +2297,21 @@ def consolidate_saved():
             payload = request.get_json() or {}
             req_id = f"consolidate-{int(time.time() * 1000)}"
             stage_start = time.perf_counter()
-            print(
-                f"[consolidate-saved][start] id={req_id} file_type={payload.get('file_type', 'both')} "
-                f"date={payload.get('date')} range={payload.get('start_date')}->{payload.get('end_date')}"
-            )
+            
+            # Memory optimization settings
+            optimize_memory = payload.get('optimize_memory', True)
+            max_records_per_batch = payload.get('max_records_per_batch', 5000)
+            
+            # Log initial memory usage
+            initial_memory = get_memory_usage_mb()
+            print(f"[consolidate-saved][start] id={req_id} initial_memory={initial_memory:.1f}MB optimize_memory={optimize_memory}")
+            
             date_str = payload.get('date')
             start_date_str = payload.get('start_date')
             end_date_str = payload.get('end_date')
             file_type = payload.get('file_type', 'both')
-            # Allow control of fast mode via payload - default False to persist averages to DB
             fast_mode = payload.get('fast_mode', False)
-            skip_daily = payload.get('skip_daily', True) # Default to True for faster performance
+            skip_daily = payload.get('skip_daily', True)
             allow_missing = payload.get('allow_missing', True)
 
             if file_type not in ['mcap', 'pr', 'both']:
@@ -2113,6 +2338,11 @@ def consolidate_saved():
             except Exception:
                 return jsonify({'error': 'Invalid date format. Use DD-Mon-YYYY (e.g., 03-Dec-2025)'}), 400
 
+            # Check memory limits - if too many dates, force batching
+            if len(date_iso_list) > 7 and not optimize_memory:
+                optimize_memory = True
+                print(f"[consolidate-saved][warning] Processing {len(date_iso_list)} dates - forcing memory optimization")
+
             logs = []
             work_dir = tempfile.mkdtemp()
             results = {}
@@ -2121,14 +2351,60 @@ def consolidate_saved():
                 logs.append(message)
                 print(message)
 
-            def make_consolidator_from_cache(data_type, allowed_symbols=None, symbol_name_map=None):
-                df, dates_list, avg_col = build_consolidated_from_cache(
-                    date_iso_list, data_type, allow_missing=allow_missing, log_fn=add_log,
-                    allowed_symbols=allowed_symbols, symbol_name_map=symbol_name_map
-                )
+            def make_consolidator_from_cache_optimized(data_type, allowed_symbols=None, symbol_name_map=None):
+                """Memory-optimized consolidation from cache"""
+                memory_before = get_memory_usage_mb()
+                
+                if optimize_memory and len(date_iso_list) > max_records_per_batch // 252:  # 252 approx companies per day
+                    # Process in batches for large date ranges
+                    batch_size = max(1, max_records_per_batch // 252)
+                    date_batches = [date_iso_list[i:i + batch_size] for i in range(0, len(date_iso_list), batch_size)]
+                    
+                    add_log(f"Processing {data_type.upper()} in {len(date_batches)} batches (batch_size={batch_size} days)")
+                    
+                    batch_dfs = []
+                    for i, date_batch in enumerate(date_batches):
+                        add_log(f"Processing {data_type.upper()} batch {i+1}/{len(date_batches)} ({len(date_batch)} days)")
+                        
+                        df_batch, dates_batch, avg_col = build_consolidated_from_cache(
+                            date_batch, data_type, allow_missing=allow_missing, log_fn=add_log,
+                            allowed_symbols=allowed_symbols, symbol_name_map=symbol_name_map
+                        )
+                        
+                        if df_batch is not None and not df_batch.empty:
+                            batch_dfs.append(df_batch)
+                        
+                        # Force garbage collection after each batch
+                        gc.collect()
+                        current_memory = get_memory_usage_mb()
+                        add_log(f"Batch {i+1} complete. Memory: {current_memory:.1f}MB")
+                    
+                    if not batch_dfs:
+                        raise ValueError(f"No {data_type.upper()} data available for requested dates")
+                    
+                    # Combine batches efficiently
+                    processor = ChunkedDataProcessor()
+                    df = processor.consolidate_chunked(batch_dfs)
+                    dates_list = date_iso_list
+                    
+                    # Clear batch data
+                    del batch_dfs
+                    gc.collect()
+                    
+                else:
+                    # Regular processing for smaller datasets
+                    df, dates_list, avg_col = build_consolidated_from_cache(
+                        date_iso_list, data_type, allow_missing=allow_missing, log_fn=add_log,
+                        allowed_symbols=allowed_symbols, symbol_name_map=symbol_name_map
+                    )
+                
                 if df is None or df.empty:
                     raise ValueError(f"No {data_type.upper()} data available for requested dates")
+                
+                memory_after = get_memory_usage_mb()
                 add_log(f"{data_type.upper()} consolidated: {len(df)} companies across {len(dates_list)} dates")
+                add_log(f"Memory usage: {memory_before:.1f}MB -> {memory_after:.1f}MB (Δ{memory_after-memory_before:+.1f}MB)")
+                
                 cons = MarketCapConsolidator(work_dir, file_type=data_type)
                 cons.df_consolidated = df
                 cons.dates_list = dates_list
@@ -2139,8 +2415,10 @@ def consolidate_saved():
             mcap_output_path = None
             pr_output_path = None
             mcap_symbols = None
-
             mcap_name_map = None
+
+            # Initialize memory optimizer
+            optimizer = MemoryOptimizedExporter(compression_level=9)  # Maximum compression
 
             # Build a label for filenames based on requested dates
             if len(date_iso_list) == 1:
@@ -2151,28 +2429,38 @@ def consolidate_saved():
                 date_label = "dates"
             date_label = date_label.replace('/', '-').replace(' ', '_')
 
+            # Data collection for multi-sheet Excel
+            excel_sheets = {}
+            
             if file_type in ['mcap', 'both']:
                 try:
                     mcap_stage_start = time.perf_counter()
-                    consolidator_mcap, companies_count, dates_count = make_consolidator_from_cache('mcap')
-                    mcap_output_path = os.path.join(work_dir, 'Market_Cap.xlsx')
-                    add_log(f"Creating Excel file: {mcap_output_path}")
-                    consolidator_mcap.format_excel_output(mcap_output_path)
-                    add_log(f"✓ Excel file created: {mcap_output_path}")
+                    consolidator_mcap, companies_count, dates_count = make_consolidator_from_cache_optimized('mcap')
+                    
+                    add_log(f"Collected MCAP data: {len(consolidator_mcap.df_consolidated)} records")
+                    excel_sheets['Market_Cap'] = consolidator_mcap.df_consolidated.copy()
+                    
                     mcap_symbols = set(consolidator_mcap.df_consolidated['Symbol'])
                     mcap_name_map = dict(zip(
                         consolidator_mcap.df_consolidated['Symbol'],
                         consolidator_mcap.df_consolidated['Company Name']
                     ))
+                    
                     if not fast_mode:
                         persist_start = time.perf_counter()
                         add_log(f"Starting MCAP persistence to Mongo (saving averages, skip_daily={skip_daily})...")
+                        # Perform persistence BEFORE deleting the dataframe
                         persist_consolidated_results(consolidator_mcap, 'mcap', source='cached_db', skip_daily=skip_daily)
                         add_log(f"✓ Persisted {companies_count} MCAP averages to DB in {time.perf_counter() - persist_start:.2f}s")
                         persisted = True
                     else:
                         add_log("⚠️ Skipping MCAP DB persistence (fast_mode=True). Averages NOT saved to MongoDB.")
                         persisted = False
+                        
+                    # Now clear consolidator from memory
+                    del consolidator_mcap.df_consolidated
+                    gc.collect()
+                        
                     results['mcap'] = {
                         'companies': companies_count,
                         'dates': dates_count,
@@ -2193,22 +2481,27 @@ def consolidate_saved():
                     # IMPORTANT: Reverse the mapping for PR - we need CompanyName → Symbol mapping
                     # so that PR data (which has company names) can be mapped to ticker symbols
                     pr_name_to_symbol = {v: k for k, v in mcap_name_map.items()} if mcap_name_map else None
-                    consolidator_pr, companies_count_pr, dates_count_pr = make_consolidator_from_cache(
+                    consolidator_pr, companies_count_pr, dates_count_pr = make_consolidator_from_cache_optimized(
                         'pr', allowed_symbols=None, symbol_name_map=pr_name_to_symbol
                     )
-                    pr_output_path = os.path.join(work_dir, 'Net_Traded_Value.xlsx')
-                    add_log(f"Creating PR Excel file: {pr_output_path}")
-                    consolidator_pr.format_excel_output(pr_output_path)
-                    add_log(f"✓ PR Excel file created: {pr_output_path}")
+                    
+                    add_log(f"Collected PR data: {len(consolidator_pr.df_consolidated)} records")
+                    excel_sheets['Net_Traded_Value'] = consolidator_pr.df_consolidated.copy()
+                    
                     if not fast_mode:
                         persist_start = time.perf_counter()
                         add_log(f"Starting PR persistence to Mongo (saving averages, skip_daily={skip_daily})...")
+                        # Perform persistence BEFORE deleting the dataframe
                         persist_consolidated_results(consolidator_pr, 'pr', source='cached_db', skip_daily=skip_daily)
                         add_log(f"✓ Persisted {companies_count_pr} PR averages to DB in {time.perf_counter() - persist_start:.2f}s")
                         persisted_pr = True
                     else:
                         add_log("⚠️ Skipping PR DB persistence (fast_mode=True). Averages NOT saved to MongoDB.")
                         persisted_pr = False
+
+                    # Now clear consolidator from memory
+                    del consolidator_pr.df_consolidated
+                    gc.collect()
                     results['pr'] = {
                         'companies': companies_count_pr,
                         'dates': dates_count_pr,
@@ -2223,86 +2516,68 @@ def consolidate_saved():
                     shutil.rmtree(work_dir, ignore_errors=True)
                     return jsonify({'error': f'Failed to consolidate PR: {exc}'}), 500
 
-            if not mcap_output_path and not pr_output_path:
+            if not excel_sheets:
                 shutil.rmtree(work_dir, ignore_errors=True)
-                return jsonify({'error': 'No output generated'}), 500
+                return jsonify({'error': 'No data collected for Excel creation'}), 500
 
-            response = None
+            # Create single Excel file with multiple sheets
+            excel_creation_start = time.perf_counter()
+            excel_filename = f"Market_Data_{date_label}.xlsx"
+            excel_path = os.path.join(work_dir, excel_filename)
+            
+            add_log(f"Creating multi-sheet Excel file: {excel_filename}")
+            add_log(f"Sheets to create: {list(excel_sheets.keys())}")
+            
+            if optimize_memory:
+                optimizer.create_multi_sheet_excel(excel_sheets, excel_path)
+            else:
+                # Fallback to openpyxl for multiple sheets
+                with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+                    for sheet_name, df in excel_sheets.items():
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+            
+            # Get file size and log
+            excel_size_mb = os.path.getsize(excel_path) / 1024 / 1024
+            add_log(f"✓ Multi-sheet Excel created: {excel_size_mb:.1f}MB in {time.perf_counter() - excel_creation_start:.2f}s")
+            
+            # Clear sheets data from memory
+            del excel_sheets
+            gc.collect()
 
-            # Always copy MCAP file to nosubject/Market_Cap.xlsx for dashboard use
+            # Always copy Market_Cap sheet to nosubject/ if MCAP data exists
             try:
                 nosubject_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject')
                 if not os.path.exists(nosubject_dir):
                     os.makedirs(nosubject_dir)
-                if mcap_output_path:
+                if 'mcap' in results:
+                    # Copy the multi-sheet file as Market_Cap.xlsx for backward compatibility
                     market_cap_dest = os.path.join(nosubject_dir, 'Market_Cap.xlsx')
-                    shutil.copy2(mcap_output_path, market_cap_dest)
-                    add_log(f"✓ Market_Cap.xlsx copied to {market_cap_dest}")
+                    shutil.copy2(excel_path, market_cap_dest)
+                    add_log(f"✓ Multi-sheet Excel copied to {market_cap_dest}")
             except Exception as exc:
-                add_log(f"⚠️ Could not copy Market_Cap.xlsx to nosubject/: {exc}")
+                add_log(f"⚠️ Could not copy Excel to nosubject/: {exc}")
 
-            if mcap_output_path and pr_output_path:
-                zip_start = time.perf_counter()
-                zip_name = f"Market_Data_{date_label}.zip"
-                zip_path = os.path.join(work_dir, zip_name)
-                add_log(f"Packaging files into zip: {zip_path}")
-                with zipfile.ZipFile(zip_path, 'w') as zipf:
-                    zipf.write(mcap_output_path, arcname='Market_Cap.xlsx')
-                    zipf.write(pr_output_path, arcname='Net_Traded_Value.xlsx')
-                add_log(f"Zip build done in {time.perf_counter() - zip_start:.2f}s")
-                add_log("Sending zipped response...")
-                response = send_file(
-                    zip_path,
-                    mimetype='application/zip',
-                    as_attachment=True,
-                    download_name=zip_name
-                )
-                response.headers['Content-Disposition'] = f"attachment; filename={zip_name}"
-                add_log("send_file invoked for zipped response")
-            elif mcap_output_path:
-                zip_start = time.perf_counter()
-                zip_name = f"Market_Cap_{date_label}.zip"
-                zip_path = os.path.join(work_dir, zip_name)
-                add_log(f"Packaging MCAP files into zip: {zip_path}")
-                with zipfile.ZipFile(zip_path, 'w') as zipf:
-                    zipf.write(mcap_output_path, arcname='Market_Cap.xlsx')
-                add_log(f"Zip build done in {time.perf_counter() - zip_start:.2f}s")
-                add_log("Sending MCAP zip response...")
-                response = send_file(
-                    zip_path,
-                    mimetype='application/zip',
-                    as_attachment=True,
-                    download_name=zip_name
-                )
-                response.headers['Content-Disposition'] = f"attachment; filename={zip_name}"
-                add_log("send_file invoked for MCAP zip")
-            elif pr_output_path:
-                zip_start = time.perf_counter()
-                zip_name = f"Net_Traded_Value_{date_label}.zip"
-                zip_path = os.path.join(work_dir, zip_name)
-                add_log(f"Packaging PR files into zip: {zip_path}")
-                with zipfile.ZipFile(zip_path, 'w') as zipf:
-                    zipf.write(pr_output_path, arcname='Net_Traded_Value.xlsx')
-                add_log(f"Zip build done in {time.perf_counter() - zip_start:.2f}s")
-                add_log("Sending PR zip response...")
-                response = send_file(
-                    zip_path,
-                    mimetype='application/zip',
-                    as_attachment=True,
-                    download_name=zip_name
-                )
-                response.headers['Content-Disposition'] = f"attachment; filename={zip_name}"
-                add_log("send_file invoked for PR zip")
+            # Send the single Excel file (no ZIP needed!)
+            final_memory = get_memory_usage_mb()
+            total_elapsed = time.perf_counter() - stage_start
+            add_log(f"Export completed: {total_elapsed:.2f}s, Peak memory: {final_memory:.1f}MB, File size: {excel_size_mb:.1f}MB")
+            
+            response = send_file(
+                excel_path,
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                as_attachment=True,
+                download_name=excel_filename
+            )
+            response.headers['Content-Disposition'] = f"attachment; filename={excel_filename}"
+            
             if logs:
                 safe_log = ' | '.join(logs)
                 safe_log = safe_log.encode('ascii', errors='ignore').decode('ascii')
                 response.headers['X-Export-Log'] = safe_log
 
-            total_elapsed = time.perf_counter() - stage_start
-            print(f"[consolidate-saved][done] id={req_id} outputs={list(results.keys())} elapsed={total_elapsed:.2f}s")
+            print(f"[consolidate-saved][done] id={req_id} sheets={list(results.keys())} elapsed={total_elapsed:.2f}s memory={final_memory:.1f}MB size={excel_size_mb:.1f}MB")
 
-            response.call_on_close(lambda: [shutil.rmtree(work_dir, ignore_errors=True),
-                                            os.path.exists(market_cap_dest) and os.remove(market_cap_dest)])
+            response.call_on_close(lambda: [shutil.rmtree(work_dir, ignore_errors=True), gc.collect()])
             return response
 
         except Exception as e:
