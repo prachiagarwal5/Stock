@@ -144,43 +144,21 @@ class SymbolMetricsFetcher:
             'symbol': symbol
         }
         
-        max_tries = 3
-        last_exc = None
+        resp = sess.get(self.BASE_URL, params=params, headers=self.headers, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise ValueError(f"NSE getSymbolData error {resp.status_code} for {symbol} ({series})")
         
-        for attempt in range(max_tries):
-            try:
-                if attempt > 0:
-                    time.sleep(0.5) # Short delay between retries
-                    print(f"[retry] symbol {symbol} ({series}) attempt {attempt+1}/{max_tries}...")
-                
-                resp = sess.get(self.BASE_URL, params=params, headers=self.headers, timeout=self.timeout)
-                if resp.status_code != 200:
-                    raise ValueError(f"NSE getSymbolData error {resp.status_code} for {symbol} ({series})")
-                
-                try:
-                    payload = resp.json() if resp.content else {}
-                except Exception:
-                    raise ValueError(f"Invalid JSON for {symbol} ({series})")
-                    
-                equity_list = payload.get('equityResponse') or []
-                if not equity_list:
-                    message = payload.get('msg') or payload.get('message') or 'No equityResponse'
-                    raise ValueError(f"{message} for {symbol} ({series})")
-                
-                return equity_list[0] or {}
-                
-            except Exception as e:
-                last_exc = e
-                # Only retry on 404 or No equityResponse errors
-                if 'error 404' in str(e) or 'No equityResponse' in str(e):
-                    continue
-                else:
-                    # For other errors (timeout, connection, etc.), we can also retry or let it fail
-                    # User specifically mentioned 404s, so we focus on that.
-                    continue
-
-        # If all retries failed
-        raise last_exc
+        try:
+            payload = resp.json() if resp.content else {}
+        except Exception:
+            raise ValueError(f"Invalid JSON for {symbol} ({series})")
+            
+        equity_list = payload.get('equityResponse') or []
+        if not equity_list:
+            message = payload.get('msg') or payload.get('message') or 'No equityResponse'
+            raise ValueError(f"{message} for {symbol} ({series})")
+        
+        return equity_list[0] or {}
 
     def fetch_symbol_data(self, symbol, series='EQ', as_of=None, session=None):
         as_on = as_of or datetime.now().strftime('%Y-%m-%d')
