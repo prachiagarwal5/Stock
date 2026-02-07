@@ -12,23 +12,45 @@ A new MongoDB collection has been created to store daily values for each symbol:
 
 **Collection Name:** `symbol_metrics_daily`
 
-**Schema:**
+**Schema:** ⚡ **One document per stock** with date-wise data nested inside
 ```json
 {
   "symbol": "RELIANCE",
   "company_name": "Reliance Industries Limited",
-  "date": "2026-02-02",
-  "impact_cost": 0.05,
-  "free_float_mcap": 1234567890.50,
-  "total_market_cap": 1500000000.00,
-  "total_traded_value": 5000000.00,
-  "source": "symbol_dashboard",
-  "updated_at": "2026-02-02T10:30:00"
+  "created_at": "2026-02-02T10:30:00",
+  "last_updated": "2026-02-07T15:45:00",
+  "daily_data": [
+    {
+      "date": "2026-02-02",
+      "impact_cost": 0.05,
+      "free_float_mcap": 1234567890.50,
+      "total_market_cap": 1500000000.00,
+      "total_traded_value": 5000000.00,
+      "source": "symbol_dashboard",
+      "updated_at": "2026-02-02T10:30:00"
+    },
+    {
+      "date": "2026-02-03",
+      "impact_cost": 0.04,
+      "free_float_mcap": 1245678901.60,
+      "total_market_cap": 1510000000.00,
+      "total_traded_value": 5200000.00,
+      "source": "symbol_dashboard",
+      "updated_at": "2026-02-03T11:00:00"
+    }
+  ]
 }
 ```
 
-**Index:**
-- Unique compound index on `(symbol, date)` for efficient querying and preventing duplicates
+**Benefits:**
+- ✅ Only 1 document per stock (e.g., 1000 stocks = 1000 documents total)
+- ✅ No duplicate data - each date is stored once within the array
+- ✅ If data for a date already exists, it gets replaced automatically
+- ✅ Easy to query and calculate averages
+
+**Indexes:**
+- Unique index on `symbol` for fast lookups
+- Index on `daily_data.date` for date range queries
 
 ### 2. **Automatic Storage on Dashboard Build**
 
@@ -38,13 +60,34 @@ When the dashboard is built (via `/api/nse-symbol-dashboard`), the system now:
 2. **Stores** the values in `symbol_metrics` collection (as before)
 3. **Additionally stores** daily values in `symbol_metrics_daily` collection
 
-**Key Function:** `upsert_symbol_metrics()` in `app.py`
+**Key Function:** `upsert_symbol_metrics()` in [app.py](../Backend/app.py)
 
 This function has been updated to:
 - Store complete symbol metrics in `symbol_metrics` collection
 - Extract and store daily metrics (`impact_cost`, `free_float_mcap`, `total_market_cap`, `total_traded_value`) in `symbol_metrics_daily` collection
-- Use the `as_on` date as the date key
-- **Replace** existing values if the same symbol and date already exist (upsert behavior)
+- **One document per stock**: Each stock has ONE document with a `daily_data` array
+- **Date-wise storage**: Each date's data is stored as an object in the `daily_data` array
+- **Automatic replacement**: If data for a date already exists, it gets removed and replaced with new values
+- **No duplicates**: The `$pull` operation removes old data for the same date before `$push` adds the new data
+
+**How it works:**
+```javascript
+// Step 1: Ensure document exists for the symbol
+update({ symbol: "RELIANCE" }, { 
+  $set: { company_name: "...", last_updated: "..." },
+  $setOnInsert: { symbol: "RELIANCE", created_at: "..." }
+}, { upsert: true })
+
+// Step 2: Remove existing entry for this date (if any)
+update({ symbol: "RELIANCE" }, {
+  $pull: { daily_data: { date: "2026-02-02" } }
+})
+
+// Step 3: Add new entry for this date
+update({ symbol: "RELIANCE" }, {
+  $push: { daily_data: { date: "2026-02-02", impact_cost: 0.05, ... } }
+})
+```
 
 ### 3. **Average Calculation from Database**
 
@@ -71,11 +114,25 @@ This function has been updated to:
 }
 ```
 
-**How it works:**
-- Uses MongoDB aggregation pipeline
-- Groups by symbol
-- Calculates average using `$avg` operator
-- Filters by date range if provided
+**How it works with new schema:**
+```javascript
+// Step 1: Match symbols
+{ $match: { symbol: { $in: ['RELIANCE', 'TCS'] } } }
+
+// Step 2: Unwind daily_data array to process each date entry
+{ $unwind: '$daily_data' }
+
+// Step 3: Filter by date range (if provided)
+{ $match: { 'daily_data.date': { $gte: '2026-02-01', $lte: '2026-02-07' } } }
+
+// Step 4: Calculate averages per symbol
+{ $group: {
+    _id: '$symbol',
+    avg_impact_cost: { $avg: '$daily_data.impact_cost' },
+    avg_free_float_mcap: { $avg: '$daily_data.free_float_mcap' },
+    ...
+}}
+```
 
 ### 4. **Excel Export with Calculated Averages**
 

@@ -61,9 +61,12 @@ dotenv.load_dotenv()
 # MongoDB connection
 try:
     # Hardcoded MongoDB connection string (as per user request)
-    mongo_uri = "mongodb+srv://prachiagrawal509:BSzCRUTG8F7voUBv@cluster0.kfbej.mongodb.net/?appName=Cluster0/Stocks"
+    mongo_uri = "mongodb+srv://prachiagrawal509:BSzCRUTG8F7voUBv@cluster0.kfbej.mongodb.net/Stocks?retryWrites=true&w=majority"
     
-    mongo_client = MongoClient(mongo_uri)
+    print(f"🔄 Connecting to MongoDB...")
+    mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
+    # Test the connection
+    mongo_client.admin.command('ping')
     db = mongo_client['Stocks']
     excel_results_collection = db['excel_results']
     bhavcache_collection = db['bhavcache']
@@ -72,6 +75,8 @@ try:
     symbol_metrics_collection = db['symbol_metrics']  # Symbol dashboard metrics
     symbol_metrics_daily_collection = db['symbol_metrics_daily']  # Daily impact_cost and free_float_mcap
     nifty_indices_collection = db['nifty_indices']  # Nifty index constituent mappings
+    
+    print(f"🔄 Creating indexes...")
     # speed-critical indexes
     symbol_daily_collection.create_index(
         [('symbol', 1), ('type', 1), ('date', 1)], name='symbol_type_date', unique=True
@@ -82,11 +87,28 @@ try:
         name='symbol_type_range', unique=False
     )
     bhavcache_collection.create_index([('type', 1), ('date', 1)], name='type_date_cache')
-    symbol_metrics_daily_collection.create_index([('symbol', 1), ('date', 1)], name='symbol_date_daily', unique=True)
+    
+    # New schema: one document per symbol with date-wise nested data
+    # Drop old collection to migrate to new schema if duplicates exist
+    try:
+        symbol_metrics_daily_collection.create_index([('symbol', 1)], name='symbol_idx', unique=True)
+    except Exception as idx_err:
+        if 'duplicate key' in str(idx_err).lower() or 'E11000' in str(idx_err):
+            print(f"⚠️ Found old schema data with duplicates. Migrating to new schema...")
+            print(f"⚠️ Dropping old symbol_metrics_daily collection data...")
+            symbol_metrics_daily_collection.drop()
+            print(f"✓ Collection dropped. Creating fresh indexes...")
+            symbol_metrics_daily_collection.create_index([('symbol', 1)], name='symbol_idx', unique=True)
+        else:
+            raise
+    
+    symbol_metrics_daily_collection.create_index([('daily_data.date', 1)], name='daily_date_idx')
     nifty_indices_collection.create_index([('symbol', 1)], name='symbol_idx', unique=True)
     print("✅ MongoDB connected successfully")
 except Exception as e:
     print(f"⚠️ MongoDB connection failed: {e}")
+    import traceback
+    traceback.print_exc()
     db = None
     excel_results_collection = None
     bhavcache_collection = None
@@ -313,11 +335,11 @@ def upsert_symbol_metrics(row, source='nse_symbol_metrics'):
             upsert=True
         )
         
-        # Also store daily impact_cost and free_float_mcap values
+        # Store date-wise data in one document per symbol
+        # Schema: { symbol: "RELIANCE", company_name: "...", daily_data: [{date: "2026-02-02", impact_cost: ..., free_float_mcap: ...}, ...] }
         if symbol_metrics_daily_collection is not None:
-            daily_payload = {
-                'symbol': symbol,
-                'company_name': row.get('companyName'),
+            company_name = row.get('companyName') or row.get('company_name') or ''
+            daily_entry = {
                 'date': as_on,
                 'impact_cost': _safe_float(row.get('impact_cost')),
                 'free_float_mcap': _safe_float(row.get('free_float_mcap')),
@@ -326,10 +348,33 @@ def upsert_symbol_metrics(row, source='nse_symbol_metrics'):
                 'source': source,
                 'updated_at': datetime.now().isoformat()
             }
+            
+            # Update or insert the document for this symbol
+            # If date already exists in daily_data array, replace it; otherwise add it
             symbol_metrics_daily_collection.update_one(
-                {'symbol': symbol, 'date': as_on},
-                {'$set': daily_payload},
+                {'symbol': symbol},
+                {
+                    '$set': {
+                        'company_name': company_name,
+                        'last_updated': datetime.now().isoformat()
+                    },
+                    '$setOnInsert': {
+                        'symbol': symbol,
+                        'created_at': datetime.now().isoformat()
+                    }
+                },
                 upsert=True
+            )
+            
+            # Now update the specific date entry in daily_data array
+            # Remove existing entry for this date and add new one
+            symbol_metrics_daily_collection.update_one(
+                {'symbol': symbol},
+                {'$pull': {'daily_data': {'date': as_on}}}
+            )
+            symbol_metrics_daily_collection.update_one(
+                {'symbol': symbol},
+                {'$push': {'daily_data': daily_entry}}
             )
     except Exception as exc:
         print(f"⚠️ Failed to upsert symbol_metrics for {row.get('symbol')}: {exc}")
@@ -960,35 +1005,40 @@ def calculate_averages_from_db(symbols, start_date=None, end_date=None):
     if consolidated_averages:
         return consolidated_averages
     
-    # Fallback to original DB method
+    # Fallback to original DB method with new schema
     if symbol_metrics_daily_collection is None or not symbols:
         return {}
     
     try:
-        # Build query
-        query = {'symbol': {'$in': symbols}}
+        # New schema: { symbol: "RELIANCE", daily_data: [{date: "2026-02-02", impact_cost: ..., free_float_mcap: ...}, ...] }
+        # Build aggregation pipeline to unwind daily_data array and filter by date
+        pipeline = [
+            {'$match': {'symbol': {'$in': symbols}}},
+            {'$unwind': '$daily_data'},
+        ]
+        
+        # Add date filter if provided
         if start_date or end_date:
             date_filter = {}
             if start_date:
                 date_filter['$gte'] = start_date
             if end_date:
                 date_filter['$lte'] = end_date
-            query['date'] = date_filter
+            pipeline.append({'$match': {'daily_data.date': date_filter}})
         
-        # Aggregate to calculate averages per symbol
-        pipeline = [
-            {'$match': query},
+        # Calculate averages
+        pipeline.extend([
             {
                 '$group': {
                     '_id': '$symbol',
-                    'avg_impact_cost': {'$avg': '$impact_cost'},
-                    'avg_free_float_mcap': {'$avg': '$free_float_mcap'},
-                    'avg_total_market_cap': {'$avg': '$total_market_cap'},
-                    'avg_total_traded_value': {'$avg': '$total_traded_value'},
+                    'avg_impact_cost': {'$avg': '$daily_data.impact_cost'},
+                    'avg_free_float_mcap': {'$avg': '$daily_data.free_float_mcap'},
+                    'avg_total_market_cap': {'$avg': '$daily_data.total_market_cap'},
+                    'avg_total_traded_value': {'$avg': '$daily_data.total_traded_value'},
                     'count': {'$sum': 1}
                 }
             }
-        ]
+        ])
         
         result = {}
         for doc in symbol_metrics_daily_collection.aggregate(pipeline):
@@ -2359,6 +2409,8 @@ def consolidate_saved():
 
     Response: Excel file (zip when both MCAP and PR are produced).
     """
+    work_dir = None  # Initialize early to avoid UnboundLocalError in exception handlers
+    req_id = None
     try:
         try:
             payload = request.get_json() or {}
@@ -2650,11 +2702,15 @@ def consolidate_saved():
             return response
 
         except Exception as e:
-            shutil.rmtree(work_dir, ignore_errors=True)
-            print(f"[consolidate-saved][error] id={req_id} {e}")
+            if work_dir:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            error_msg = f"id={req_id} {e}" if req_id else str(e)
+            print(f"[consolidate-saved][error] {error_msg}")
             return jsonify({'error': str(e)}), 500
 
     except Exception as e:
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
         print(f"[consolidate-saved][error] {e}")
         return jsonify({'error': str(e)}), 500
 
