@@ -34,12 +34,32 @@ from memory_optimized_export import MemoryOptimizedExporter, ChunkedDataProcesso
 import gc
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"], "allow_headers": ["Content-Type", "Authorization"]}})
 
+# Enhanced CORS configuration for production deployment
+CORS(app, 
+     resources={r"/*": {
+         "origins": "*",
+         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+         "allow_headers": ["Content-Type", "Authorization", "Accept", "X-Requested-With"],
+         "expose_headers": ["Content-Disposition", "X-Export-Log"],
+         "supports_credentials": False,
+         "max_age": 3600
+     }})
 
 @app.after_request
-def add_cors_expose_headers(response):
-    expose = response.headers.get('Access-Control-Expose-Headers')
+def add_cors_headers(response):
+    # Ensure CORS headers are present (fallback for production)
+    if 'Access-Control-Allow-Origin' not in response.headers:
+        response.headers['Access-Control-Allow-Origin'] = '*'
+    
+    if 'Access-Control-Allow-Methods' not in response.headers:
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    
+    if 'Access-Control-Allow-Headers' not in response.headers:
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Accept, X-Requested-With'
+    
+    # Add expose headers
+    expose = response.headers.get('Access-Control-Expose-Headers', '')
     needed = ['Content-Disposition', 'X-Export-Log']
     if expose:
         existing = [h.strip() for h in expose.split(',') if h.strip()]
@@ -49,7 +69,19 @@ def add_cors_expose_headers(response):
         if h not in existing:
             existing.append(h)
     response.headers['Access-Control-Expose-Headers'] = ', '.join(existing)
+    
     return response
+
+@app.before_request
+def handle_preflight():
+    """Handle OPTIONS preflight requests"""
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Accept, X-Requested-With'
+        response.headers['Access-Control-Max-Age'] = '3600'
+        return response
 
 @app.route("/")
 def home():
