@@ -1695,32 +1695,77 @@ def download_nse_range():
             pr_df = cached_pr['df'] if cached_pr else None
 
             if need_mcap or need_pr:
-                try:
-                    api_url = "https://www.nseindia.com/api/reports"
-                    params = {
-                        'archives': json.dumps([{
-                            "name": "CM - Bhavcopy (PR.zip)",
-                            "type": "archives",
-                            "category": "capital-market",
-                            "section": "equities"
-                        }]),
-                        'date': nse_date_formatted,
-                        'type': 'equities',
-                        'mode': 'single'
-                    }
+                # Retry logic for network failures
+                max_retries = 3
+                retry_delay = 2  # seconds
+                
+                for attempt in range(max_retries):
+                    try:
+                        api_url = "https://www.nseindia.com/api/reports"
+                        params = {
+                            'archives': json.dumps([{
+                                "name": "CM - Bhavcopy (PR.zip)",
+                                "type": "archives",
+                                "category": "capital-market",
+                                "section": "equities"
+                            }]),
+                            'date': nse_date_formatted,
+                            'type': 'equities',
+                            'mode': 'single'
+                        }
 
-                    headers = {
-                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-                    }
+                        headers = {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            'Accept': 'application/json, text/plain, */*',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'Connection': 'keep-alive'
+                        }
 
-                    response = requests.get(api_url, params=params, headers=headers, timeout=30)
-                    if response.status_code != 200:
+                        response = requests.get(api_url, params=params, headers=headers, timeout=30)
+                        if response.status_code != 200:
+                            if response.status_code == 404:
+                                # 404 means no data for this date (holiday/weekend)
+                                result['errors'].append({
+                                    'date': nse_date_formatted,
+                                    'error': f'NSE API error: {response.status_code} - No data available (possibly a holiday)'
+                                })
+                                result['failed_count'] += 1
+                                return index, result
+                            elif attempt < max_retries - 1:
+                                # Retry for other errors
+                                time.sleep(retry_delay)
+                                continue
+                            else:
+                                result['errors'].append({
+                                    'date': nse_date_formatted,
+                                    'error': f'NSE API error: {response.status_code}'
+                                })
+                                result['failed_count'] += 1
+                                return index, result
+                        break  # Success, exit retry loop
+                    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, 
+                            requests.exceptions.RequestException) as conn_err:
+                        if attempt < max_retries - 1:
+                            print(f"Connection error for {nse_date_formatted} (attempt {attempt+1}/{max_retries}): {conn_err}")
+                            time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                            continue
+                        else:
+                            result['errors'].append({
+                                'date': nse_date_formatted,
+                                'error': f'Connection failed after {max_retries} attempts: {str(conn_err)}'
+                            })
+                            result['failed_count'] += 1
+                            return index, result
+                    except Exception as e:
                         result['errors'].append({
                             'date': nse_date_formatted,
-                            'error': f'NSE API error: {response.status_code}'
+                            'error': f'Error fetching ZIP: {str(e)}'
                         })
                         result['failed_count'] += 1
                         return index, result
+                
+                # If we get here, response is successful
+                try:
 
                     zip_data = BytesIO(response.content)
                     with zipfile.ZipFile(zip_data, 'r') as zip_ref:
@@ -1769,7 +1814,7 @@ def download_nse_range():
                 except Exception as e:
                     result['errors'].append({
                         'date': nse_date_formatted,
-                        'error': f'Error fetching ZIP: {str(e)}'
+                        'error': f'Error processing ZIP file: {str(e)}'
                     })
                     result['failed_count'] += 1
                     return index, result
@@ -1851,6 +1896,31 @@ def download_nse_range():
             downloads_summary['entries'].extend(res['entries'])
             downloads_summary['errors'].extend(res['errors'])
 
+        # Categorize errors for better user feedback
+        error_categories = {
+            'holidays': [],
+            'network': [],
+            'other': []
+        }
+        
+        for error in downloads_summary['errors']:
+            error_msg = error.get('error', '').lower()
+            if '404' in error_msg or 'no data available' in error_msg or 'holiday' in error_msg:
+                error_categories['holidays'].append(error['date'])
+            elif 'connection' in error_msg or 'resolve' in error_msg or 'getaddrinfo' in error_msg or 'timeout' in error_msg:
+                error_categories['network'].append(error['date'])
+            else:
+                error_categories['other'].append(error)
+        
+        # Build helpful error summary
+        error_summary = []
+        if error_categories['holidays']:
+            error_summary.append(f"No data available (likely holidays): {', '.join(error_categories['holidays'])}")
+        if error_categories['network']:
+            error_summary.append(f"Network/connection errors: {', '.join(error_categories['network'])} - Try again later or check internet connection")
+        if error_categories['other']:
+            error_summary.append(f"{len(error_categories['other'])} other errors - check details below")
+
         return jsonify({
             'success': True,
             'summary': {
@@ -1859,7 +1929,8 @@ def download_nse_range():
                 'fetched': downloads_summary['fetched_count'],
                 'failed': downloads_summary['failed_count'],
                 'refresh_mode': refresh_mode,
-                'parallel_workers': parallel_workers
+                'parallel_workers': parallel_workers,
+                'error_summary': error_summary
             },
             'entries': downloads_summary['entries'],
             'errors': downloads_summary['errors']
@@ -2474,48 +2545,16 @@ def consolidate_saved():
                 """Memory-optimized consolidation from cache"""
                 memory_before = get_memory_usage_mb()
                 
-                if optimize_memory and len(date_iso_list) > max_records_per_batch // 252:  # 252 approx companies per day
-                    # Process in batches for large date ranges
-                    batch_size = max(1, max_records_per_batch // 252)
-                    date_batches = [date_iso_list[i:i + batch_size] for i in range(0, len(date_iso_list), batch_size)]
-                    
-                    add_log(f"Processing {data_type.upper()} in {len(date_batches)} batches (batch_size={batch_size} days)")
-                    
-                    batch_dfs = []
-                    for i, date_batch in enumerate(date_batches):
-                        add_log(f"Processing {data_type.upper()} batch {i+1}/{len(date_batches)} ({len(date_batch)} days)")
-                        
-                        df_batch, dates_batch, avg_col = build_consolidated_from_cache(
-                            date_batch, data_type, allow_missing=allow_missing, log_fn=add_log,
-                            allowed_symbols=allowed_symbols, symbol_name_map=symbol_name_map
-                        )
-                        
-                        if df_batch is not None and not df_batch.empty:
-                            batch_dfs.append(df_batch)
-                        
-                        # Force garbage collection after each batch
-                        gc.collect()
-                        current_memory = get_memory_usage_mb()
-                        add_log(f"Batch {i+1} complete. Memory: {current_memory:.1f}MB")
-                    
-                    if not batch_dfs:
-                        raise ValueError(f"No {data_type.upper()} data available for requested dates")
-                    
-                    # Combine batches efficiently
-                    processor = ChunkedDataProcessor()
-                    df = processor.consolidate_chunked(batch_dfs)
-                    dates_list = date_iso_list
-                    
-                    # Clear batch data
-                    del batch_dfs
-                    gc.collect()
-                    
-                else:
-                    # Regular processing for smaller datasets
-                    df, dates_list, avg_col = build_consolidated_from_cache(
-                        date_iso_list, data_type, allow_missing=allow_missing, log_fn=add_log,
-                        allowed_symbols=allowed_symbols, symbol_name_map=symbol_name_map
-                    )
+                # IMPORTANT: Don't batch the consolidation itself - that causes data loss!
+                # Instead, rely on build_consolidated_from_cache's internal optimizations
+                # Only for EXTREMELY large date ranges (6+ months), process all at once
+                
+                add_log(f"Processing {data_type.upper()} for {len(date_iso_list)} dates")
+                
+                df, dates_list, avg_col = build_consolidated_from_cache(
+                    date_iso_list, data_type, allow_missing=allow_missing, log_fn=add_log,
+                    allowed_symbols=allowed_symbols, symbol_name_map=symbol_name_map
+                )
                 
                 if df is None or df.empty:
                     raise ValueError(f"No {data_type.upper()} data available for requested dates")
