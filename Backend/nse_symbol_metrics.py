@@ -274,8 +274,7 @@ class SymbolMetricsFetcher:
                         if status == 'ok':
                             rows.append(payload)
                         elif status == 'timeout':
-                            # Don't add individual timeout errors, we'll add summary
-                            pass
+                            errors.append(payload)
                         else:
                             errors.append(payload)
         else:

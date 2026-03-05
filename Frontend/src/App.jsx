@@ -455,58 +455,58 @@ function App() {
         let processedSymbols = 0;
 
         try {
-            for (let batchNum = 0; batchNum < TOTAL_BATCHES; batchNum++) {
-                const startSymbol = batchNum * BATCH_SIZE + 1;
-                const endSymbol = Math.min((batchNum + 1) * BATCH_SIZE, TOTAL_SYMBOLS);
+            // Throttled concurrent batch processing (2 at a time)
+            const CONCURRENCY_LIMIT = 2;
+            const batches = Array.from({ length: TOTAL_BATCHES }, (_, i) => i);
 
-                setDashboardBatchProgress({
-                    currentBatch: batchNum + 1,
-                    totalBatches: TOTAL_BATCHES,
-                    symbolsProcessed: processedSymbols,
-                    totalSymbols: TOTAL_SYMBOLS,
-                    status: `Fetching symbols ${startSymbol}-${endSymbol}...`
+            setDashboardBatchProgress({
+                currentBatch: 0,
+                totalBatches: TOTAL_BATCHES,
+                symbolsProcessed: 0,
+                totalSymbols: TOTAL_SYMBOLS,
+                status: `Starting throttled fetch (${CONCURRENCY_LIMIT} batches at a time)...`
+            });
+
+            for (let i = 0; i < batches.length; i += CONCURRENCY_LIMIT) {
+                const chunk = batches.slice(i, i + CONCURRENCY_LIMIT);
+                const chunkPromises = chunk.map(async (batchNum) => {
+                    const payload = {
+                        batch_index: batchNum,
+                        save_to_file: false,
+                        top_n: TOTAL_SYMBOLS,
+                        top_n_by: 'mcap',
+                        start_date: rangeStartDate,
+                        end_date: rangeEndDate
+                    };
+
+                    const response = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) {
+                        const errorData = await response.json();
+                        throw new Error(`Batch ${batchNum + 1} failed: ${errorData.error || 'Request failed'}`);
+                    }
+
+                    const data = await response.json();
+
+                    processedSymbols += (data.rows ? data.rows.length : 0);
+                    setDashboardBatchProgress(prev => ({
+                        ...prev,
+                        currentBatch: prev.currentBatch + 1,
+                        symbolsProcessed: processedSymbols,
+                        status: `✅ Batch ${batchNum + 1} complete`
+                    }));
+
+                    return data;
                 });
 
-                const payload = {
-                    batch_index: batchNum,
-                    save_to_file: false, // Don't save file in backend batch
-                    top_n: TOTAL_SYMBOLS,
-                    top_n_by: 'mcap',
-                    start_date: rangeStartDate, // Use raw YYYY-MM-DD
-                    end_date: rangeEndDate     // Use raw YYYY-MM-DD
-                };
-
-                const response = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify(payload)
-                });
-
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    allErrors.push({ batch: batchNum + 1, error: errorData.error || 'Request failed' });
-                    continue;
-                }
-
-                const data = await response.json();
-                let batchCount = 0;
-                if (data.rows) {
-                    allRows = allRows.concat(data.rows);
-                    batchCount = data.rows.length;
-                }
-                if (data.errors) {
-                    allErrors = allErrors.concat(data.errors);
-                }
-
-                processedSymbols += batchCount;
-                setDashboardBatchProgress({
-                    currentBatch: batchNum + 1,
-                    totalBatches: TOTAL_BATCHES,
-                    symbolsProcessed: processedSymbols,
-                    totalSymbols: TOTAL_SYMBOLS,
-                    status: `✅ Batch ${batchNum + 1} complete (${batchCount} symbols)`
+                const results = await Promise.all(chunkPromises);
+                results.forEach(data => {
+                    if (data.rows) allRows = allRows.concat(data.rows);
+                    if (data.errors) allErrors = allErrors.concat(data.errors);
                 });
             }
 

@@ -844,11 +844,15 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
     df_all_pivot['Days With Data'] = df_all_pivot[available_cols].notna().sum(axis=1)
     df_all_pivot[avg_col] = df_all_pivot[available_cols].mean(axis=1)
 
-    # Remove empty rows
-    df_all_pivot = df_all_pivot[~df_all_pivot[available_cols].isna().all(axis=1)].reset_index(drop=True)
-
     # Sort by average
     df_all_pivot = df_all_pivot.sort_values(by=avg_col, ascending=False, na_position='last').reset_index(drop=True)
+
+    # Convert values to floats for safe calculation (no scaling here, raw values stored in Mongo)
+    if available_cols:
+        for col in available_cols:
+            df_all_pivot[col] = pd.to_numeric(df_all_pivot[col], errors='coerce')
+        
+        df_all_pivot[avg_col] = pd.to_numeric(df_all_pivot[avg_col], errors='coerce')
 
     # Final column order
     final_cols = ['Symbol', 'Company Name', 'Days With Data', avg_col] + available_cols
@@ -1329,6 +1333,17 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             else None, 
             axis=1
         )
+        
+        # Round values to 2 decimals (already raw values, no division by 1M needed)
+        # Fix: impact_cost should NOT be scaled/divided by 1 or 10M here as it's a percentage/ratio
+        numeric_cols_to_round = ['total_market_cap', 'free_float_mcap', 'total_traded_value']
+        for col in numeric_cols_to_round:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').round(2)
+        
+        if 'impact_cost' in df.columns:
+            df['impact_cost'] = pd.to_numeric(df['impact_cost'], errors='coerce').round(2)
+
         
         # Calculate ratio of free float to avg total market cap (current values)
         df['ratio of free float to avg total market cap'] = df.apply(
@@ -2009,7 +2024,7 @@ def nse_symbol_dashboard():
         BATCH_SIZE = 100
         TOTAL_SYMBOLS = 1100
         MAX_TIME_TOTAL = 55
-        MAX_TIME_PER_SYMBOL = 1.0
+        MAX_TIME_PER_SYMBOL = 2.0
         MAX_WORKERS = 50
 
         print(f"[symbol-dashboard][start] id={req_id} batch_index={batch_index} "
@@ -2028,11 +2043,11 @@ def nse_symbol_dashboard():
             # 1. Try MongoDB first (Most robust)
             if symbol_aggregates_collection is not None:
                 try:
-                    # Fetch top 1100 symbols by average market cap
+                    # Fetch top 1100 symbols by average market cap with stable sort
                     db_symbols = list(symbol_aggregates_collection.find(
                         {'type': 'mcap'},
                         {'symbol': 1, 'average': 1}
-                    ).sort('average', -1).limit(TOTAL_SYMBOLS))
+                    ).sort([('average', -1), ('symbol', 1)]).limit(TOTAL_SYMBOLS))
                     
                     if db_symbols:
                         symbols = [s['symbol'] for s in db_symbols]
@@ -2262,60 +2277,66 @@ def nse_symbol_dashboard():
 
         fetcher = SymbolMetricsFetcher()
         
-        for batch_idx, batch_symbols in enumerate(symbol_batches):
-            batch_start = time.perf_counter()
-            try:
-                batch_pr = {s: symbol_pr_data.get(s) for s in batch_symbols if s in symbol_pr_data}
-                batch_mcap = {s: symbol_mcap_data.get(s) for s in batch_symbols if s in symbol_mcap_data}
-                result = fetcher.build_dashboard(
+        # Parallel batch processing
+        print(f"[symbol-dashboard] Starting parallel processing for {total_batches} batches...")
+        
+        with ThreadPoolExecutor(max_workers=min(total_batches, 10)) as executor:
+            future_to_batch = {
+                executor.submit(
+                    fetcher.build_dashboard,
                     batch_symbols,
                     excel_path=None,
                     max_symbols=None,
                     as_of=as_on,
                     parallel=True,
-                    max_workers=MAX_WORKERS,
+                    max_workers=MAX_WORKERS // 5, # Limit workers per batch when running parallel batches
                     chunk_size=5,
-                    symbol_pr_data=batch_pr,
-                    symbol_mcap_data=batch_mcap,
+                    symbol_pr_data={s: symbol_pr_data.get(s) for s in batch_symbols if s in symbol_pr_data},
+                    symbol_mcap_data={s: symbol_mcap_data.get(s) for s in batch_symbols if s in symbol_mcap_data},
                     max_time_seconds=None,
                     fetch_indices_from_csv=False,
                     nifty_indices_collection=nifty_indices_collection
-                )
-                batch_rows = result.get('rows', [])
-                batch_errors = result.get('errors', [])
-                
-                # Enrich with aggregates data (days_with_data)
-                if symbol_aggregates_collection is not None:
-                    try:
-                        for doc in symbol_aggregates_collection.find({'symbol': {'$in': batch_symbols}, 'type': 'pr'}):
-                            sym = doc.get('symbol')
-                            if sym:
-                                for row in batch_rows:
-                                    if row.get('symbol') == sym:
-                                        row['days_with_data'] = doc.get('days_with_data', 0)
-                                        break
-                    except Exception as exc:
-                        print(f"⚠️ Failed to fetch days_with_data for batch: {exc}")
-                
-                # Add primary_index
-                for row in batch_rows:
-                    sym = row.get('symbol')
-                    if sym and sym in index_map:
-                        row['primary_index'] = index_map[sym]
-                all_rows.extend(batch_rows)
-                all_errors.extend(batch_errors)
-                batches_completed += 1
-                batch_elapsed = time.perf_counter() - batch_start
-                print(f"[symbol-dashboard] Batch {batch_idx + 1}/{total_batches}: "
-                      f"{len(batch_rows)}/{len(batch_symbols)} in {batch_elapsed:.1f}s "
-                      f"(total: {len(all_rows)})")
-            except Exception as exc:
-                print(f"[symbol-dashboard] Batch {batch_idx + 1} failed: {exc}")
-                all_errors.append({'batch': batch_idx + 1, 'error': str(exc)})
-                batches_completed += 1
-            # Small delay to avoid rate limiting
-            if batch_idx < total_batches - 1:
-                time.sleep(0.2)
+                ): batch_idx for batch_idx, batch_symbols in enumerate(symbol_batches)
+            }
+            
+            for future in as_completed(future_to_batch):
+                batch_idx = future_to_batch[future]
+                batch_symbols = symbol_batches[batch_idx]
+                try:
+                    result = future.result()
+                    batch_rows = result.get('rows', [])
+                    batch_errors = result.get('errors', [])
+                    
+                    # Enrich with aggregates data (days_with_data)
+                    if symbol_aggregates_collection is not None:
+                        try:
+                            # Optimization: Use a local set for batch symbols check
+                            current_batch_symbols = set(batch_symbols)
+                            for doc in symbol_aggregates_collection.find({'symbol': {'$in': list(current_batch_symbols)}, 'type': 'pr'}):
+                                sym = doc.get('symbol')
+                                if sym:
+                                    for row in batch_rows:
+                                        if row.get('symbol') == sym:
+                                            row['days_with_data'] = doc.get('days_with_data', 0)
+                                            break
+                        except Exception as exc:
+                            print(f"⚠️ Failed to fetch days_with_data for batch {batch_idx+1}: {exc}")
+                    
+                    # Add primary_index
+                    for row in batch_rows:
+                        sym = row.get('symbol')
+                        if sym and sym in index_map:
+                            row['primary_index'] = index_map[sym]
+                            
+                    all_rows.extend(batch_rows)
+                    all_errors.extend(batch_errors)
+                    batches_completed += 1
+                    print(f"[symbol-dashboard] Batch {batch_idx + 1}/{total_batches} completed: {len(batch_rows)} rows")
+                except Exception as exc:
+                    print(f"[symbol-dashboard] Batch {batch_idx + 1} failed: {exc}")
+                    all_errors.append({'batch': batch_idx + 1, 'error': str(exc)})
+                    batches_completed += 1
+
 
         # Persist results
         for row in all_rows:
@@ -2621,96 +2642,137 @@ def consolidate_saved():
 
             # Data collection for multi-sheet Excel
             excel_sheets = {}
-            
-            if file_type in ['mcap', 'both']:
+
+            # Pre-fetch Company Name -> Symbol mapping from Mongo to allow parallel processing
+            prefetched_name_map = {}
+            if symbol_aggregates_collection is not None:
                 try:
-                    mcap_stage_start = time.perf_counter()
-                    consolidator_mcap, companies_count, dates_count = make_consolidator_from_cache_optimized('mcap')
+                    for doc in symbol_aggregates_collection.find({'type': 'mcap'}, {'symbol': 1, 'company_name': 1}):
+                        s, c = doc.get('symbol'), doc.get('company_name')
+                        if s and c: prefetched_name_map[c] = s
+                    if prefetched_name_map:
+                        add_log(f"✓ Pre-fetched {len(prefetched_name_map)} symbol mappings from DB")
+                except:
+                    pass
+
+            def run_mcap():
+                try:
+                    mcap_start = time.perf_counter()
+                    cons, count, d_count = make_consolidator_from_cache_optimized('mcap')
                     
-                    add_log(f"Collected MCAP data: {len(consolidator_mcap.df_consolidated)} records")
-                    excel_sheets['Market_Cap'] = consolidator_mcap.df_consolidated.copy()
+                    # Extract map for PR just in case it's more up-to-date
+                    m_map = dict(zip(cons.df_consolidated['Symbol'], cons.df_consolidated['Company Name']))
                     
-                    mcap_symbols = set(consolidator_mcap.df_consolidated['Symbol'])
-                    mcap_name_map = dict(zip(
-                        consolidator_mcap.df_consolidated['Symbol'],
-                        consolidator_mcap.df_consolidated['Company Name']
-                    ))
+                    sheet_df = cons.df_consolidated.copy()
                     
                     if not fast_mode:
                         persist_start = time.perf_counter()
-                        add_log(f"Starting MCAP persistence to Mongo (saving averages, skip_daily={skip_daily})...")
-                        # Perform persistence BEFORE deleting the dataframe
-                        persist_consolidated_results(consolidator_mcap, 'mcap', source='cached_db', skip_daily=skip_daily)
-                        add_log(f"✓ Persisted {companies_count} MCAP averages to DB in {time.perf_counter() - persist_start:.2f}s")
-                        persisted = True
-                    else:
-                        add_log("⚠️ Skipping MCAP DB persistence (fast_mode=True). Averages NOT saved to MongoDB.")
-                        persisted = False
-                        
-                    # Now clear consolidator from memory
-                    del consolidator_mcap.df_consolidated
-                    del consolidator_mcap
-                    gc.collect()
-                        
-                    results['mcap'] = {
-                        'companies': companies_count,
-                        'dates': dates_count,
-                        'files': len(date_iso_list),
-                        'persisted': persisted
+                        add_log(f"Starting MCAP persistence to Mongo...")
+                        persist_consolidated_results(cons, 'mcap', source='cached_db', skip_daily=skip_daily)
+                        add_log(f"✓ Persisted {count} MCAP averages in {time.perf_counter() - persist_start:.2f}s")
+                    
+                    return {
+                        'cons': cons, 'sheet_df': sheet_df, 'm_map': m_map, 
+                        'results': {'companies': count, 'dates': d_count, 'files': len(date_iso_list), 'persisted': not fast_mode},
+                        'duration': time.perf_counter() - mcap_start
                     }
-                    add_log(f"MCAP stage done in {time.perf_counter() - mcap_stage_start:.2f}s")
-                except ValueError as exc:
-                    shutil.rmtree(work_dir, ignore_errors=True)
-                    return jsonify({'error': str(exc)}), 400
-                except Exception as exc:
-                    shutil.rmtree(work_dir, ignore_errors=True)
-                    return jsonify({'error': f'Failed to consolidate MCAP: {exc}'}), 500
+                except Exception as e:
+                    return {'error': f"MCAP failed: {e}"}
 
-            if file_type in ['pr', 'both']:
+            def run_pr(name_map):
                 try:
-                    pr_stage_start = time.perf_counter()
-                    # IMPORTANT: Reverse the mapping for PR - we need CompanyName → Symbol mapping
-                    # so that PR data (which has company names) can be mapped to ticker symbols
-                    pr_name_to_symbol = {v: k for k, v in mcap_name_map.items()} if mcap_name_map else None
-                    consolidator_pr, companies_count_pr, dates_count_pr = make_consolidator_from_cache_optimized(
-                        'pr', allowed_symbols=None, symbol_name_map=pr_name_to_symbol
+                    pr_start = time.perf_counter()
+                    # Use provided name_map (pre-fetched or live)
+                    pr_map = {v: k for k, v in name_map.items()} if name_map else None
+                    cons, count, d_count = make_consolidator_from_cache_optimized(
+                        'pr', allowed_symbols=None, symbol_name_map=pr_map
                     )
                     
-                    add_log(f"Collected PR data: {len(consolidator_pr.df_consolidated)} records")
-                    excel_sheets['Net_Traded_Value'] = consolidator_pr.df_consolidated.copy()
+                    sheet_df = cons.df_consolidated.copy()
                     
                     if not fast_mode:
                         persist_start = time.perf_counter()
-                        add_log(f"Starting PR persistence to Mongo (saving averages, skip_daily={skip_daily})...")
-                        # Perform persistence BEFORE deleting the dataframe
-                        persist_consolidated_results(consolidator_pr, 'pr', source='cached_db', skip_daily=skip_daily)
-                        add_log(f"✓ Persisted {companies_count_pr} PR averages to DB in {time.perf_counter() - persist_start:.2f}s")
-                        persisted_pr = True
-                    else:
-                        add_log("⚠️ Skipping PR DB persistence (fast_mode=True). Averages NOT saved to MongoDB.")
-                        persisted_pr = False
-
-                    # Now clear consolidator from memory
-                    del consolidator_pr.df_consolidated
-                    del consolidator_pr
-                    gc.collect()
-                    results['pr'] = {
-                        'companies': companies_count_pr,
-                        'dates': dates_count_pr,
-                        'files': len(date_iso_list),
-                        'persisted': persisted_pr
+                        add_log(f"Starting PR persistence to Mongo...")
+                        persist_consolidated_results(cons, 'pr', source='cached_db', skip_daily=skip_daily)
+                        add_log(f"✓ Persisted {count} PR averages in {time.perf_counter() - persist_start:.2f}s")
+                    
+                    return {
+                        'cons': cons, 'sheet_df': sheet_df,
+                        'results': {'companies': count, 'dates': d_count, 'files': len(date_iso_list), 'persisted': not fast_mode},
+                        'duration': time.perf_counter() - pr_start
                     }
-                    add_log(f"PR stage done in {time.perf_counter() - pr_stage_start:.2f}s")
-                except ValueError as exc:
+                except Exception as e:
+                    return {'error': f"PR failed: {e}"}
+
+            # Parallel Execution
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                mcap_task = None
+                pr_task = None
+                
+                if file_type in ['mcap', 'both']:
+                    mcap_task = executor.submit(run_mcap)
+                
+                # If only PR, run with prefetched map
+                if file_type == 'pr':
+                    pr_task = executor.submit(run_pr, prefetched_name_map)
+                
+                # Wait for MCAP if it's running, then start PR if 'both'
+                mcap_data = mcap_task.result() if mcap_task else None
+                if mcap_data and 'error' in mcap_data:
                     shutil.rmtree(work_dir, ignore_errors=True)
-                    return jsonify({'error': str(exc)}), 400
-                except Exception as exc:
+                    return jsonify({'error': mcap_data['error']}), 500
+                
+                if mcap_data:
+                    excel_sheets['Market_Cap'] = mcap_data['sheet_df']
+                    results['mcap'] = mcap_data['results']
+                    add_log(f"MCAP stage done in {mcap_data['duration']:.2f}s")
+                    
+                    # If both, we can now run PR with potentially better map from MCAP
+                    if file_type == 'both':
+                        # Merge prefetched and live map
+                        combined_map = {**prefetched_name_map, **(mcap_data['m_map'] or {})}
+                        pr_task = executor.submit(run_pr, combined_map)
+                
+                # We can now clear MCAP cons from memory if it finished
+                if mcap_data and 'cons' in mcap_data:
+                    del mcap_data['cons'].df_consolidated
+                    del mcap_data['cons']
+                    gc.collect()
+
+                pr_data = pr_task.result() if pr_task else None
+                if pr_data and 'error' in pr_data:
                     shutil.rmtree(work_dir, ignore_errors=True)
-                    return jsonify({'error': f'Failed to consolidate PR: {exc}'}), 500
+                    return jsonify({'error': pr_data['error']}), 500
+                
+                if pr_data:
+                    excel_sheets['Net_Traded_Value'] = pr_data['sheet_df']
+                    results['pr'] = pr_data['results']
+                    add_log(f"PR stage done in {pr_data['duration']:.2f}s")
+                    
+                    # Clear memory
+                    if 'cons' in pr_data:
+                        del pr_data['cons'].df_consolidated
+                        del pr_data['cons']
+                    gc.collect()
 
             if not excel_sheets:
                 shutil.rmtree(work_dir, ignore_errors=True)
                 return jsonify({'error': 'No data collected for Excel creation'}), 500
+
+            # Scale values to Crores and round to 2 decimal places for consolidation Excel only
+            for sheet_name, df_sheet in excel_sheets.items():
+                # Identify columns that should be numeric (excluding Symbol, Company Name, Days With Data)
+                cols_to_scale = [c for c in df_sheet.columns if c not in ['Symbol', 'Company Name', 'Days With Data']]
+                for col in cols_to_scale:
+                    try:
+                        df_sheet[col] = pd.to_numeric(df_sheet[col], errors='coerce')
+                        if pd.api.types.is_numeric_dtype(df_sheet[col]):
+                            # IMPORTANT: Only scale MCAP and Traded Value, NOT impact cost or ratios
+                            # These columns only contain MCAP or Net Traded Value depending on the sheet
+                            df_sheet[col] = (df_sheet[col] / 10000000).round(2)
+                    except:
+                        pass
+                add_log(f"✓ Scaled to Crores and rounded columns in sheet '{sheet_name}'")
 
             # Create single Excel file with multiple sheets
             excel_creation_start = time.perf_counter()

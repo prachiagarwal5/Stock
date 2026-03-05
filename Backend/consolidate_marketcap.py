@@ -257,6 +257,7 @@ class MarketCapConsolidator:
         pivot[self.avg_col] = numeric_dates.mean(axis=1) if not numeric_dates.empty else None
 
         if self.file_type == 'mcap':
+            pivot[self.avg_ff_col] = ff_avg
             columns_order = ['Symbol', 'Company Name', self.days_col, self.avg_col, self.avg_ff_col] + date_cols
         else:
             columns_order = ['Symbol', 'Company Name', self.days_col, self.avg_col] + date_cols
@@ -316,6 +317,20 @@ class MarketCapConsolidator:
         start_excel = time.perf_counter()
 
         df = self.df_consolidated.copy()
+        
+        # Convert numeric columns to Crores for Excel output only
+        # Excluding Symbol, Company Name, Days With Data
+        cols_to_scale = [c for c in df.columns if c not in ['Symbol', 'Company Name', 'Days With Data']]
+        for col in cols_to_scale:
+            try:
+                # IMPORTANT: Only scale MCAP and Traded Value, NOT impact cost or ratios if they were here
+                # In this consolidator, self.value_col is Market Cap or Net Traded Value
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                # If Market Cap or Net Traded Value (division by 10^7)
+                df[col] = (df[col] / 10000000).round(2)
+            except:
+                pass
+
         # Clean NaN/INF so xlsxwriter write_row doesn't fail
         df = df.replace([np.inf, -np.inf], np.nan)
         df = df.where(pd.notna(df), None)

@@ -35,8 +35,8 @@ class MemoryOptimizedExporter:
                 # Try to downcast to smaller types
                 if df[col].dtype == 'int64':
                     df[col] = pd.to_numeric(df[col], downcast='integer')
-                elif df[col].dtype == 'float64':
-                    df[col] = pd.to_numeric(df[col], downcast='float')
+                # IMPORTANT: DO NOT downcast float64 to float32 as it causes
+                # precision artifacts (e.g. 6864.46 becomes 6864.4599609375)
         
         return df
     
