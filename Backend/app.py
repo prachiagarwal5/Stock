@@ -1289,7 +1289,7 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
         # Calculate days since listing
         def calculate_listing_info(listing_date):
             if not listing_date or pd.isna(listing_date):
-                return None, 'N', 'N'
+                return None, 'N', 'N', None
             try:
                 if isinstance(listing_date, str):
                     list_dt = pd.to_datetime(listing_date)
@@ -1300,9 +1300,9 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
                 months_since = days_since / 30.44
                 listed_6m = 'Y' if months_since >= 6 else 'N'
                 listed_1m = 'Y' if months_since >= 1 else 'N'
-                return list_dt.strftime('%Y-%m-%d'), listed_6m, listed_1m
+                return list_dt.strftime('%Y-%m-%d'), listed_6m, listed_1m, days_since
             except:
-                return None, 'N', 'N'
+                return None, 'N', 'N', None
         
         # Determine broader index (use DB index if available, fallback to primary_index or API index)
         def get_broader_index(row):
@@ -1323,6 +1323,7 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
         df['Day of Listing'] = listing_info.apply(lambda x: x[0] if x else None)
         df['listed> 6months'] = listing_info.apply(lambda x: x[1] if x else 'N')
         df['listed> 1 months'] = listing_info.apply(lambda x: x[2] if x else 'N')
+        df['number of days from listing'] = listing_info.apply(lambda x: x[3] if x else None)
         
         df['Broader Index'] = df.apply(get_broader_index, axis=1)
         
@@ -1334,12 +1335,12 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             axis=1
         )
         
-        # Round values to 2 decimals (already raw values, no division by 1M needed)
+        # Round values to 2 decimals and normalize to Crores (divide by 1,00,00,000)
         # Fix: impact_cost should NOT be scaled/divided by 1 or 10M here as it's a percentage/ratio
         numeric_cols_to_round = ['total_market_cap', 'free_float_mcap', 'total_traded_value']
         for col in numeric_cols_to_round:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').round(2)
+                df[col] = (pd.to_numeric(df[col], errors='coerce') / 10000000).round(2)
         
         if 'impact_cost' in df.columns:
             df['impact_cost'] = pd.to_numeric(df['impact_cost'], errors='coerce').round(2)
@@ -1361,10 +1362,11 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             ('Index (DB)', 'index'),  # Index from Nifty DB
             ('Index (API)', 'index_from_api'),  # Original API index
             ('Avg Impact cost', 'impact_cost'),
-            ('Average Market Cap', 'total_market_cap'),
-            ('Average Free Float Market Cap', 'free_float_mcap'),
-            ('Average Net Traded Value', 'total_traded_value'),
+            ('Average Market Cap (Cr)', 'total_market_cap'),
+            ('Average Free Float Market Cap (Cr)', 'free_float_mcap'),
+            ('Average Net Traded Value (Cr)', 'total_traded_value'),
             ('Day of Listing', 'Day of Listing'),
+            ('number of days from listing', 'number of days from listing'),
             ('Broader Index', 'Broader Index'),
             ('listed> 6months', 'listed> 6months'),
             ('listed> 1 months', 'listed> 1 months'),
@@ -1420,15 +1422,16 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             'D': (20, None),  # Index (DB)
             'E': (20, None),  # Index (API)
             'F': (15, numbers.FORMAT_NUMBER_00),  # avg Impact cost
-            'G': (20, '#,##0.00'),  # avg total market cap
-            'H': (22, '#,##0.00'),  # Avg Free float market cap
-            'I': (20, '#,##0.00'),  # Avg daily traded value
+            'G': (24, '#,##0.00'),  # avg total market cap (Cr)
+            'H': (28, '#,##0.00'),  # Avg Free float market cap (Cr)
+            'I': (26, '#,##0.00'),  # Avg daily traded value (Cr)
             'J': (15, None),  # Day of Listing
-            'K': (15, None),  # Broader Index
-            'L': (13, None),  # listed> 6months
-            'M': (13, None),  # listed> 1 months
-            'N': (18, '0.0000'),  # Ratio of avg free float to avg total market cap
-            'O': (18, '0.0000'),  # ratio of free float to avg total market cap
+            'K': (25, None),  # number of days from listing
+            'L': (15, None),  # Broader Index
+            'M': (13, None),  # listed> 6months
+            'N': (13, None),  # listed> 1 months
+            'O': (18, '0.0000'),  # Ratio of avg free float to avg total market cap
+            'P': (18, '0.0000'),  # ratio of free float to avg total market cap
         }
         
         # Apply column formatting
@@ -2089,10 +2092,17 @@ def nse_symbol_dashboard():
             return jsonify({'error': error_msg}), 400
 
         symbols = list(dict.fromkeys(symbols))[:TOTAL_SYMBOLS]  # Remove duplicates, force top 1100
+
+        # Make sure specific user-requested symbols are included even if not in the top 1100
+        required_symbols = ['GANECOS', 'ALLCARGO', 'ATL']
+        for rs in required_symbols:
+            if rs not in symbols:
+                symbols.append(rs)
+                
         total_symbols = len(symbols)
 
         # Always 10 batches of 100
-        symbol_batches = [symbols[i:i + BATCH_SIZE] for i in range(0, TOTAL_SYMBOLS, BATCH_SIZE)]
+        symbol_batches = [symbols[i:i + BATCH_SIZE] for i in range(0, total_symbols, BATCH_SIZE)]
         total_batches = len(symbol_batches)
 
         print(f"[symbol-dashboard] {total_symbols} symbols -> {total_batches} batches of {BATCH_SIZE}")
