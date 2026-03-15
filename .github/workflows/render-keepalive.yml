@@ -1,0 +1,62 @@
+name: Render Keepalive
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: render-keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping-backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate required secret
+        run: |
+          if [ -z "${{ secrets.BACKEND_KEEPALIVE_URL }}" ]; then
+            echo "BACKEND_KEEPALIVE_URL secret is missing"
+            exit 1
+          fi
+
+      - name: Ping keepalive endpoint
+        env:
+          BACKEND_KEEPALIVE_URL: ${{ secrets.BACKEND_KEEPALIVE_URL }}
+          KEEPALIVE_TOKEN: ${{ secrets.KEEPALIVE_TOKEN }}
+        run: |
+          set -e
+
+          echo "Pinging: ${BACKEND_KEEPALIVE_URL}"
+
+          if [ -n "${KEEPALIVE_TOKEN}" ]; then
+            HTTP_CODE=$(curl -sS -o /tmp/keepalive_response.json -w "%{http_code}" \
+              --connect-timeout 10 \
+              --max-time 25 \
+              --retry 2 \
+              --retry-delay 2 \
+              --retry-connrefused \
+              -H "X-Keepalive-Token: ${KEEPALIVE_TOKEN}" \
+              "${BACKEND_KEEPALIVE_URL}")
+          else
+            HTTP_CODE=$(curl -sS -o /tmp/keepalive_response.json -w "%{http_code}" \
+              --connect-timeout 10 \
+              --max-time 25 \
+              --retry 2 \
+              --retry-delay 2 \
+              --retry-connrefused \
+              "${BACKEND_KEEPALIVE_URL}")
+          fi
+
+          echo "HTTP status: ${HTTP_CODE}"
+          echo "Response body:"
+          cat /tmp/keepalive_response.json || true
+
+          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+            echo "Keepalive ping failed with status ${HTTP_CODE}"
+            exit 1
+          fi
+
+          echo "Keepalive ping succeeded"

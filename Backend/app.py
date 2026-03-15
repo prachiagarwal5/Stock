@@ -35,6 +35,9 @@ import gc
 
 app = Flask(__name__)
 
+# Process start marker used by keep-alive endpoint for lightweight diagnostics
+PROCESS_START_TIME = datetime.now()
+
 # Enhanced CORS configuration for production deployment
 CORS(app, 
      resources={r"/*": {
@@ -89,6 +92,28 @@ def home():
 
 # Load environment variables
 dotenv.load_dotenv()
+
+# Keep-alive security settings (for GitHub Actions scheduled pings)
+KEEPALIVE_TOKEN = os.getenv('KEEPALIVE_TOKEN', '').strip()
+KEEPALIVE_ALLOW_UNAUTH = os.getenv('KEEPALIVE_ALLOW_UNAUTH', 'true').strip().lower() == 'true'
+
+
+def _is_keepalive_authorized(req):
+    """Validate keep-alive token if token auth is enabled."""
+    # If unauthenticated access is explicitly allowed, accept request.
+    if KEEPALIVE_ALLOW_UNAUTH:
+        return True
+
+    if not KEEPALIVE_TOKEN:
+        # No token configured while unauthenticated access is disabled.
+        return False
+
+    provided = (
+        req.headers.get('X-Keepalive-Token')
+        or req.args.get('token')
+        or req.headers.get('Authorization', '').replace('Bearer ', '', 1)
+    )
+    return bool(provided) and provided.strip() == KEEPALIVE_TOKEN
 
 # MongoDB connection
 try:
@@ -880,6 +905,31 @@ def health():
         'status': 'ok',
         'message': 'Market Cap Consolidation Service is running'
     }), 200
+
+
+@app.route('/api/keepalive', methods=['GET'])
+def keepalive():
+    """
+    Lightweight keep-alive endpoint for external schedulers (e.g., GitHub Actions).
+
+    Suggested use on Render free plan:
+    - Ping every 5-10 minutes.
+    - Set KEEPALIVE_ALLOW_UNAUTH=false and configure KEEPALIVE_TOKEN for protection.
+    """
+    if not _is_keepalive_authorized(request):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    uptime_seconds = int((datetime.now() - PROCESS_START_TIME).total_seconds())
+    response = jsonify({
+        'status': 'ok',
+        'message': 'keepalive',
+        'service': 'stock-backend',
+        'time': datetime.now().isoformat(),
+        'uptime_seconds': uptime_seconds,
+        'db_connected': db is not None
+    })
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    return response, 200
 
 
 @app.route('/api/consolidation-status', methods=['GET'])
