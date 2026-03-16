@@ -158,7 +158,12 @@ class SymbolMetricsFetcher:
             message = payload.get('msg') or payload.get('message') or 'No equityResponse'
             raise ValueError(f"{message} for {symbol} ({series})")
         
-        return equity_list[0] or {}
+        item = equity_list[0] or {}
+        # Validation: If all key sections are null, it's a dummy response for the wrong series
+        if not item or (item.get('metaData') is None and item.get('tradeInfo') is None and item.get('secInfo') is None):
+            raise ValueError(f"Empty data for {symbol} ({series}) - likely wrong series")
+
+        return item
 
     def fetch_symbol_data(self, symbol, series='EQ', as_of=None, session=None):
         as_on = as_of or datetime.now().strftime('%Y-%m-%d')
@@ -176,8 +181,8 @@ class SymbolMetricsFetcher:
                 break
             except ValueError as exc:
                 last_exc = exc
-                # try next series on 404 or no equityResponse
-                if 'error 404' not in str(exc) and 'No equityResponse' not in str(exc):
+                # try next series on 404, no equityResponse, or empty data
+                if 'error 404' not in str(exc) and 'No equityResponse' not in str(exc) and 'Empty data' not in str(exc):
                     # non-retriable
                     raise
                 continue

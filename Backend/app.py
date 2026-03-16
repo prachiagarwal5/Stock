@@ -436,6 +436,70 @@ def upsert_symbol_metrics(row, source='nse_symbol_metrics'):
     except Exception as exc:
         print(f"⚠️ Failed to upsert symbol_metrics for {row.get('symbol')}: {exc}")
 
+METRIC_FIELDS_FROM_NSE = [
+    'impact_cost', 'free_float_mcap', 'total_market_cap', 
+    'total_traded_value', 'companyName', 'listingDate', 'basicIndustry'
+]
+
+def enrich_rows_from_metrics_db(rows):
+    """
+    For any row missing impact_cost, free_float_mcap, total_market_cap, total_traded_value, companyName, listingDate
+    fall back to the most recent stored value in symbol_metrics_collection.
+    This handles stocks where the current NSE API call returns None (e.g. BE-series, illiquid stocks).
+    """
+    if symbol_metrics_collection is None or not rows:
+        return rows
+
+    # Find rows with at least one missing metric field
+    needs_fallback = [
+        r for r in rows
+        if any(r.get(f) is None for f in METRIC_FIELDS_FROM_NSE)
+    ]
+    if not needs_fallback:
+        return rows
+
+    syms = list({r['symbol'] for r in needs_fallback if r.get('symbol')})
+    if not syms:
+        return rows
+
+    # Fetch latest stored doc per symbol (sort by as_on desc)
+    try:
+        pipeline = [
+            {'$match': {'symbol': {'$in': syms}}},
+            {'$sort': {'as_on': -1, 'updated_at': -1}},
+            {'$group': {
+                '_id': '$symbol',
+                'impact_cost':        {'$first': '$impact_cost'},
+                'free_float_mcap':    {'$first': '$free_float_mcap'},
+                'total_market_cap':   {'$first': '$total_market_cap'},
+                'total_traded_value': {'$first': '$total_traded_value'},
+                'companyName':        {'$first': '$companyName'},
+                'listingDate':        {'$first': '$listingDate'},
+                'basicIndustry':      {'$first': '$basicIndustry'},
+            }}
+        ]
+        fallback_map = {}
+        for doc in symbol_metrics_collection.aggregate(pipeline):
+            sym = doc.pop('_id')
+            fallback_map[sym] = doc
+
+        filled = 0
+        for row in needs_fallback:
+            sym = row.get('symbol')
+            fb = fallback_map.get(sym)
+            if not fb:
+                continue
+            for field in METRIC_FIELDS_FROM_NSE:
+                if row.get(field) is None and fb.get(field) is not None:
+                    row[field] = fb[field]
+                    filled += 1
+
+        if filled:
+            print(f"[enrich_metrics_db] ✓ Filled {filled} null metric fields for {len(fallback_map)} symbols from history")
+    except Exception as exc:
+        print(f"[enrich_metrics_db] ⚠️ Fallback query failed: {exc}")
+
+    return rows
 
 def persist_consolidated_results(consolidator, data_type, source='consolidation', skip_daily=False):
     """Store per-symbol per-date values and averages into MongoDB using bulk operations with memory optimization."""
@@ -1197,7 +1261,22 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
     """
     try:
         df = pd.DataFrame(rows)
-        
+
+        # Fill missing companyName from symbol_aggregates DB
+        # Handles symbols where NSE API returned no company info
+        if symbol_aggregates_collection is not None and 'symbol' in df.columns and 'companyName' in df.columns:
+            missing_mask = df['companyName'].isna() | (df['companyName'].astype(str).str.strip() == '')
+            if missing_mask.any():
+                missing_syms = df.loc[missing_mask, 'symbol'].tolist()
+                _cname_map = {}
+                for doc in symbol_aggregates_collection.find({'symbol': {'$in': missing_syms}, 'type': 'mcap'}):
+                    if doc.get('company_name'):
+                        _cname_map[doc['symbol']] = doc['company_name']
+                for sym, cname in _cname_map.items():
+                    df.loc[df['symbol'] == sym, 'companyName'] = cname
+                if _cname_map:
+                    print(f"[format_dashboard_excel] ✓ Filled companyName for {len(_cname_map)} symbols from DB")
+
         # Use EXACT same averages as consolidation Excel by extracting from consolidation source
         # Do NOT use the dashboard data averages - get them from the same place as consolidation Excel
         if start_date and end_date:
@@ -2144,11 +2223,34 @@ def nse_symbol_dashboard():
         symbols = list(dict.fromkeys(symbols))[:TOTAL_SYMBOLS]  # Remove duplicates, force top 1100
 
         # Make sure specific user-requested symbols are included even if not in the top 1100
-        required_symbols = ['GANECOS', 'ALLCARGO', 'ATL']
+        required_symbols = ['GANECOS', 'ALLCARGO']
         for rs in required_symbols:
             if rs not in symbols:
                 symbols.append(rs)
-                
+
+        # Force-upsert GANECOS and ALLCARGO into nifty_indices DB as NIFTY MICROCAP 250
+        # This ensures they are counted in the Microcap 250 tab even if missing from the NSE CSV
+        _microcap_required = {
+            'GANECOS': ['NIFTY MICROCAP 250'],
+            'ALLCARGO': ['NIFTY MICROCAP 250'],
+        }
+        if nifty_indices_collection is not None:
+            for _sym, _indices in _microcap_required.items():
+                try:
+                    nifty_indices_collection.update_one(
+                        {'symbol': _sym},
+                        {'$set': {
+                            'symbol': _sym,
+                            'indices': _indices,
+                            'primary_index': _indices[0],
+                            'last_updated': datetime.now()
+                        }},
+                        upsert=True
+                    )
+                except Exception as _e:
+                    print(f"[symbol-dashboard] ⚠️ Could not upsert index for {_sym}: {_e}")
+            print(f"[symbol-dashboard] ✓ Ensured GANECOS & ALLCARGO are mapped to NIFTY MICROCAP 250 in DB")
+
         total_symbols = len(symbols)
 
         # Always 10 batches of 100
@@ -2230,7 +2332,25 @@ def nse_symbol_dashboard():
                 sym = row.get('symbol')
                 if sym and sym in index_map:
                     row['primary_index'] = index_map[sym]
-            
+
+            # Enrich missing companyName from DB (handles NSE API returning no company info)
+            if symbol_aggregates_collection is not None:
+                _missing_rows = [r for r in rows if not r.get('companyName')]
+                if _missing_rows:
+                    _missing_syms = [r['symbol'] for r in _missing_rows]
+                    _batch_name_map = {}
+                    for doc in symbol_aggregates_collection.find({'symbol': {'$in': _missing_syms}, 'type': 'mcap'}):
+                        if doc.get('company_name'):
+                            _batch_name_map[doc['symbol']] = doc['company_name']
+                    for row in _missing_rows:
+                        if row['symbol'] in _batch_name_map:
+                            row['companyName'] = _batch_name_map[row['symbol']]
+                    if _batch_name_map:
+                        print(f'[symbol-dashboard] ✓ Filled companyName for {len(_batch_name_map)} symbols in batch {batch_idx+1} from DB')
+
+            # Fill missing impact_cost, mcap, etc from symbol_metrics_collection (historical runs)
+            rows = enrich_rows_from_metrics_db(rows)
+
             # Persist to DB
             for row in rows:
                 upsert_symbol_metrics(dict(row), source='symbol_dashboard')
@@ -2397,6 +2517,25 @@ def nse_symbol_dashboard():
                     all_errors.append({'batch': batch_idx + 1, 'error': str(exc)})
                     batches_completed += 1
 
+
+        # Enrich missing companyName from symbol_aggregates DB before persisting
+        # This covers symbols where the NSE API returned no companyName
+        if symbol_aggregates_collection is not None:
+            rows_needing_name = [r for r in all_rows if not r.get('companyName')]
+            if rows_needing_name:
+                syms_needing_name = [r['symbol'] for r in rows_needing_name]
+                _name_map = {}
+                for doc in symbol_aggregates_collection.find({'symbol': {'$in': syms_needing_name}, 'type': 'mcap'}):
+                    if doc.get('company_name'):
+                        _name_map[doc['symbol']] = doc['company_name']
+                for row in rows_needing_name:
+                    if row['symbol'] in _name_map:
+                        row['companyName'] = _name_map[row['symbol']]
+                if _name_map:
+                    print(f"[symbol-dashboard] ✓ Filled companyName for {len(_name_map)} symbols from DB")
+
+        # Fill missing impact_cost, mcap, etc from symbol_metrics_collection (historical runs)
+        all_rows = enrich_rows_from_metrics_db(all_rows)
 
         # Persist results
         for row in all_rows:
