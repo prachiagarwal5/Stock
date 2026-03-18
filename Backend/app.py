@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 import os
 import pandas as pd
@@ -372,69 +372,94 @@ def upsert_symbol_aggregate(symbol, company_name, data_type, days_with_data, ave
         print(f"⚠️ Failed to upsert symbol_aggregate for {symbol} {data_type}: {exc}")
 
 
-def upsert_symbol_metrics(row, source='nse_symbol_metrics'):
+def bulk_upsert_symbol_metrics(rows, source='nse_symbol_metrics'):
+    """
+    ULTRA-FAST bulk upsert of symbol metrics.
+    Consolidates thousands of database operations into 2-3 bulk writes.
+    """
     if symbol_metrics_collection is None:
         return
+    
+    from pymongo import UpdateOne
+    ops_main = []
+    ops_daily_meta = []
+    ops_daily_pull = []
+    ops_daily_push = []
+    
+    now_iso = datetime.now().isoformat()
+    default_as_on = datetime.now().strftime('%Y-%m-%d')
+    
     try:
-        symbol = str(row.get('symbol') or '').strip()
-        if not symbol:
-            return
-        payload = dict(row)
-        as_on = payload.get('as_on') or payload.get('date') or datetime.now().strftime('%Y-%m-%d')
-        if isinstance(as_on, datetime):
-            as_on = as_on.strftime('%Y-%m-%d')
-        payload['as_on'] = as_on
-        payload['source'] = source
-        payload['updated_at'] = datetime.now().isoformat()
-        symbol_metrics_collection.update_one(
-            {'symbol': symbol, 'as_on': as_on},
-            {'$set': payload},
-            upsert=True
-        )
-        
-        # Store date-wise data in one document per symbol
-        # Schema: { symbol: "RELIANCE", company_name: "...", daily_data: [{date: "2026-02-02", impact_cost: ..., free_float_mcap: ...}, ...] }
-        if symbol_metrics_daily_collection is not None:
-            company_name = row.get('companyName') or row.get('company_name') or ''
-            daily_entry = {
-                'date': as_on,
-                'impact_cost': _safe_float(row.get('impact_cost')),
-                'free_float_mcap': _safe_float(row.get('free_float_mcap')),
-                'total_market_cap': _safe_float(row.get('total_market_cap')),
-                'total_traded_value': _safe_float(row.get('total_traded_value')),
-                'source': source,
-                'updated_at': datetime.now().isoformat()
-            }
+        for row in rows:
+            symbol = str(row.get('symbol') or '').strip()
+            if not symbol: continue
             
-            # Update or insert the document for this symbol
-            # If date already exists in daily_data array, replace it; otherwise add it
-            symbol_metrics_daily_collection.update_one(
-                {'symbol': symbol},
-                {
-                    '$set': {
-                        'company_name': company_name,
-                        'last_updated': datetime.now().isoformat()
-                    },
-                    '$setOnInsert': {
-                        'symbol': symbol,
-                        'created_at': datetime.now().isoformat()
-                    }
-                },
+            payload = dict(row)
+            as_on = payload.get('as_on') or payload.get('date') or default_as_on
+            if hasattr(as_on, 'strftime'): as_on = as_on.strftime('%Y-%m-%d')
+            
+            payload['as_on'] = as_on
+            payload['source'] = source
+            payload['updated_at'] = now_iso
+            
+            # 1. Main collection ops
+            ops_main.append(UpdateOne(
+                {'symbol': symbol, 'as_on': as_on},
+                {'$set': payload},
                 upsert=True
-            )
+            ))
             
-            # Now update the specific date entry in daily_data array
-            # Remove existing entry for this date and add new one
-            symbol_metrics_daily_collection.update_one(
-                {'symbol': symbol},
-                {'$pull': {'daily_data': {'date': as_on}}}
-            )
-            symbol_metrics_daily_collection.update_one(
-                {'symbol': symbol},
-                {'$push': {'daily_data': daily_entry}}
-            )
+            # 2. Daily collection (Metadata & Structure)
+            if symbol_metrics_daily_collection is not None:
+                cname = row.get('companyName') or row.get('company_name') or ''
+                daily_entry = {
+                    'date': as_on,
+                    'impact_cost': _safe_float(row.get('impact_cost')),
+                    'free_float_mcap': _safe_float(row.get('free_float_mcap')),
+                    'total_market_cap': _safe_float(row.get('total_market_cap')),
+                    'total_traded_value': _safe_float(row.get('total_traded_value')),
+                    'source': source,
+                    'updated_at': now_iso
+                }
+                
+                ops_daily_meta.append(UpdateOne(
+                    {'symbol': symbol},
+                    {
+                        '$set': {'company_name': cname, 'last_updated': now_iso},
+                        '$setOnInsert': {'symbol': symbol, 'created_at': now_iso}
+                    },
+                    upsert=True
+                ))
+                
+                ops_daily_pull.append(UpdateOne(
+                    {'symbol': symbol},
+                    {'$pull': {'daily_data': {'date': as_on}}}
+                ))
+                
+                ops_daily_push.append(UpdateOne(
+                    {'symbol': symbol},
+                    {'$push': {'daily_data': daily_entry}}
+                ))
+
+        # Execute Bulk Operations
+        if ops_main:
+            symbol_metrics_collection.bulk_write(ops_main, ordered=False)
+        
+        if symbol_metrics_daily_collection is not None:
+            if ops_daily_meta:
+                symbol_metrics_daily_collection.bulk_write(ops_daily_meta, ordered=False)
+            if ops_daily_pull:
+                symbol_metrics_daily_collection.bulk_write(ops_daily_pull, ordered=False)
+            if ops_daily_push:
+                symbol_metrics_daily_collection.bulk_write(ops_daily_push, ordered=False)
+                
+        print(f"✅ Bulk upserted {len(rows)} symbol metrics successfully ({source})")
     except Exception as exc:
-        print(f"⚠️ Failed to upsert symbol_metrics for {row.get('symbol')}: {exc}")
+        print(f"⚠️ Bulk upsert failed: {exc}")
+
+def upsert_symbol_metrics(row, source='nse_symbol_metrics'):
+    """Legacy wrapper for single row upsert"""
+    bulk_upsert_symbol_metrics([row], source=source)
 
 METRIC_FIELDS_FROM_NSE = [
     'impact_cost', 'free_float_mcap', 'total_market_cap', 
@@ -857,21 +882,26 @@ def bulk_upsert_symbol_daily_from_df(df, date_iso, data_type, source='nse_downlo
             print(f"⚠️ bulk upsert for {data_type} {date_iso} failed: {exc}")
 
 
-def get_consolidated_metrics_from_db(date_iso_list, data_type):
+def get_consolidated_metrics_from_db(date_iso_list, data_type, allowed_symbols=None):
     """
     ULTRA-FAST consolidation using MongoDB Aggregation Pipeline on symbol_daily collection.
     Avoids fetching and processing raw CSVs for every request.
+    Now supports filtering by allowed_symbols for targeted consolidation (like Dashboard).
     """
     if symbol_daily_collection is None:
         return None
     
     try:
+        match_query = {
+            'type': data_type,
+            'date': {'$in': date_iso_list}
+        }
+        if allowed_symbols:
+            match_query['symbol'] = {'$in': list(allowed_symbols)}
+            
         pipeline = [
             {
-                '$match': {
-                    'type': data_type,
-                    'date': {'$in': date_iso_list}
-                }
+                '$match': match_query
             },
             {
                 '$group': {
@@ -907,13 +937,15 @@ def get_consolidated_metrics_from_db(date_iso_list, data_type):
                 'Average Value': res['sum_val'] / res['count_val'] if res['count_val'] > 0 else 0,
                 'Days With Data': res['count_val']
             }
-            # Flatten daily data for pivoting
+            # Flatten daily data for pivoting - fast string manipulation for YYYY-MM-DD -> DD-MM-YYYY
             for daily in res.get('daily_data', []):
-                # Format date back to DD-MM-YYYY for consolidator compatibility
+                d_iso = daily['date']
                 try:
-                    d_dt = datetime.strptime(daily['date'], '%Y-%m-%d')
-                    date_key = d_dt.strftime('%d-%m-%Y')
-                    row[date_key] = daily['val']
+                    # Faster than strptime/strftime: "2026-02-02" -> ["2026", "02", "02"] -> "02-02-2026"
+                    parts = d_iso.split('-')
+                    if len(parts) == 3:
+                        date_key = f"{parts[2]}-{parts[1]}-{parts[0]}"
+                        row[date_key] = daily['val']
                 except:
                     pass
             rows.append(row)
@@ -935,7 +967,7 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
 
     # OPTIMIZATION: Try DB aggregation first (it's much faster)
     if log_fn: log_fn(f"⚡ Attempting high-performance DB aggregation for {data_type.upper()}...")
-    df_db = get_consolidated_metrics_from_db(date_iso_list, data_type)
+    df_db = get_consolidated_metrics_from_db(date_iso_list, data_type, allowed_symbols=allowed_symbols)
     if df_db is not None and not df_db.empty:
         if log_fn: log_fn(f"✅ DB aggregation successful ({len(df_db)} records)")
         
@@ -1271,7 +1303,7 @@ def calculate_averages_from_consolidated_data(symbols, start_date=None, end_date
             
             pr_df, pr_dates_list, pr_avg_col = build_consolidated_from_cache(
                 date_iso_list, 'pr', allow_missing=True, log_fn=None,
-                allowed_symbols=None, symbol_name_map=pr_name_to_symbol
+                allowed_symbols=set(symbols), symbol_name_map=pr_name_to_symbol
             )
             
             # Extract PR averages for requested symbols
@@ -1433,12 +1465,15 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
                         
                         if date_iso_list:
                             consolidation_averages = {}
+                            import time
+                            f_start = time.perf_counter()
+                            print(f"[format_dashboard_excel] ⚡ Consolidating averages for {len(symbols)} symbols across {len(date_iso_list)} dates...")
                             
                             # Get MCAP averages using EXACT same method as consolidation
                             try:
                                 mcap_df, dates_list, avg_col = build_consolidated_from_cache(
                                     date_iso_list, 'mcap', allow_missing=True, log_fn=None,
-                                    allowed_symbols=None, symbol_name_map=None
+                                    allowed_symbols=set(symbols), symbol_name_map=None
                                 )
                                 
                                 mcap_lookup = {row['Symbol']: {'mcap': row[avg_col], 'company_name': row.get('Company Name', '')} 
@@ -1456,14 +1491,17 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
                                     
                                     pr_df, pr_dates_list, pr_avg_col = build_consolidated_from_cache(
                                         date_iso_list, 'pr', allow_missing=True, log_fn=None,
-                                        allowed_symbols=None, symbol_name_map=pr_name_to_symbol
+                                        allowed_symbols=set(symbols), symbol_name_map=pr_name_to_symbol
                                     )
                                     
                                     pr_lookup = {row['Symbol']: row[pr_avg_col] for _, row in pr_df.iterrows()}
                                     
+                                    # ... (rest of the loop)
                                     for symbol in symbols:
                                         if symbol in pr_lookup and symbol in consolidation_averages:
                                             consolidation_averages[symbol]['traded_value'] = pr_lookup[symbol]
+                                            
+                                    print(f"[format_dashboard_excel] ✅ Consolidation took {time.perf_counter() - f_start:.2f}s")
                                             
                                 except Exception as exc:
                                     print(f"[format_dashboard_excel] ⚠️ PR consolidation averages failed: {exc}")
@@ -1487,59 +1525,41 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
         if 'listingDate' in df.columns and 'listing_date' not in df.columns:
             df['listing_date'] = df['listingDate']
         
-        # Calculate days since listing
-        def calculate_listing_info(listing_date):
-            if not listing_date or pd.isna(listing_date):
-                return None, 'N', 'N', None
-            try:
-                if isinstance(listing_date, str):
-                    list_dt = pd.to_datetime(listing_date)
-                else:
-                    listing_dt = listing_date
-                
-                now = datetime.now()
-                diff_days = (now - listing_dt.to_pydatetime() if hasattr(listing_dt, 'to_pydatetime') else (now - listing_dt)).days
-                months_since = diff_days / 30.44
-                listed_6m = 'Y' if months_since >= 6 else 'N'
-                listed_1m = 'Y' if months_since >= 1 else 'N'
-                return listing_dt.strftime('%d-%b-%Y'), listed_6m, listed_1m, diff_days
-            except:
-                return None, 'N', 'N', None
+        # Optimized calculation of listing info using Vectorized Pandas operations
+        if 'listing_date' in df.columns and not df.empty:
+            # Convert to datetime once
+            ld_series = pd.to_datetime(df['listing_date'], errors='coerce')
+            now = datetime.now()
+            
+            # Days calculation
+            df['number of days from listing'] = (now - ld_series).dt.days
+            
+            # Formatted strings
+            df['Day of Listing'] = ld_series.dt.strftime('%d-%b-%Y')
+            
+            # Boolean logic for 1m/6m
+            months_series = df['number of days from listing'] / 30.44
+            df['listed> 6months'] = months_series.apply(lambda x: 'Y' if x >= 6 else 'N')
+            df['listed> 1 months'] = months_series.apply(lambda x: 'Y' if x >= 1 else 'N')
+        else:
+            for col in ['Day of Listing', 'listed> 6months', 'listed> 1 months', 'number of days from listing']:
+                df[col] = None
+
+        # Determine broader index - Vectorized
+        qualifying_indices = {'NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 150', 'NIFTY SMALLCAP 250'}
+        df['Broader Index'] = df['index'].apply(lambda x: 'NIFTY 500' if str(x).upper().strip() in qualifying_indices or str(x).replace(' ', '').upper() in [i.replace(' ', '') for i in qualifying_indices] else '')
         
-        # Determine broader index
-        def get_broader_index(row):
-            index = row.get('index')
-            if not index or pd.isna(index):
-                return ''
-            index_upper = str(index).upper().replace(' ', '')
-            qualifying_indices = ['NIFTY50', 'NIFTYNEXT50', 'NIFTYMIDCAP150', 'NIFTYSMALLCAP250']
-            for q_idx in qualifying_indices:
-                if q_idx == index_upper:
-                    return 'NIFTY 500'
-            return ''
-        
-        # Apply calculations
-        listing_info = df.apply(lambda row: calculate_listing_info(row.get('listing_date')), axis=1)
-        df['Day of Listing'] = listing_info.apply(lambda x: x[0] if x else None)
-        df['listed> 6months'] = listing_info.apply(lambda x: x[1] if x else 'N')
-        df['listed> 1 months'] = listing_info.apply(lambda x: x[2] if x else 'N')
-        df['number of days from listing'] = listing_info.apply(lambda x: x[3] if x else None)
-        df['Broader Index'] = df.apply(get_broader_index, axis=1)
-        
-        # Round and normalize to Crores
-        numeric_cols_to_round = ['total_market_cap', 'free_float_mcap', 'total_traded_value']
-        for col in numeric_cols_to_round:
+        # Round and normalize to Crores - Vectorized
+        numeric_cols = ['total_market_cap', 'free_float_mcap', 'total_traded_value']
+        for col in numeric_cols:
             if col in df.columns:
                 df[col] = (pd.to_numeric(df[col], errors='coerce') / 10000000).round(2)
         
         if 'impact_cost' in df.columns:
             df['impact_cost'] = pd.to_numeric(df['impact_cost'], errors='coerce').round(2)
 
-        # Ratio calculations
-        df['Ratio of avg free float to avg total market cap'] = df.apply(
-            lambda row: round(row.get('free_float_mcap', 0) / row.get('total_market_cap', 1), 4) 
-            if row.get('total_market_cap') and row.get('total_market_cap') > 0 else None, axis=1
-        )
+        # Ratio calculations - Vectorized
+        df['Ratio of avg free float to avg total market cap'] = (df['free_float_mcap'] / df['total_market_cap'].replace(0, np.nan)).round(4)
         df['ratio of free float to avg total market cap'] = df['Ratio of avg free float to avg total market cap']
         
         # Reorder and rename columns
@@ -1562,80 +1582,59 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             ('ratio of free float to avg total market cap', 'ratio of free float to avg total market cap')
         ]
         
-        df.insert(0, 'serial_no', range(1, len(df) + 1))
+        df['serial_no'] = range(1, len(df) + 1)
         output_df = pd.DataFrame()
         for new_name, old_name in output_columns:
             output_df[new_name] = df[old_name] if old_name in df.columns else None
         
-        output_df.to_excel(excel_path, index=False, sheet_name='Dashboard', engine='openpyxl')
+        # HIGH-PERFORMANCE writing with XlsxWriter
+        print(f"[format_dashboard_excel] 🚀 Writing {len(output_df)} rows via XlsxWriter...")
+        writer = pd.ExcelWriter(excel_path, engine='xlsxwriter')
+        output_df.to_excel(writer, index=False, sheet_name='Dashboard')
         
-        # Apply formatting
-        from openpyxl import load_workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, numbers
+        workbook = writer.book
+        worksheet = writer.sheets['Dashboard']
         
-        wb = load_workbook(excel_path)
-        ws = wb.active
+        # Define formats
+        header_format = workbook.add_format({
+            'bold': True, 'font_color': 'white', 'bg_color': '#4472C4',
+            'border': 1, 'align': 'center', 'valign': 'vcenter', 'text_wrap': True
+        })
         
-        # Define styles
-        header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
-        header_font = Font(bold=True, color='FFFFFF', size=11)
-        header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        cell_format = workbook.add_format({'border': 1})
+        num_format = workbook.add_format({'border': 1, 'num_format': '#,##0.00'})
+        ratio_format = workbook.add_format({'border': 1, 'num_format': '0.0000'})
         
-        thin_border = Border(
-            left=Side(style='thin'),
-            right=Side(style='thin'),
-            top=Side(style='thin'),
-            bottom=Side(style='thin')
-        )
+        # Column widths
+        widths = [8, 12, 30, 20, 20, 15, 24, 28, 26, 15, 25, 15, 13, 13, 18, 18]
+        for i, w in enumerate(widths):
+            worksheet.set_column(i, i, w)
+            
+        # Specific formats for data columns
+        # Index of columns (0-based): F(5), G(6), H(7), I(8), O(14), P(15)
+        # We apply formatting while writing or via set_column
+        worksheet.set_column(5, 5, 15, num_format)   # Avg Impact Cost
+        worksheet.set_column(6, 6, 24, num_format)   # Avg Market Cap
+        worksheet.set_column(7, 7, 28, num_format)   # Avg Free Float
+        worksheet.set_column(8, 8, 26, num_format)   # Avg Net Traded Value
+        worksheet.set_column(14, 15, 18, ratio_format) # Ratios
         
-        # Format header row (row 1)
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = header_alignment
-            cell.border = thin_border
+        # Re-apply header formatting
+        for col_num, value in enumerate(output_df.columns.values):
+            worksheet.write(0, col_num, value, header_format)
+            
+        # Freeze panes
+        worksheet.freeze_panes(1, 0)
         
-        # Set column widths and apply number formatting
-        column_formats = {
-            'A': (8, None),  # Serial No
-            'B': (12, None),  # Symbol
-            'C': (30, None),  # Company name
-            'D': (20, None),  # Index (DB)
-            'E': (20, None),  # Index (API)
-            'F': (15, numbers.FORMAT_NUMBER_00),  # avg Impact cost
-            'G': (24, '#,##0.00'),  # avg total market cap (Cr)
-            'H': (28, '#,##0.00'),  # Avg Free float market cap (Cr)
-            'I': (26, '#,##0.00'),  # Avg daily traded value (Cr)
-            'J': (15, None),  # Day of Listing
-            'K': (25, None),  # number of days from listing
-            'L': (15, None),  # Broader Index
-            'M': (13, None),  # listed> 6months
-            'N': (13, None),  # listed> 1 months
-            'O': (18, '0.0000'),  # Ratio of avg free float to avg total market cap
-            'P': (18, '0.0000'),  # ratio of free float to avg total market cap
-        }
+        writer.close()
         
-        # Apply column formatting
-        for col_letter, (width, num_format) in column_formats.items():
-            ws.column_dimensions[col_letter].width = width
-            if num_format:
-                for row in range(2, ws.max_row + 1):
-                    cell = ws[f'{col_letter}{row}']
-                    cell.number_format = num_format
-                    cell.border = thin_border
-            else:
-                for row in range(2, ws.max_row + 1):
-                    cell = ws[f'{col_letter}{row}']
-                    cell.border = thin_border
-        
-        # Freeze header row
-        ws.freeze_panes = 'A2'
-        
-        # Save formatted workbook
-        wb.save(excel_path)
-        
-        print(f"✅ Created dashboard Excel with {len(output_df)} rows and formatting")
+        print(f"[format_dashboard_excel] ✅ High-performance generation took {time.perf_counter() - f_start:.2f}s total")
         return True
+    except Exception as e:
+        print(f"⚠️ Error formatting dashboard Excel: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
     except Exception as e:
         print(f"⚠️ Error formatting dashboard Excel: {e}")
         import traceback
@@ -2076,246 +2075,180 @@ def nse_symbol_dashboard():
     """
     Build a dashboard of impact cost, free float market cap, traded value, and index for symbols.
     Optimized for Render free tier (30s timeout).
-    
-    For large requests (>50 symbols), use batch_index parameter to paginate:
-    - First call: get total_batches from response
-    - Subsequent calls: pass batch_index=0,1,2... to get each batch
-    - Frontend accumulates all results
+    Now supports SSE for real-time progress updates.
     """
     try:
         data = request.get_json() or {}
         req_id = f"symboldash-{int(time.time() * 1000)}"
         start_time = time.perf_counter()
         
-        # Check if this is a batch request or full request
-        batch_index = data.get('batch_index')  # None = process all, int = specific batch
-        
+        batch_index = data.get('batch_index')
         date_str = data.get('date')
         start_date_str = data.get('start_date')
         end_date_str = data.get('end_date')
-        save_to_file = data.get('save_to_file', True)
         provided_symbols = data.get('symbols') or []
-        top_n = data.get('top_n', 100)  # Default to 100 for Render
-        top_n_by = data.get('top_n_by') or 'mcap'
+        top_n = data.get('top_n', 100)
         as_on = datetime.now().strftime('%Y-%m-%d')
 
-        # Render detection and settings
-        is_render = os.environ.get('RENDER') == 'true' or os.environ.get('RENDER_SERVICE_NAME')
-        
-
-        # Force user requirements: 11 batches of 100 symbols (top 1100 by MCAP)
-        BATCH_SIZE = 100
         TOTAL_SYMBOLS = 1100
-        MAX_TIME_TOTAL = 55
-        MAX_TIME_PER_SYMBOL = 2.0
-        MAX_WORKERS = 50
+        BATCH_SIZE = 100
 
-        print(f"[symbol-dashboard][start] id={req_id} batch_index={batch_index} "
-              f"is_render={is_render} top_n={top_n}")
+        import queue
+        import threading
+        msg_queue = queue.Queue()
 
+        def generate():
+            try:
+                def stream_log(msg, percentage=None):
+                    data = {'message': msg, 'req_id': req_id}
+                    if percentage is not None: data['percentage'] = percentage
+                    msg_queue.put(f"data: {json.dumps(data)}\n\n")
 
-        symbols = provided_symbols[:] if provided_symbols else []
-        tag = None
-        
-        # Dashboard Symbol Fetching Logic:
-        # 1. If symbols provided in payload, use them.
-        # 2. Otherwise, check MongoDB 'symbol_aggregates' for top 1100 by MCAP (Primary).
-        # 3. Fallback to local 'nosubject/Market_Cap.xlsx' if DB is empty or not connected.
+                # Send initial connection log immediately
+                yield f"data: {json.dumps({'message': 'Initializing dashboard...', 'percentage': 0, 'req_id': req_id})}\n\n"
 
-        if not symbols:
-            # 1. Try MongoDB first (Most robust)
-            if symbol_aggregates_collection is not None:
-                try:
-                    # Fetch top 1100 symbols by average market cap with stable sort
-                    db_symbols = list(symbol_aggregates_collection.find(
-                        {'type': 'mcap'},
-                        {'symbol': 1, 'average': 1}
-                    ).sort([('average', -1), ('symbol', 1)]).limit(TOTAL_SYMBOLS))
-                    
-                    if db_symbols:
-                        symbols = [s['symbol'] for s in db_symbols]
-                        print(f"[symbol-dashboard] Got {len(symbols)} symbols from MongoDB (top {TOTAL_SYMBOLS} by Avg MCAP)")
-                except Exception as e:
-                    print(f"[symbol-dashboard][mongodb-error] {e}")
-
-            # 2. Fallback to Excel if DB search failed or returned nothing
-            if not symbols:
-                market_cap_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject', 'Market_Cap.xlsx')
-                if os.path.exists(market_cap_path):
+                def run_build():
                     try:
-                        df = pd.read_excel(market_cap_path)
-                        # Try to find the right columns for symbol and market cap
-                        symbol_col = None
-                        mcap_col = None
-                        for c in df.columns:
-                            if str(c).strip().lower() in ['symbol', 'symbols']:
-                                symbol_col = c
-                            if 'mcap' in str(c).strip().lower() or 'market cap' in str(c).strip().lower():
-                                mcap_col = c
+                        symbols_to_process = provided_symbols[:] if provided_symbols else []
                         
-                        if symbol_col and mcap_col:
-                            df = df[[symbol_col, mcap_col]].dropna()
-                            df = df.sort_values(by=mcap_col, ascending=False)
-                            symbols = df[symbol_col].astype(str).tolist()[:TOTAL_SYMBOLS]
-                            print(f"[symbol-dashboard] Got {len(symbols)} symbols from Market_Cap.xlsx (top {TOTAL_SYMBOLS} MCAP)")
-                    except Exception as exc:
-                        print(f"⚠️ Failed to fetch symbols from Market_Cap.xlsx: {exc}")
-                else:
-                    print(f"⚠️ Market_Cap.xlsx not found at {market_cap_path}")
+                        if not symbols_to_process:
+                            if symbol_aggregates_collection is not None:
+                                stream_log("Fetching top symbols from database...", 5)
+                                db_symbols = list(symbol_aggregates_collection.find(
+                                    {'type': 'mcap'},
+                                    {'symbol': 1, 'average': 1}
+                                ).sort([('average', -1), ('symbol', 1)]).limit(TOTAL_SYMBOLS))
+                                if db_symbols:
+                                    symbols_to_process = [s['symbol'] for s in db_symbols]
+                                    stream_log(f"Got {len(symbols_to_process)} symbols from MongoDB", 10)
 
-        if not symbols:
-            error_msg = (
-                "No symbols found. The dashboard requires the top 1100 symbols by Market Cap. "
-                "Please run a 'Consolidation Export' (with fast_mode=False) first to populate the database "
-                "with symbol rankings."
-            )
-            return jsonify({'error': error_msg}), 400
+                        if not symbols_to_process:
+                            stream_log("Checking local Market_Cap.xlsx fallback...", 12)
+                            market_cap_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject', 'Market_Cap.xlsx')
+                            if os.path.exists(market_cap_path):
+                                df = pd.read_excel(market_cap_path)
+                                sym_col = next((c for c in df.columns if str(c).strip().lower() in ['symbol', 'symbols']), None)
+                                if sym_col:
+                                    symbols_to_process = df[sym_col].astype(str).tolist()[:TOTAL_SYMBOLS]
+                                    stream_log(f"Got {len(symbols_to_process)} symbols from Market_Cap.xlsx", 15)
 
-        symbols = list(dict.fromkeys(symbols))[:TOTAL_SYMBOLS]  # Remove duplicates, force top 1100
+                        if not symbols_to_process:
+                            msg_queue.put(f"data: {json.dumps({'error': 'No symbols found'})}\n\n")
+                            msg_queue.put(None) # Signal end
+                            return
 
-        # Make sure specific user-requested symbols are included even if not in the top 1100
-        required_symbols = ['GANECOS', 'ALLCARGO']
-        for rs in required_symbols:
-            if rs not in symbols:
-                symbols.append(rs)
+                        final_symbols = list(dict.fromkeys(symbols_to_process))[:TOTAL_SYMBOLS]
+                        for rs in ['GANECOS', 'ALLCARGO']:
+                            if rs not in final_symbols: final_symbols.append(rs)
 
-        # Force-upsert GANECOS and ALLCARGO into nifty_indices DB as NIFTY MICROCAP 250
-        # This ensures they are counted in the Microcap 250 tab even if missing from the NSE CSV
-        _microcap_required = {
-            'GANECOS': ['NIFTY MICROCAP 250'],
-            'ALLCARGO': ['NIFTY MICROCAP 250'],
-        }
-        if nifty_indices_collection is not None:
-            for _sym, _indices in _microcap_required.items():
-                try:
-                    nifty_indices_collection.update_one(
-                        {'symbol': _sym},
-                        {'$set': {
-                            'symbol': _sym,
-                            'indices': _indices,
-                            'primary_index': _indices[0],
-                            'last_updated': datetime.now()
-                        }},
-                        upsert=True
-                    )
-                except Exception as _e:
-                    print(f"[symbol-dashboard] ⚠️ Could not upsert index for {_sym}: {_e}")
-            print(f"[symbol-dashboard] ✓ Ensured GANECOS & ALLCARGO are mapped to NIFTY MICROCAP 250 in DB")
+                        if nifty_indices_collection is not None:
+                            stream_log("Ensuring special symbol mappings...", 18)
+                            for _sym in ['GANECOS', 'ALLCARGO']:
+                                nifty_indices_collection.update_one({'symbol': _sym}, {'$set': {'symbol': _sym, 'indices': ['NIFTY MICROCAP 250'], 'primary_index': 'NIFTY MICROCAP 250', 'last_updated': datetime.now()}}, upsert=True)
 
-        total_symbols = len(symbols)
+                        total_count = len(final_symbols)
+                        if batch_index is None:
+                            batch_symbols = final_symbols
+                            batch_idx, total_batches = 0, 1
+                        else:
+                            batch_idx = int(batch_index)
+                            symbol_batches = [final_symbols[i:i + BATCH_SIZE] for i in range(0, len(final_symbols), BATCH_SIZE)]
+                            total_batches = len(symbol_batches)
+                            if batch_idx >= total_batches:
+                                msg_queue.put(f"data: {json.dumps({'complete': True, 'rows': []})}\n\n")
+                                msg_queue.put(None)
+                                return
+                            batch_symbols = symbol_batches[batch_idx]
 
-        # 1. IDENTIFY BATCH SYMBOLS
-        if batch_index is None:
-            # SINGLE REQUEST MODE
-            batch_symbols = symbols
-            batch_idx, total_batches = 0, 1
-            print(f"[symbol-dashboard][single-request] Processing {len(batch_symbols)} symbols")
-        else:
-            # BATCH MODE
-            batch_idx = int(batch_index)
-            symbol_batches = [symbols[i:i + BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
-            total_batches = len(symbol_batches)
-            if batch_idx < 0 or batch_idx >= total_batches:
-                return jsonify({'success': True, 'count': 0, 'rows': [], 'batch_index': batch_idx, 'total_batches': total_batches}), 200
-            batch_symbols = symbol_batches[batch_idx]
-            print(f"[symbol-dashboard][batch] Processing batch {batch_idx + 1}/{total_batches}")
+                        stream_log(f"Bulk loading metadata for {len(batch_symbols)} symbols...", 20)
+                        symbol_pr_data, symbol_mcap_data, index_mapping, metrics_cache = {}, {}, {}, {}
 
-        # 2. BULK METADATA FETCHING (Always per batch symbols)
-        symbol_pr_data = {}
-        symbol_mcap_data = {}
-        index_mapping = {}
-        metrics_cache = {}
-        
-        if symbol_aggregates_collection is not None:
-            try:
-                agg_cursor = symbol_aggregates_collection.find({'symbol': {'$in': batch_symbols}})
-                for doc in agg_cursor:
-                    sym, dtype = doc.get('symbol'), doc.get('type')
-                    if not sym: continue
-                    if dtype == 'pr':
-                        symbol_pr_data[sym] = {'days_with_data': doc.get('days_with_data', 0), 'avg_pr': doc.get('average')}
-                        if sym not in symbol_mcap_data: symbol_mcap_data[sym] = {}
-                        symbol_mcap_data[sym]['total_traded_value'] = doc.get('average')
-                    elif dtype == 'mcap':
-                        if sym not in symbol_mcap_data: symbol_mcap_data[sym] = {}
-                        symbol_mcap_data[sym]['avg_mcap'] = doc.get('average')
-                print(f"[symbol-dashboard] ✓ Bulk loaded aggregates for {len(batch_symbols)} symbols")
+                        if symbol_aggregates_collection is not None:
+                            for doc in symbol_aggregates_collection.find({'symbol': {'$in': batch_symbols}}):
+                                sym, dtype = doc.get('symbol'), doc.get('type')
+                                if dtype == 'pr':
+                                    symbol_pr_data[sym] = {'days_with_data': doc.get('days_with_data', 0), 'avg_pr': doc.get('average')}
+                                    if sym not in symbol_mcap_data: symbol_mcap_data[sym] = {}
+                                    symbol_mcap_data[sym]['total_traded_value'] = doc.get('average')
+                                elif dtype == 'mcap':
+                                    if sym not in symbol_mcap_data: symbol_mcap_data[sym] = {}
+                                    symbol_mcap_data[sym]['avg_mcap'] = doc.get('average')
+
+                        if nifty_indices_collection is not None:
+                            for doc in nifty_indices_collection.find({'symbol': {'$in': batch_symbols}}):
+                                if doc.get('symbol') and doc.get('indices'): index_mapping[doc['symbol']] = doc['indices']
+
+                        if symbol_metrics_collection is not None:
+                            for doc in symbol_metrics_collection.find({'as_on': as_on, 'symbol': {'$in': batch_symbols}}):
+                                if doc.get('symbol'): metrics_cache[doc['symbol']] = doc
+
+                        stream_log("Starting parallel fetch for metrics...", 25)
+                        fetcher = SymbolMetricsFetcher()
+                        result = fetcher.build_dashboard(
+                            batch_symbols, as_of=as_on, parallel=True, max_workers=10, 
+                            chunk_size=max(10, len(batch_symbols) // 10),
+                            symbol_pr_data=symbol_pr_data, symbol_mcap_data=symbol_mcap_data,
+                            external_index_mapping=index_mapping, external_metrics_cache=metrics_cache,
+                            log_fn=lambda msg, percentage: stream_log(msg, 25 + int(percentage * 0.7))
+                        )
+                        
+                        rows = result.get('rows', [])
+                        errors = result.get('errors', [])
+
+                        stream_log("Enriching results and updating database...", 95)
+                        index_map_detailed = primary_index_map_from_db(batch_symbols)
+                        for row in rows:
+                            row.pop('_id', None)
+                            sym = row.get('symbol')
+                            if sym in index_map_detailed: row['primary_index'] = index_map_detailed[sym]
+                            if sym in symbol_pr_data: row['days_with_data'] = symbol_pr_data[sym].get('days_with_data', 0)
+                        
+                        # High-performance bulk upsert
+                        bulk_upsert_symbol_metrics(rows, source='symbol_dashboard')
+
+                        is_last = (batch_idx == total_batches - 1)
+                        download_url, db_id = None, None
+                        if is_last and len(rows) > 0:
+                            stream_log("Generating final Excel report...", 98)
+                            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+                            e_path = temp_file.name
+                            temp_file.close()
+                            format_dashboard_excel(rows, e_path, start_date=start_date_str, end_date=end_date_str)
+                            db_id = save_excel_to_database(e_path, f"Symbol_Dashboard_{as_on}.xlsx", {'symbols': len(rows), 'as_on': as_on})
+                            if db_id: download_url = f"/api/nse-symbol-dashboard/download?id={db_id}"
+                            os.remove(e_path)
+
+                        final_data = {
+                            'success': True, 'count': len(rows), 'rows': rows, 'errors': errors,
+                            'batch_index': batch_idx, 'total_batches': total_batches,
+                            'total_symbols': total_count, 'complete': is_last,
+                            'download_url': download_url, 'file_id': str(db_id) if db_id else None,
+                            'message': 'Dashboard build complete!', 'percentage': 100
+                        }
+                        msg_queue.put(f"data: {json.dumps(final_data)}\n\n")
+                    except Exception as e:
+                        msg_queue.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+                    finally:
+                        msg_queue.put(None) # Sentinel
+
+                # Start the build in a background thread
+                thread = threading.Thread(target=run_build)
+                thread.start()
+
+                # Poll the queue for messages and yield them
+                while True:
+                    msg = msg_queue.get()
+                    if msg is None: break
+                    yield msg
+                
+                thread.join()
+
             except Exception as e:
-                print(f"⚠️ Aggregates bulk load failed: {e}")
+                print(f"Dashboard SSE Error: {e}")
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-        if nifty_indices_collection is not None:
-            try:
-                idx_cursor = nifty_indices_collection.find({'symbol': {'$in': batch_symbols}})
-                for doc in idx_cursor:
-                    sym, idxs = doc.get('symbol'), doc.get('indices', [])
-                    if sym and idxs: index_mapping[sym] = idxs
-                print(f"[symbol-dashboard] ✓ Bulk loaded index mapping for {len(index_mapping)} symbols")
-            except Exception as e:
-                print(f"⚠️ Index mapping bulk load failed: {e}")
+        return Response(generate(), mimetype='text/event-stream')
 
-        if symbol_metrics_collection is not None:
-            try:
-                cache_cursor = symbol_metrics_collection.find({'as_on': as_on, 'symbol': {'$in': batch_symbols}})
-                for doc in cache_cursor:
-                    sym = doc.get('symbol')
-                    if sym: metrics_cache[sym] = doc
-                print(f"[symbol-dashboard] ✓ Loaded {len(metrics_cache)} symbols from metrics cache (as_on={as_on})")
-            except Exception as e:
-                print(f"⚠️ Metrics cache load failed: {e}")
-
-        # 3. PROCESSING (Call fetcher with metadata injections)
-        fetcher = SymbolMetricsFetcher()
-        rows, errors = [], []
-        try:
-            effective_workers = 10
-            chunk_size = max(10, len(batch_symbols) // effective_workers)
-            
-            result = fetcher.build_dashboard(
-                batch_symbols, as_of=as_on, parallel=True, max_workers=effective_workers, chunk_size=chunk_size,
-                symbol_pr_data=symbol_pr_data, symbol_mcap_data=symbol_mcap_data,
-                external_index_mapping=index_mapping, external_metrics_cache=metrics_cache
-            )
-            rows = result.get('rows', [])
-            errors = result.get('errors', [])
-        except Exception as exc:
-            errors.append({'error': f"Processing failed: {exc}"})
-
-        # 4. ENRICHMENT & PERSISTENCE
-        index_map_detailed = primary_index_map_from_db(batch_symbols)
-        for row in rows:
-            row.pop('_id', None)  # Remove MongoDB ObjectId for JSON serialization
-            sym = row.get('symbol')
-            if not sym: continue
-            if sym in index_map_detailed: row['primary_index'] = index_map_detailed[sym]
-            if sym in symbol_pr_data: row['days_with_data'] = symbol_pr_data[sym].get('days_with_data', 0)
-            upsert_symbol_metrics(dict(row), source='symbol_dashboard')
-        
-        duration = time.perf_counter() - start_time
-        is_last_batch = (batch_idx == total_batches - 1)
-
-        # 5. EXPORT & RESPONSE
-        download_url, db_id, download_name = None, None, None
-        if is_last_batch and len(rows) > 0:
-            download_name = f"Symbol_Dashboard_{as_on}.xlsx"
-            try:
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
-                excel_path = temp_file.name
-                temp_file.close()
-                format_dashboard_excel(rows, excel_path, start_date=start_date_str, end_date=end_date_str)
-                db_id = save_excel_to_database(excel_path, download_name, {'symbols': len(rows), 'as_on': as_on})
-                if db_id: download_url = f"/api/nse-symbol-dashboard/download?id={db_id}"
-                os.remove(excel_path)
-            except Exception as exc:
-                print(f"⚠️ Excel export failed: {exc}")
-
-        return jsonify({
-            'success': True, 'count': len(rows), 'rows': rows, 'errors': errors,
-            'batch_index': batch_idx, 'total_batches': total_batches,
-            'total_symbols': total_symbols, 'symbols_in_batch': len(batch_symbols),
-            'complete': is_last_batch, 'duration_seconds': round(duration, 1),
-            'download_url': download_url, 'file_id': str(db_id) if db_id else None
-        }), 200
-        
     except Exception as e:
         print(f"[symbol-dashboard][error] {e}")
         import traceback

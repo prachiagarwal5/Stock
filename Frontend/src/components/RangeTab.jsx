@@ -238,11 +238,7 @@ const RangeTab = ({
                                     🔄 Building Dashboard...
                                 </div>
                                 <div style={{ color: '#558b2f', fontSize: '0.95rem', marginTop: '4px' }}>
-                                    {dashboardBatchProgress
-                                        ? (dashboardBatchProgress.totalBatches === 1
-                                            ? `${dashboardBatchProgress.status}`
-                                            : `Batch ${dashboardBatchProgress.currentBatch}/${dashboardBatchProgress.totalBatches}: ${dashboardBatchProgress.status}`)
-                                        : 'Initializing...'}
+                                    {dashboardBatchProgress?.message || 'Initializing...'}
                                 </div>
                             </div>
                         </div>
@@ -258,92 +254,44 @@ const RangeTab = ({
                                     border: '1px solid #a5d6a7',
                                     position: 'relative'
                                 }}>
-                                    {dashboardBatchProgress.totalBatches === 1 ? (
-                                        <div className="progress-bar-pulse" style={{
-                                            background: 'linear-gradient(90deg, #4caf50, #81c784, #4caf50)',
-                                            height: '100%',
-                                            width: '100%',
-                                            animation: 'pulse 2s infinite ease-in-out'
-                                        }}>
-                                            <div style={{
-                                                display: 'flex',
-                                                alignItems: 'center',
-                                                justifyContent: 'center',
-                                                height: '100%',
-                                                color: '#fff',
-                                                fontWeight: 'bold',
-                                                fontSize: '0.85rem'
-                                            }}>
-                                                Processing symbols...
-                                            </div>
-                                        </div>
-                                    ) : (
-                                        <div style={{
-                                            background: 'linear-gradient(90deg, #4caf50, #81c784)',
-                                            height: '100%',
-                                            width: `${(dashboardBatchProgress.symbolsProcessed / dashboardBatchProgress.totalSymbols) * 100}%`,
-                                            transition: 'width 0.5s ease',
-                                            display: 'flex',
-                                            alignItems: 'center',
-                                            justifyContent: 'center',
-                                            color: '#fff',
-                                            fontWeight: 'bold',
-                                            fontSize: '0.85rem'
-                                        }}>
-                                            {Math.round((dashboardBatchProgress.symbolsProcessed / dashboardBatchProgress.totalSymbols) * 100)}%
-                                        </div>
-                                    )}
+                                    <div style={{
+                                        background: 'linear-gradient(90deg, #4caf50, #81c784)',
+                                        height: '100%',
+                                        width: `${dashboardBatchProgress.percentage || 0}%`,
+                                        transition: 'width 0.5s ease',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
+                                        color: '#fff',
+                                        fontWeight: 'bold',
+                                        fontSize: '0.85rem'
+                                    }}>
+                                        {Math.round(dashboardBatchProgress.percentage || 0)}%
+                                    </div>
                                 </div>
                                 {dashboardBatchProgress.totalBatches > 1 && (
                                     <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '8px', fontSize: '0.9rem', color: '#558b2f' }}>
-                                        <span>{dashboardBatchProgress.symbolsProcessed} symbols processed</span>
-                                        <span>{dashboardBatchProgress.totalSymbols} total</span>
+                                        <span>Batch mode: {dashboardBatchProgress.currentBatch} / {dashboardBatchProgress.totalBatches}</span>
+                                        <span>{dashboardBatchProgress.totalSymbols} total symbols</span>
                                     </div>
                                 )}
                             </div>
                         )}
 
-                        {dashboardBatchProgress && dashboardBatchProgress.totalBatches > 1 ? (
-                            <div style={{
-                                background: '#fff',
-                                borderRadius: '10px',
-                                padding: '14px 18px',
-                                border: '1px solid #a5d6a7'
-                            }}>
-                                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
-                                    <span style={{ color: '#666', fontWeight: '500' }}>📦 Batch:</span>
-                                    <span style={{ fontWeight: 'bold', color: '#2e7d32' }}>
-                                        {`${dashboardBatchProgress.currentBatch} of ${dashboardBatchProgress.totalBatches}`}
-                                    </span>
-                                </div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
-                                    <span style={{ color: '#666', fontWeight: '500' }}>🔢 Symbols per batch:</span>
-                                    <span style={{ fontWeight: 'bold', color: '#2e7d32' }}>100</span>
-                                </div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                                    <span style={{ color: '#666', fontWeight: '500' }}>⏱️ Est. per batch:</span>
-                                    <span style={{ fontWeight: 'bold', color: '#2e7d32' }}>~20-25 seconds</span>
-                                </div>
-                                <div style={{ marginTop: '12px', fontSize: '0.9rem', color: '#689f38', textAlign: 'center' }}>
-                                    💡 <em>Each batch request completes within Render's 30s limit</em>
-                                </div>
+                        <div style={{
+                            background: '#fff',
+                            borderRadius: '10px',
+                            padding: '14px 18px',
+                            border: '1px solid #a5d6a7',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '12px'
+                        }}>
+                            <span style={{ fontSize: '1.2rem' }}>⚡</span>
+                            <div style={{ fontSize: '0.9rem', color: '#2e7d32' }}>
+                                <strong>Real-time Streaming:</strong> Receiving granular updates from the backend. Subsequent runs for this date will be cached.
                             </div>
-                        ) : (
-                            <div style={{
-                                background: '#fff',
-                                borderRadius: '10px',
-                                padding: '14px 18px',
-                                border: '1px solid #a5d6a7',
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: '12px'
-                            }}>
-                                <span style={{ fontSize: '1.2rem' }}>⚡</span>
-                                <div style={{ fontSize: '0.9rem', color: '#2e7d32' }}>
-                                    <strong>Optimized Single Request:</strong> Utilizing backend caching. Subsequent runs for this date will be near-instant.
-                                </div>
-                            </div>
-                        )}
+                        </div>
                     </div>
                 )}
 

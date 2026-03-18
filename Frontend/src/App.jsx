@@ -557,7 +557,6 @@ function App() {
     };
 
     const handleBuildDashboard = async () => {
-        // Dashboard only available for date range (after MCAP/PR averages are calculated)
         if (!rangeStartDate || !rangeEndDate) {
             setError('Select a date range first (Start Date and End Date)');
             return;
@@ -568,7 +567,6 @@ function App() {
         setSuccess(null);
         setDashboardResult(null);
 
-        // Configuration
         const TOTAL_SYMBOLS = 1100;
 
         try {
@@ -577,7 +575,9 @@ function App() {
                 totalBatches: 1,
                 symbolsProcessed: 0,
                 totalSymbols: TOTAL_SYMBOLS,
-                status: 'Fetching dashboard data (Single request optimized)...'
+                status: 'Connecting to dashboard stream...',
+                message: 'Initializing...',
+                percentage: 0
             });
 
             const response = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard`, {
@@ -591,33 +591,59 @@ function App() {
                     end_date: rangeEndDate
                 })
             });
+
             if (!response.ok) {
                 const errorData = await response.json();
                 throw new Error(errorData.error || 'Dashboard generation failed');
             }
 
-            const data = await response.json();
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
 
-            setDashboardResult({
-                rows: data.rows || [],
-                errors: data.errors || [],
-                count: data.count || 0,
-                download_url: data.download_url,
-                db_id: data.db_id
-            });
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
 
-            setSuccess(`✅ Dashboard generated with ${data.count} symbols`);
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
 
-            if (data.download_url) {
-                const fullUrl = `${VITE_API_URL}${data.download_url}`;
-                setSuccess(prev => `${prev}. Excel ready.`);
-                window.open(fullUrl, '_blank');
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        try {
+                            const data = JSON.parse(line.substring(6));
+                            if (data.error) throw new Error(data.error);
+
+                            if (data.message) {
+                                setDashboardBatchProgress(prev => ({
+                                    ...prev,
+                                    message: data.message,
+                                    percentage: data.percentage !== undefined ? data.percentage : prev.percentage
+                                }));
+                                setExportLog(prev => [...prev, data.message]);
+                            }
+
+                            if (data.complete) {
+                                setDashboardResult(data);
+                                setSuccess(`✅ Dashboard built successfully with ${data.count} symbols`);
+                                if (data.rows && data.rows.length > 0 && activeTab === 'mongo') {
+                                    await loadDashboardData(dashboardLimit);
+                                }
+                                break;
+                            }
+                        } catch (e) {
+                            console.error("Error parsing dashboard SSE:", e);
+                        }
+                    }
+                }
             }
         } catch (err) {
+            console.error('Dashboard Error:', err);
             setError(err.message);
+            setDashboardBatchProgress(null);
         } finally {
             setDashboardLoading(false);
-            setDashboardBatchProgress(null);
         }
     };
 

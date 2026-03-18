@@ -237,7 +237,7 @@ class SymbolMetricsFetcher:
         }
         return result
 
-    def fetch_many(self, symbols, sleep_between=0.02, max_symbols=None, as_of=None, parallel=True, max_workers=20, chunk_size=100, max_time_seconds=None, external_metrics_cache=None):
+    def fetch_many(self, symbols, sleep_between=0.02, max_symbols=None, as_of=None, parallel=True, max_workers=20, chunk_size=100, max_time_seconds=None, external_metrics_cache=None, log_fn=None):
         """
         Fetch symbol data with optional timeout protection.
         external_metrics_cache: dict of {symbol: dashboard_row} already stored in DB.
@@ -282,7 +282,12 @@ class SymbolMetricsFetcher:
                 workers_for_batch = max(5, min(max_workers, len(batch)))
                 batch_num = (i // (chunk_size or len(capped_symbols))) + 1
                 total_batches = (len(capped_symbols) + (chunk_size or len(capped_symbols)) - 1) // (chunk_size or len(capped_symbols))
-                print(f"[fetch-symbols] Sub-batch {batch_num}/{total_batches}: {len(batch)} symbols with {workers_for_batch} parallel workers")
+                
+                msg = f"Processing Batch {batch_num}/{total_batches}: {len(batch)} symbols..."
+                print(f"[fetch-symbols] {msg}")
+                if log_fn:
+                    log_fn(msg, percentage=int((batch_num / total_batches) * 100))
+                
                 with ThreadPoolExecutor(max_workers=workers_for_batch) as executor:
                     for status, payload in executor.map(_worker, batch):
                         if status == 'ok':
@@ -308,7 +313,7 @@ class SymbolMetricsFetcher:
 
         return rows, errors
 
-    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=50, chunk_size=100, symbol_pr_data=None, symbol_mcap_data=None, max_time_seconds=None, fetch_indices_from_csv=False, nifty_indices_collection=None, external_index_mapping=None, external_metrics_cache=None):
+    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=50, chunk_size=100, symbol_pr_data=None, symbol_mcap_data=None, max_time_seconds=None, fetch_indices_from_csv=False, nifty_indices_collection=None, external_index_mapping=None, external_metrics_cache=None, log_fn=None):
         """
         Build dashboard with additional calculated columns.
         Optimized with minimum 5 workers per batch for parallel processing.
@@ -347,7 +352,8 @@ class SymbolMetricsFetcher:
             symbols, max_symbols=max_symbols, as_of=as_of, 
             parallel=parallel, max_workers=effective_workers, 
             chunk_size=chunk_size, max_time_seconds=max_time_seconds,
-            external_metrics_cache=external_metrics_cache
+            external_metrics_cache=external_metrics_cache,
+            log_fn=log_fn
         )
 
         # Store API indices before overriding
