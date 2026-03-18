@@ -519,7 +519,8 @@ def persist_consolidated_results(consolidator, data_type, source='consolidation'
                 date_range = None
 
         # CHUNKED PROCESSING to avoid OOM
-        SYMBOL_BATCH_SIZE = 200 
+        # OPTIMIZATION: Increased batch size for faster persistence
+        SYMBOL_BATCH_SIZE = 1000 
         total_rows = len(consolidator.df_consolidated)
         
         print(f"[persist] Starting chunked persistence for {total_rows} symbols ({data_type})...")
@@ -726,6 +727,35 @@ def get_cached_csv_bulk(date_iso_list, data_type):
         return {}
 
 
+def get_cached_csv_metadata_bulk(date_iso_list, data_type):
+    """LIGHTWEIGHT fetch of cache metadata (NO BLOB) for existence checks."""
+    if bhavcache_collection is None:
+        return {}
+    
+    try:
+        # SINGLE query for all dates, excluding the heavy file_data blob
+        docs = list(bhavcache_collection.find({
+            'date': {'$in': date_iso_list},
+            'type': data_type
+        }, {
+            'file_data': 0  # CRITICAL: Exclude the binary blob
+        }))
+        
+        results = {}
+        for doc in docs:
+            date_iso = doc.get('date')
+            results[date_iso] = {
+                'records': doc.get('records', 0),
+                'stored_at': doc.get('stored_at'),
+                'is_cached': True
+            }
+        
+        return results
+    except Exception as e:
+        print(f"⚠️ Metadata cache fetch failed: {e}")
+        return {}
+
+
 def put_cached_csv(date_iso, data_type, df, source='nse'):
     if bhavcache_collection is None or df is None:
         return None
@@ -753,19 +783,52 @@ def put_cached_csv(date_iso, data_type, df, source='nse'):
         return None
 
 
-def bulk_upsert_symbol_daily_from_df(df, date_iso, data_type, source='nse_download'):
+def bulk_upsert_symbol_daily_from_df(df, date_iso, data_type, source='nse_download', symbol_name_map=None):
     """Fast upsert of per-symbol values into Mongo, avoids per-row round trips."""
     if symbol_daily_collection is None or df is None or df.empty:
         return
     symbol_col = 'Symbol' if data_type == 'mcap' else 'SECURITY'
     name_col = 'Security Name' if data_type == 'mcap' else 'SECURITY'
     value_col = 'Market Cap(Rs.)' if data_type == 'mcap' else 'NET_TRDVAL'
+    
+    # Pre-process PR mapping if needed
+    pr_lookup = None
+    if data_type == 'pr' and symbol_name_map:
+        # Build normalized lookup: normalized_name -> ticker_symbol
+        def normalize_name(name):
+            if not name: return ''
+            return ''.join(c.upper() for c in str(name) if c.isalnum() or c.isspace()).strip()
+        
+        pr_lookup = {}
+        for company_name, ticker in symbol_name_map.items():
+            norm_name = normalize_name(company_name)
+            if norm_name: pr_lookup[norm_name] = ticker
+
     ops = []
     for _, row in df.iterrows():
-        symbol = str(row.get(symbol_col) or '').strip()
-        if not symbol or is_summary_symbol(symbol):
+        raw_symbol = str(row.get(symbol_col) or '').strip()
+        if not raw_symbol or is_summary_symbol(raw_symbol):
             continue
+            
+        symbol = raw_symbol
         company_name = str(row.get(name_col) or symbol).strip()
+        
+        # PR Mapping Logic
+        if data_type == 'pr' and pr_lookup:
+            def normalize_name(name):
+                if not name: return ''
+                return ''.join(c.upper() for c in str(name) if c.isalnum() or c.isspace()).strip()
+            
+            norm_pr = normalize_name(raw_symbol) # raw_symbol is the company name in PR
+            mapped_ticker = pr_lookup.get(norm_pr)
+            if mapped_ticker:
+                symbol = mapped_ticker
+                # company_name stays as the full name from PR if we want, or we can use it from the map if we had it
+            else:
+                # If we can't map it, skip it to ensure consistent sorting/averaging with MCAP
+                # (since PR without MCAP ticker won't group correctly in the pivot)
+                continue
+                
         raw_value = row.get(value_col)
         value = pd.to_numeric(raw_value, errors='coerce')
         if pd.isna(value):
@@ -794,6 +857,74 @@ def bulk_upsert_symbol_daily_from_df(df, date_iso, data_type, source='nse_downlo
             print(f"⚠️ bulk upsert for {data_type} {date_iso} failed: {exc}")
 
 
+def get_consolidated_metrics_from_db(date_iso_list, data_type):
+    """
+    ULTRA-FAST consolidation using MongoDB Aggregation Pipeline on symbol_daily collection.
+    Avoids fetching and processing raw CSVs for every request.
+    """
+    if symbol_daily_collection is None:
+        return None
+    
+    try:
+        pipeline = [
+            {
+                '$match': {
+                    'type': data_type,
+                    'date': {'$in': date_iso_list}
+                }
+            },
+            {
+                '$group': {
+                    '_id': '$symbol',
+                    'Symbol': {'$first': '$symbol'},
+                    'Company Name': {'$first': '$company_name'},
+                    'sum_val': {'$sum': '$value'},
+                    'count_val': {'$sum': 1},
+                    # We also need the daily values for the pivot
+                    'daily_data': {
+                        '$push': {
+                            'date': '$date',
+                            'val': '$value'
+                        }
+                    }
+                }
+            }
+        ]
+        
+        # Execute aggregation
+        cursor = symbol_daily_collection.aggregate(pipeline)
+        results = list(cursor)
+        
+        if not results:
+            return None
+            
+        # Convert to DataFrame
+        rows = []
+        for res in results:
+            row = {
+                'Symbol': res['Symbol'],
+                'Company Name': res['Company Name'],
+                'Average Value': res['sum_val'] / res['count_val'] if res['count_val'] > 0 else 0,
+                'Days With Data': res['count_val']
+            }
+            # Flatten daily data for pivoting
+            for daily in res.get('daily_data', []):
+                # Format date back to DD-MM-YYYY for consolidator compatibility
+                try:
+                    d_dt = datetime.strptime(daily['date'], '%Y-%m-%d')
+                    date_key = d_dt.strftime('%d-%m-%Y')
+                    row[date_key] = daily['val']
+                except:
+                    pass
+            rows.append(row)
+            
+        df = pd.DataFrame(rows)
+        return df
+    except Exception as e:
+        print(f"⚠️ MongoDB aggregation failed for {data_type}: {e}")
+        return None
+
+
 def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False, log_fn=None, allowed_symbols=None, symbol_name_map=None):
     """Build consolidated dataframe - ULTRA-OPTIMIZED with minimal operations."""
     
@@ -802,7 +933,33 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
         if log_fn: log_fn(f"❌ {error_msg}")
         raise ValueError(error_msg)
 
-    # BULK LOAD all dates at once
+    # OPTIMIZATION: Try DB aggregation first (it's much faster)
+    if log_fn: log_fn(f"⚡ Attempting high-performance DB aggregation for {data_type.upper()}...")
+    df_db = get_consolidated_metrics_from_db(date_iso_list, data_type)
+    if df_db is not None and not df_db.empty:
+        if log_fn: log_fn(f"✅ DB aggregation successful ({len(df_db)} records)")
+        
+        # Identify date columns (DD-MM-YYYY)
+        date_cols = [c for c in df_db.columns if re.match(r"\d{2}-\d{2}-\d{4}", c)]
+        date_cols = sorted(date_cols, key=lambda d: datetime.strptime(d, '%d-%m-%Y'))
+        
+        # Determine average column name based on type
+        if data_type == 'pr':
+            avg_col = 'Average Net Traded Value'
+        else:
+            avg_col = 'Average Market Cap'
+            
+        # Rename the generic 'Average Value' column
+        df_db = df_db.rename(columns={'Average Value': avg_col})
+        
+        # Sort by average
+        if avg_col in df_db.columns:
+            df_db = df_db.sort_values(by=avg_col, ascending=False, na_position='last').reset_index(drop=True)
+        
+        return df_db, [(d, datetime.strptime(d, '%d-%m-%Y')) for d in date_cols], avg_col
+
+    # Fallback to BULK LOAD from CSV cache
+    if log_fn: log_fn(f"ℹ️ DB aggregation failed or no data. Falling back to CSV cache...")
     cached_dict = get_cached_csv_bulk(date_iso_list, data_type)
     
     frames = []
@@ -1592,6 +1749,85 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
 
 
 
+def download_nse_csv(date_obj_or_iso, data_type):
+    """
+    Download a specific CSV (mcap or pr) from NSE for a given date.
+    Returns: pandas.DataFrame or None
+    """
+    try:
+        if isinstance(date_obj_or_iso, str):
+            # Handle both YYYY-MM-DD and DD-Mon-YYYY if needed, but primary is ISO
+            try:
+                date_obj = datetime.strptime(date_obj_or_iso, '%Y-%m-%d')
+            except:
+                date_obj = date_parser.parse(date_obj_or_iso)
+        else:
+            date_obj = date_obj_or_iso
+            
+        nse_date_formatted = date_obj.strftime('%d-%b-%Y')
+        
+        # NSE API request
+        api_url = "https://www.nseindia.com/api/reports"
+        params = {
+            'archives': json.dumps([{
+                "name": "CM - Bhavcopy (PR.zip)",
+                "type": "archives",
+                "category": "capital-market",
+                "section": "equities"
+            }]),
+            'date': nse_date_formatted,
+            'type': 'equities',
+            'mode': 'single'
+        }
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Connection': 'keep-alive'
+        }
+        
+        # Mimic browser requests more closely to avoid blocks
+        response = requests.get(api_url, params=params, headers=headers, timeout=30)
+        if response.status_code != 200:
+            print(f"⚠️ NSE API returned {response.status_code} for {nse_date_formatted}")
+            return None
+            
+        zip_data = BytesIO(response.content)
+        with zipfile.ZipFile(zip_data, 'r') as zip_ref:
+            file_list = zip_ref.namelist()
+            
+            target_file = None
+            if data_type == 'mcap':
+                # Look for mcap or bhav fallback
+                for file in file_list:
+                    if file.lower().startswith('mcap') and file.lower().endswith('.csv'):
+                        target_file = file
+                        break
+                if not target_file:
+                    for file in file_list:
+                        if file.lower().endswith('.csv') and ('bhav' in file.lower() or file.lower().startswith('bh')):
+                            target_file = file
+                            break
+            else: # pr
+                for file in file_list:
+                    if file.lower().startswith('pr') and file.lower().endswith('.csv'):
+                        target_file = file
+                        break
+                        
+            if not target_file:
+                print(f"⚠️ Target file {data_type} not found in ZIP for {nse_date_formatted}. Files: {file_list}")
+                return None
+                
+            csv_content = zip_ref.read(target_file)
+            df = pd.read_csv(BytesIO(csv_content), on_bad_lines='skip', engine='python')
+            df.columns = df.columns.str.strip()
+            return df
+    except Exception as e:
+        print(f"⚠️ Error downloading {data_type} for {date_obj_or_iso}: {e}")
+        return None
+
+
 @app.route('/api/download-nse', methods=['POST'])
 def download_nse_data():
     """
@@ -1606,157 +1842,50 @@ def download_nse_data():
         if not nse_date:
             return jsonify({'error': 'Date is required in format DD-Mon-YYYY'}), 400
         
-        # Convert NSE date format to DDMMYYYY for filename
+        # Parse date
         try:
             date_obj = date_parser.parse(nse_date)
-            filename_date = date_obj.strftime('%d%m%Y')
+            date_iso = date_obj.strftime('%Y-%m-%d')
             nse_date_formatted = date_obj.strftime('%d-%b-%Y')
         except:
             return jsonify({'error': 'Invalid date format. Use DD-Mon-YYYY (e.g., 03-Dec-2025)'}), 400
         
-        # NSE API request
-        api_url = "https://www.nseindia.com/api/reports"
-        
-        # Request body as shown in browser developer tools
-        params = {
-            'archives': json.dumps([{
-                "name": "CM - Bhavcopy (PR.zip)",
-                "type": "archives",
-                "category": "capital-market",
-                "section": "equities"
-            }]),
-            'date': nse_date_formatted,
-            'type': 'equities',
-            'mode': 'single'
-        }
-        
-        # Headers to mimic browser request
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-        }
-        
         print(f"Downloading NSE data for {nse_date_formatted}...")
         
-        # Download the ZIP file
-        response = requests.get(api_url, params=params, headers=headers, timeout=30)
+        # Use helper for MCAP
+        mcap_df = download_nse_csv(date_obj, 'mcap')
+        if mcap_df is None:
+            return jsonify({'error': f'Failed to download or parse MCAP for {nse_date_formatted}'}), 404
+            
+        # Use helper for PR
+        pr_df = download_nse_csv(date_obj, 'pr')
         
-        if response.status_code != 200:
-            return jsonify({'error': f'NSE API error: {response.status_code}'}), response.status_code
+        # Persist to Mongo cache and symbol_daily
+        put_cached_csv(date_iso, 'mcap', mcap_df, source='nse')
+        bulk_upsert_symbol_daily_from_df(mcap_df, date_iso, 'mcap', source='nse_download')
         
-        # Extract ZIP file in memory
-        try:
-            zip_data = BytesIO(response.content)
-            with zipfile.ZipFile(zip_data, 'r') as zip_ref:
-                # List all files in ZIP
-                file_list = zip_ref.namelist()
-                print(f"Files in ZIP: {file_list}")
-                
-                # Look for both mcap and pr files
-                mcap_file = None
-                pr_file = None
-                
-                # Find mcap file (market cap)
-                for file in file_list:
-                    if file.lower().startswith('mcap') and file.lower().endswith('.csv'):
-                        mcap_file = file
-                        print(f"Found market cap file: {mcap_file}")
-                        break
-                
-                # Find pr file (NET_TRDVAL - net traded value)
-                for file in file_list:
-                    if file.lower().startswith('pr') and file.lower().endswith('.csv'):
-                        pr_file = file
-                        print(f"Found PR file: {pr_file}")
-                        break
-                
-                # If mcap not found, look for bhav file as fallback
-                if not mcap_file:
-                    for file in file_list:
-                        if file.lower().endswith('.csv') and ('bhav' in file.lower() or file.lower().startswith('bh')):
-                            mcap_file = file
-                            print(f"Using Bhavcopy file as mcap: {mcap_file}")
-                            break
-                
-                # Check if we have at least one file
-                if not mcap_file and not pr_file:
-                    csv_files = [f for f in file_list if f.lower().endswith('.csv')]
-                    if csv_files:
-                        mcap_file = csv_files[0]
-                        print(f"Using fallback CSV file: {mcap_file}")
-                    else:
-                        return jsonify({'error': f'No CSV files found in ZIP. Files available: {", ".join(file_list)}'}), 400
-                
-                # Process mcap file
-                mcap_df = None
-                mcap_filename = f"mcap{filename_date}.csv"
-                if mcap_file:
-                    try:
-                        csv_content = zip_ref.read(mcap_file)
-                        mcap_df = pd.read_csv(BytesIO(csv_content))
-                        mcap_df.columns = mcap_df.columns.str.strip()
-                        print(f"MCAP CSV loaded. Columns: {mcap_df.columns.tolist()}")
-                        print(f"MCAP Total records: {len(mcap_df)}")
-                        
-                        # Validate columns for mcap
-                        if 'Symbol' not in mcap_df.columns:
-                            return jsonify({'error': f'Symbol column not found in MCAP CSV. Available: {mcap_df.columns.tolist()}'}), 400
-                    except Exception as e:
-                        return jsonify({'error': f'Error reading MCAP file: {str(e)}'}), 400
-                
-                # Process pr file
-                pr_df = None
-                pr_filename = f"pr{filename_date}.csv"
-                if pr_file:
-                    try:
-                        csv_content = zip_ref.read(pr_file)
-                        # Some PR files have inconsistent columns; be lenient and skip bad lines.
-                        pr_df = pd.read_csv(BytesIO(csv_content), on_bad_lines='skip', engine='python')
-                        pr_df.columns = pr_df.columns.str.strip()
-                        print(f"PR CSV loaded. Columns: {pr_df.columns.tolist()}")
-                        print(f"PR Total records: {len(pr_df)}")
-                        
-                        # Validate columns for pr (uses SECURITY instead of Symbol)
-                        if 'SECURITY' not in pr_df.columns:
-                            return jsonify({'error': f'SECURITY column not found in PR CSV. Available: {pr_df.columns.tolist()}'}), 400
-                    except Exception as e:
-                        print(f"Warning: Error reading PR file: {str(e)}")
-                        pr_df = None
-                
-                # Persist to Mongo cache and symbol_daily for downstream consolidation
-                if mcap_df is not None:
-                    date_iso = date_obj.strftime('%Y-%m-%d')
-                    put_cached_csv(date_iso, 'mcap', mcap_df, source='nse')
-                    bulk_upsert_symbol_daily_from_df(mcap_df, date_iso, 'mcap', source='nse_download')
-                if pr_df is not None:
-                    date_iso = date_obj.strftime('%Y-%m-%d')
-                    put_cached_csv(date_iso, 'pr', pr_df, source='nse')
-                    bulk_upsert_symbol_daily_from_df(pr_df, date_iso, 'pr', source='nse_download')
-                
-                return jsonify({
-                    'success': True,
-                    'message': 'Files downloaded and cached to Mongo',
-                    'files': {
-                        'mcap': {
-                            'filename': mcap_filename,
-                            'records': len(mcap_df) if mcap_df is not None else 0,
-                            'columns': mcap_df.columns.tolist() if mcap_df is not None else []
-                        },
-                        'pr': {
-                            'filename': pr_filename if pr_df is not None else None,
-                            'records': len(pr_df) if pr_df is not None else 0,
-                            'columns': pr_df.columns.tolist() if pr_df is not None else []
-                        } if pr_df is not None else None
-                    },
-                    'date': nse_date_formatted
-                }), 200
+        if pr_df is not None:
+            put_cached_csv(date_iso, 'pr', pr_df, source='nse')
+            bulk_upsert_symbol_daily_from_df(pr_df, date_iso, 'pr', source='nse_download')
         
-        except zipfile.BadZipFile:
-            return jsonify({'error': 'Invalid ZIP file received from NSE'}), 400
-        except Exception as e:
-            return jsonify({'error': f'Error extracting files: {str(e)}'}), 500
+        return jsonify({
+            'success': True,
+            'message': 'Files downloaded and cached to Mongo',
+            'files': {
+                'mcap': {
+                    'records': len(mcap_df),
+                    'columns': mcap_df.columns.tolist()
+                },
+                'pr': {
+                    'records': len(pr_df) if pr_df is not None else 0,
+                    'columns': pr_df.columns.tolist() if pr_df is not None else []
+                }
+            },
+            'date': nse_date_formatted
+        }), 200
     
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Error in download_nse_data: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/nse-dates', methods=['GET'])
@@ -1809,7 +1938,7 @@ def download_nse_range():
         start_date_str = data.get('start_date', '')
         end_date_str = data.get('end_date', '')
         refresh_mode = data.get('refresh_mode', 'missing_only')  # missing_only | force
-        parallel_workers = int(data.get('parallel_workers', 10) or 10)
+        parallel_workers = int(data.get('parallel_workers', 20) or 20)
 
         if refresh_mode not in ['missing_only', 'force']:
             return jsonify({'error': 'Invalid refresh_mode. Use missing_only or force'}), 400
@@ -1851,196 +1980,123 @@ def download_nse_range():
 
         print(f"Downloading NSE data for {len(trading_dates)} trading days (mode={refresh_mode}, workers={parallel_workers})...")
 
+        # OPTIMIZATION: Bulk fetch existing cache METADATA ONLY first
+        # This is extremely fast because it excludes the heavy file_data blobs.
+        date_iso_list = [_normalize_iso_date(d) for d in trading_dates]
+        prefetched_mcap_meta = {}
+        prefetched_pr_meta = {}
+        if refresh_mode != 'force':
+            print(f"[download-range] Fast-checking cache metadata for {len(date_iso_list)} dates...")
+            prefetched_mcap_meta = get_cached_csv_metadata_bulk(date_iso_list, 'mcap')
+            prefetched_pr_meta = get_cached_csv_metadata_bulk(date_iso_list, 'pr')
+
         def process_trade_date(index, trade_date):
             nse_date_formatted = trade_date.strftime('%d-%b-%Y')
-            filename_date = trade_date.strftime('%d%m%Y')
             date_iso = _normalize_iso_date(trade_date)
 
-            result = {
-                'entries': [],
-                'errors': [],
-                'cached_count': 0,
-                'fetched_count': 0,
-                'failed_count': 0
+            result_entry = {
+                'index': index + 1,
+                'date': nse_date_formatted,
+                'status': 'fetched',
+                'pr_status': 'fetched',
+                'mcap_records': 0,
+                'pr_records': 0
             }
 
-            cached_mcap = None if refresh_mode == 'force' else get_cached_csv(date_iso, 'mcap')
-            cached_pr = None if refresh_mode == 'force' else get_cached_csv(date_iso, 'pr')
+            # 1. LIGHTWEIGHT CACHE CHECK
+            mcap_meta = prefetched_mcap_meta.get(date_iso) if refresh_mode != 'force' else None
+            pr_meta = prefetched_pr_meta.get(date_iso) if refresh_mode != 'force' else None
+            # 2. FAST PATH: If both are cached and NOT force mode, return IMMEDIATELY
+            if mcap_meta and pr_meta and refresh_mode != 'force':
+                result_entry['status'] = 'cached'
+                result_entry['pr_status'] = 'cached'
+                result_entry['mcap_records'] = mcap_meta.get('records', 0)
+                result_entry['pr_records'] = pr_meta.get('records', 0)
+                return index, {
+                    'entries': [result_entry],
+                    'errors': [],
+                    'cached_count': 1,
+                    'fetched_count': 0,
+                    'failed_count': 0
+                }
 
-            need_mcap = refresh_mode == 'force' or cached_mcap is None
-            need_pr = refresh_mode == 'force' or cached_pr is None
-
-            mcap_df = cached_mcap['df'] if cached_mcap else None
-            pr_df = cached_pr['df'] if cached_pr else None
-
-            if need_mcap or need_pr:
-                # Retry logic for network failures
-                max_retries = 3
-                retry_delay = 2  # seconds
-                
-                for attempt in range(max_retries):
-                    try:
-                        api_url = "https://www.nseindia.com/api/reports"
-                        params = {
-                            'archives': json.dumps([{
-                                "name": "CM - Bhavcopy (PR.zip)",
-                                "type": "archives",
-                                "category": "capital-market",
-                                "section": "equities"
-                            }]),
-                            'date': nse_date_formatted,
-                            'type': 'equities',
-                            'mode': 'single'
-                        }
-
-                        headers = {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                            'Accept': 'application/json, text/plain, */*',
-                            'Accept-Language': 'en-US,en;q=0.9',
-                            'Connection': 'keep-alive'
-                        }
-
-                        response = requests.get(api_url, params=params, headers=headers, timeout=30)
-                        if response.status_code != 200:
-                            if response.status_code == 404:
-                                # 404 means no data for this date (holiday/weekend)
-                                result['errors'].append({
-                                    'date': nse_date_formatted,
-                                    'error': f'NSE API error: {response.status_code} - No data available (possibly a holiday)'
-                                })
-                                result['failed_count'] += 1
-                                return index, result
-                            elif attempt < max_retries - 1:
-                                # Retry for other errors
-                                time.sleep(retry_delay)
-                                continue
-                            else:
-                                result['errors'].append({
-                                    'date': nse_date_formatted,
-                                    'error': f'NSE API error: {response.status_code}'
-                                })
-                                result['failed_count'] += 1
-                                return index, result
-                        break  # Success, exit retry loop
-                    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, 
-                            requests.exceptions.RequestException) as conn_err:
-                        if attempt < max_retries - 1:
-                            print(f"Connection error for {nse_date_formatted} (attempt {attempt+1}/{max_retries}): {conn_err}")
-                            time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
-                            continue
-                        else:
-                            result['errors'].append({
-                                'date': nse_date_formatted,
-                                'error': f'Connection failed after {max_retries} attempts: {str(conn_err)}'
-                            })
-                            result['failed_count'] += 1
-                            return index, result
-                    except Exception as e:
-                        result['errors'].append({
-                            'date': nse_date_formatted,
-                            'error': f'Error fetching ZIP: {str(e)}'
-                        })
-                        result['failed_count'] += 1
-                        return index, result
-                
-                # If we get here, response is successful
-                try:
-
-                    zip_data = BytesIO(response.content)
-                    with zipfile.ZipFile(zip_data, 'r') as zip_ref:
-                        file_list = zip_ref.namelist()
-
-                        mcap_file = None
-                        pr_file = None
-                        for file in file_list:
-                            if file.lower().startswith('mcap') and file.lower().endswith('.csv'):
-                                mcap_file = file
-                            if file.lower().startswith('pr') and file.lower().endswith('.csv'):
-                                pr_file = file
-
-                        if not mcap_file:
-                            for file in file_list:
-                                if file.lower().endswith('.csv') and ('bhav' in file.lower() or file.lower().startswith('bh')):
-                                    mcap_file = file
-                                    break
-
-                        if need_mcap and mcap_file:
-                            try:
-                                csv_content = zip_ref.read(mcap_file)
-                                mcap_df = pd.read_csv(BytesIO(csv_content))
-                                mcap_df.columns = mcap_df.columns.str.strip()
-                                put_cached_csv(date_iso, 'mcap', mcap_df, source='nse')
-                            except Exception as e:
-                                result['errors'].append({
-                                    'date': nse_date_formatted,
-                                    'type': 'mcap',
-                                    'error': f'Error reading MCAP: {e}'
-                                })
-
-                        if need_pr and pr_file:
-                            try:
-                                csv_content = zip_ref.read(pr_file)
-                                # Some PR files have inconsistent columns; be lenient and skip bad lines.
-                                pr_df = pd.read_csv(BytesIO(csv_content), on_bad_lines='skip', engine='python')
-                                pr_df.columns = pr_df.columns.str.strip()
-                                put_cached_csv(date_iso, 'pr', pr_df, source='nse')
-                            except Exception as e:
-                                result['errors'].append({
-                                    'date': nse_date_formatted,
-                                    'type': 'pr',
-                                    'error': f'Error reading PR: {e}'
-                                })
-                except Exception as e:
-                    result['errors'].append({
-                        'date': nse_date_formatted,
-                        'error': f'Error processing ZIP file: {str(e)}'
-                    })
-                    result['failed_count'] += 1
-                    return index, result
-
-            if mcap_df is not None:
-                bulk_upsert_symbol_daily_from_df(mcap_df, date_iso, 'mcap', source='nse_download')
-                status = 'cached' if cached_mcap and refresh_mode != 'force' else 'fetched'
-                result['entries'].append({
-                    'date': nse_date_formatted,
-                    'type': 'mcap',
-                    'status': status,
-                    'records': len(mcap_df)
-                })
-                if status == 'cached':
-                    result['cached_count'] += 1
+            # 3. SLOW PATH: Missing data or FORCE mode
+            # We need the actual dataframes for these cases
+            try:
+                # MCAP Stage
+                mcap_df = None
+                if mcap_meta and refresh_mode != 'force':
+                    result_entry['status'] = 'cached'
+                    mcap_records = mcap_meta.get('records', 0)
                 else:
-                    result['fetched_count'] += 1
-            else:
-                result['entries'].append({
-                    'date': nse_date_formatted,
-                    'type': 'mcap',
-                    'status': 'missing'
-                })
-                result['failed_count'] += 1
+                    # Actually fetch from NSE or full cache
+                    mcap_data = get_cached_csv(date_iso, 'mcap') if refresh_mode != 'force' else None
+                    if not mcap_data:
+                        mcap_df = download_nse_csv(trade_date, 'mcap')
+                        if mcap_df is not None:
+                            put_cached_csv(date_iso, 'mcap', mcap_df)
+                    else:
+                        mcap_df = mcap_data['df']
+                    
+                    if mcap_df is not None:
+                        bulk_upsert_symbol_daily_from_df(mcap_df, date_iso, 'mcap', source='nse_download')
+                        mcap_records = len(mcap_df)
+                    else:
+                        mcap_records = 0
+                
+                result_entry['mcap_records'] = mcap_records
 
-            if pr_df is not None:
-                bulk_upsert_symbol_daily_from_df(pr_df, date_iso, 'pr', source='nse_download')
-                status = 'cached' if cached_pr and refresh_mode != 'force' else 'fetched'
-                result['entries'].append({
-                    'date': nse_date_formatted,
-                    'type': 'pr',
-                    'status': status,
-                    'records': len(pr_df)
-                })
-                if status == 'cached':
-                    result['cached_count'] += 1
+                # PR Stage
+                pr_df = None
+                if pr_meta and refresh_mode != 'force':
+                    result_entry['pr_status'] = 'cached'
+                    pr_records = pr_meta.get('records', 0)
                 else:
-                    result['fetched_count'] += 1
-            else:
-                result['entries'].append({
-                    'date': nse_date_formatted,
-                    'type': 'pr',
-                    'status': 'missing'
-                })
-                result['failed_count'] += 1
+                    pr_data = get_cached_csv(date_iso, 'pr') if refresh_mode != 'force' else None
+                    if not pr_data:
+                        pr_df = download_nse_csv(trade_date, 'pr')
+                        if pr_df is not None:
+                            put_cached_csv(date_iso, 'pr', pr_df)
+                    else:
+                        pr_df = pr_data['df']
+                    
+                    if pr_df is not None:
+                        # Build name map from MCAP for PR symbol mapping
+                        symbol_name_map = {}
+                        if mcap_df is not None:
+                            symbol_name_map = dict(zip(mcap_df['Security Name'], mcap_df['Symbol']))
+                        elif result_entry['status'] == 'cached':
+                            # Try to get map from cached MCAP
+                            mcap_data = get_cached_csv(date_iso, 'mcap')
+                            if mcap_data:
+                                symbol_name_map = dict(zip(mcap_data['df']['Security Name'], mcap_data['df']['Symbol']))
+                                
+                        bulk_upsert_symbol_daily_from_df(pr_df, date_iso, 'pr', source='nse_download', symbol_name_map=symbol_name_map)
+                        pr_records = len(pr_df)
+                    else:
+                        pr_records = 0
+                
+                result_entry['pr_records'] = pr_records
 
-            return index, result
+                is_cached = (result_entry['status'] == 'cached' and result_entry['pr_status'] == 'cached')
+                
+                return index, {
+                    'entries': [result_entry],
+                    'errors': [],
+                    'cached_count': 1 if is_cached else 0,
+                    'fetched_count': 0 if is_cached else 1,
+                    'failed_count': 0
+                }
+
+            except Exception as e:
+                print(f"❌ Error processing {date_iso}: {e}")
+                return index, {
+                    'entries': [result_entry],
+                    'errors': [{'date': nse_date_formatted, 'error': str(e)}],
+                    'cached_count': 0,
+                    'fetched_count': 0,
+                    'failed_count': 1
+                }
 
         futures = {}
         with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
@@ -2460,7 +2516,7 @@ def nse_symbol_dashboard():
         # Parallel batch processing
         print(f"[symbol-dashboard] Starting parallel processing for {total_batches} batches...")
         
-        with ThreadPoolExecutor(max_workers=min(total_batches, 10)) as executor:
+        with ThreadPoolExecutor(max_workers=min(total_batches, 20)) as executor:
             future_to_batch = {
                 executor.submit(
                     fetcher.build_dashboard,

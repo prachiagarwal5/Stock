@@ -237,7 +237,7 @@ class SymbolMetricsFetcher:
         }
         return result
 
-    def fetch_many(self, symbols, sleep_between=0.02, max_symbols=None, as_of=None, parallel=True, max_workers=10, chunk_size=100, max_time_seconds=None):
+    def fetch_many(self, symbols, sleep_between=0.02, max_symbols=None, as_of=None, parallel=True, max_workers=20, chunk_size=100, max_time_seconds=None):
         """
         Fetch symbol data with optional timeout protection.
         max_time_seconds: If set, stop fetching after this many seconds and return partial results.

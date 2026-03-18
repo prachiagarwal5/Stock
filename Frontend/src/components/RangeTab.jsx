@@ -20,7 +20,8 @@ const RangeTab = ({
     handleDownloadDashboard,
     handleFullPipeline,
     pipelineLoading,
-    pipelineStage
+    pipelineStage,
+    consolidationBatchProgress
 }) => {
 
     return (
@@ -100,6 +101,87 @@ const RangeTab = ({
                         <span style={{ fontSize: '1.3rem' }}>📊</span> {dashboardLoading ? 'Building...' : consolidationReady ? 'Build Dashboard' : 'Build Dashboard (Export First)'}
                     </button>
                 </div>
+
+                {/* Range Download Progress Indicator */}
+                {rangeLoading && rangeProgress && rangeProgress.summary && (
+                    <div style={{
+                        background: 'linear-gradient(135deg, #e6f0fa 0%, #c8e1f5 100%)',
+                        borderRadius: '16px',
+                        padding: '24px 28px',
+                        marginBottom: '24px',
+                        border: '2px solid #2d7ff9',
+                        boxShadow: '0 4px 20px rgba(45, 127, 249, 0.15)'
+                    }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '16px' }}>
+                            <div className="pipeline-spinner" style={{
+                                width: '40px',
+                                height: '40px',
+                                border: '4px solid #e0e0e0',
+                                borderTop: '4px solid #2d7ff9',
+                                borderRadius: '50%',
+                                animation: 'spin 1s linear infinite'
+                            }} />
+                            <div>
+                                <div style={{ fontWeight: 'bold', fontSize: '1.2rem', color: '#1565c0' }}>
+                                    ⬇️ Downloading NSE Data...
+                                </div>
+                                <div style={{ color: '#0d47a1', fontSize: '0.95rem', marginTop: '4px' }}>
+                                    Processing batches of 40 trading days with 20 parallel workers
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Progress Bar */}
+                        <div style={{ marginBottom: '16px' }}>
+                            <div style={{
+                                background: '#fff',
+                                borderRadius: '10px',
+                                height: '24px',
+                                overflow: 'hidden',
+                                border: '1px solid #90caf9'
+                            }}>
+                                <div style={{
+                                    background: 'linear-gradient(90deg, #2d7ff9, #64b5f6)',
+                                    height: '100%',
+                                    width: `${rangeProgress.summary.percentage || 0}%`,
+                                    transition: 'width 0.5s ease',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    color: '#fff',
+                                    fontWeight: 'bold',
+                                    fontSize: '0.85rem'
+                                }}>
+                                    {rangeProgress.summary.percentage || 0}%
+                                </div>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '8px', fontSize: '0.9rem', color: '#1565c0' }}>
+                                <span>{rangeProgress.summary.cached + rangeProgress.summary.fetched + rangeProgress.summary.failed} days processed</span>
+                                <span>{rangeProgress.summary.total_requested} total trading days</span>
+                            </div>
+                        </div>
+
+                        <div style={{
+                            background: '#fff',
+                            borderRadius: '10px',
+                            padding: '14px 18px',
+                            border: '1px solid #90caf9'
+                        }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                                <span style={{ color: '#666', fontWeight: '500' }}>✅ Cached:</span>
+                                <span style={{ fontWeight: 'bold', color: '#1bb76e' }}>{rangeProgress.summary.cached}</span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                                <span style={{ color: '#666', fontWeight: '500' }}>📥 Fetched:</span>
+                                <span style={{ fontWeight: 'bold', color: '#2d7ff9' }}>{rangeProgress.summary.fetched}</span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                <span style={{ color: '#666', fontWeight: '500' }}>❌ Failed:</span>
+                                <span style={{ fontWeight: 'bold', color: '#e74c3c' }}>{rangeProgress.summary.failed}</span>
+                            </div>
+                        </div>
+                    </div>
+                )}
 
                 {/* Full Pipeline Progress Indicator */}
                 {pipelineLoading && (
@@ -222,6 +304,67 @@ const RangeTab = ({
                     </div>
                 )}
 
+                {/* Consolidation Progress Indicator */}
+                {exportLoading && consolidationBatchProgress && (
+                    <div style={{
+                        background: 'linear-gradient(135deg, #f3e5f5 0%, #e1bee7 100%)',
+                        borderRadius: '16px',
+                        padding: '24px 28px',
+                        marginBottom: '24px',
+                        border: '2px solid #9c27b0',
+                        boxShadow: '0 4px 20px rgba(156, 39, 176, 0.15)'
+                    }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '16px' }}>
+                            <div className="pipeline-spinner" style={{
+                                width: '40px',
+                                height: '40px',
+                                border: '4px solid #e0e0e0',
+                                borderTop: '4px solid #9c27b0',
+                                borderRadius: '50%',
+                                animation: 'spin 1s linear infinite'
+                            }} />
+                            <div>
+                                <div style={{ fontWeight: 'bold', fontSize: '1.2rem', color: '#7b1fa2' }}>
+                                    🌌 Consolidating Data...
+                                </div>
+                                <div style={{ color: '#4a148c', fontSize: '0.95rem', marginTop: '4px' }}>
+                                    {consolidationBatchProgress.message}
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Progress Bar */}
+                        <div style={{ marginBottom: '16px' }}>
+                            <div style={{
+                                background: '#fff',
+                                borderRadius: '10px',
+                                height: '24px',
+                                overflow: 'hidden',
+                                border: '1px solid #ce93d8'
+                            }}>
+                                <div style={{
+                                    background: 'linear-gradient(90deg, #9c27b0, #ba68c8)',
+                                    height: '100%',
+                                    width: `${consolidationBatchProgress.percentage || 0}%`,
+                                    transition: 'width 0.5s ease',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    color: '#fff',
+                                    fontWeight: 'bold',
+                                    fontSize: '0.85rem'
+                                }}>
+                                    {consolidationBatchProgress.percentage || 0}%
+                                </div>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '8px', fontSize: '0.9rem', color: '#7b1fa2' }}>
+                                <span>{consolidationBatchProgress.current} days processed</span>
+                                <span>{consolidationBatchProgress.total} total days</span>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
                 {consolidationReady ? (
                     <div className="consolidation-details" style={{ marginBottom: '18px' }}>
                         <span className="pill pill-success" style={{ background: '#1bb76e', color: '#fff', borderRadius: '8px', padding: '4px 12px', marginRight: '8px' }}>Dashboard Ready</span>
@@ -268,8 +411,10 @@ const RangeTab = ({
                                     // Group entries by date
                                     const grouped = {};
                                     rangeProgress.entries.forEach(entry => {
-                                        if (!grouped[entry.date]) grouped[entry.date] = {};
-                                        grouped[entry.date][entry.type.toUpperCase()] = entry;
+                                        grouped[entry.date] = {
+                                            MCAP: { status: entry.status, records: entry.mcap_records },
+                                            PR: { status: entry.pr_status, records: entry.pr_records }
+                                        };
                                     });
                                     return Object.entries(grouped).map(([date, types]) => (
                                         <div key={date} className="range-status-card frosted-bg" style={{ background: '#f6fff8', borderRadius: '16px', boxShadow: '0 2px 12px rgba(44,62,80,0.08)', padding: '18px 16px', display: 'flex', flexDirection: 'column', alignItems: 'flex-start', minHeight: '120px', justifyContent: 'center' }}>

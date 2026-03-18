@@ -37,6 +37,7 @@ function App() {
     const [dashboardResult, setDashboardResult] = useState(null);
     const [dashboardLoading, setDashboardLoading] = useState(false);
     const [dashboardBatchProgress, setDashboardBatchProgress] = useState(null);
+    const [consolidationBatchProgress, setConsolidationBatchProgress] = useState(null);
     // Reset consolidation status when date range changes
     useEffect(() => {
         if (exportedRange) {
@@ -75,10 +76,28 @@ function App() {
     // Convert YYYY-MM-DD (from date input) to DD-Mon-YYYY format for API
     const convertDateFormat = (dateStr) => {
         if (!dateStr) return '';
-        const [year, month, day] = dateStr.split('-');
+        // Handle ISO strings from new Date().toISOString()
+        const normalized = dateStr.includes('T') ? dateStr.split('T')[0] : dateStr;
+        const [year, month, day] = normalized.split('-');
         const date = new Date(year, parseInt(month) - 1, parseInt(day));
         const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
         return `${day}-${months[date.getMonth()]}-${year}`;
+    };
+
+    const getTradingDates = (startStr, endStr) => {
+        const start = new Date(startStr);
+        const end = new Date(endStr);
+        const dates = [];
+        let curr = new Date(start);
+
+        while (curr <= end) {
+            const day = curr.getDay();
+            if (day !== 0 && day !== 6) { // 0=Sun, 6=Sat
+                dates.push(new Date(curr));
+            }
+            curr.setDate(curr.getDate() + 1);
+        }
+        return dates;
     };
 
     // Ask the user where to save a file; fall back to default downloads if picker is unavailable
@@ -177,43 +196,79 @@ function App() {
             return;
         }
 
+        const tradingDates = getTradingDates(rangeStartDate, rangeEndDate);
+        if (tradingDates.length === 0) {
+            setError('No trading days found in the selected range');
+            return;
+        }
+
         setRangeLoading(true);
         setError(null);
         setSuccess(null);
-        setRangeProgress(null);
+
+        const initialProgress = {
+            summary: {
+                total_requested: tradingDates.length,
+                cached: 0,
+                fetched: 0,
+                failed: 0,
+                percentage: 0
+            },
+            entries: [],
+            errors: []
+        };
+        setRangeProgress(initialProgress);
+
+        const BATCH_SIZE = 40;
+        let cumulativeSummary = { ...initialProgress.summary };
+        let cumulativeEntries = [];
+        let cumulativeErrors = [];
 
         try {
-            const response = await fetch(`${VITE_API_URL}/api/download-nse-range`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    start_date: convertDateFormat(rangeStartDate),
-                    end_date: convertDateFormat(rangeEndDate),
-                    save_to_file: true,
-                    refresh_mode: 'missing_only'
-                })
-            });
+            for (let i = 0; i < tradingDates.length; i += BATCH_SIZE) {
+                const batch = tradingDates.slice(i, i + BATCH_SIZE);
+                const batchStart = batch[0].toISOString().split('T')[0];
+                const batchEnd = batch[batch.length - 1].toISOString().split('T')[0];
 
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Download failed');
+                const response = await fetch(`${VITE_API_URL}/api/download-nse-range`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        start_date: convertDateFormat(batchStart),
+                        end_date: convertDateFormat(batchEnd),
+                        save_to_file: true,
+                        refresh_mode: 'missing_only',
+                        parallel_workers: 20
+                    })
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.error || `Batch ${Math.floor(i / BATCH_SIZE) + 1} failed`);
+                }
+
+                const data = await response.json();
+
+                // Aggregate results
+                cumulativeSummary.cached += (data.summary.cached || 0);
+                cumulativeSummary.fetched += (data.summary.fetched || 0);
+                cumulativeSummary.failed += (data.summary.failed || 0);
+                cumulativeSummary.percentage = Math.round(((i + batch.length) / tradingDates.length) * 100);
+                cumulativeEntries = [...cumulativeEntries, ...(data.entries || [])];
+                cumulativeErrors = [...cumulativeErrors, ...(data.errors || [])];
+
+                setRangeProgress({
+                    summary: cumulativeSummary,
+                    entries: cumulativeEntries,
+                    errors: cumulativeErrors
+                });
             }
 
-            const data = await response.json();
-            setRangeProgress({
-                summary: data.summary,
-                entries: data.entries || [],
-                errors: data.errors || []
-            });
-
-            const cached = data.summary.cached;
-            const fetched = data.summary.fetched;
-            const total = data.summary.total_requested;
-            const message = fetched === 0 && data.summary.failed === 0
-                ? `✅ All ${total} days served from cache`
-                : `✅ Ready: cached ${cached}, fetched ${fetched}, total ${total}`;
+            const message = cumulativeSummary.fetched === 0 && cumulativeSummary.failed === 0
+                ? `✅ All ${cumulativeSummary.total_requested} days served from cache`
+                : `✅ Ready: cached ${cumulativeSummary.cached}, fetched ${cumulativeSummary.fetched}, total ${cumulativeSummary.total_requested}`;
             setSuccess(message);
         } catch (err) {
             setError(err.message);
@@ -223,37 +278,103 @@ function App() {
     };
 
     const handleExportConsolidated = async (scope = 'date', skipDaily = true) => {
-        const payload = { file_type: 'both', fast_mode: false, skip_daily: skipDaily }; // persist averages to DB
         setExportLog(['Starting export...']);
+        setError(null);
+        setSuccess(null);
+        setConsolidationBatchProgress(null);
 
-        if (scope === 'range') {
-            if (!rangeStartDate || !rangeEndDate) {
-                setError('Select a start and end date');
-                setExportLog([]);
-                return;
-            }
-            payload.start_date = convertDateFormat(rangeStartDate);
-            payload.end_date = convertDateFormat(rangeEndDate);
-        } else {
-            if (!nseDate) {
-                setError('Select a date to export');
-                setExportLog([]);
-                return;
-            }
-            payload.date = convertDateFormat(nseDate);
+        if (scope === 'range' && (!rangeStartDate || !rangeEndDate)) {
+            setError('Select a start and end date');
+            setExportLog([]);
+            return;
+        }
+
+        if (scope === 'date' && !nseDate) {
+            setError('Select a date to export');
+            setExportLog([]);
+            return;
         }
 
         setExportLoading(true);
-        setError(null);
-        setSuccess(null);
+
+        // Initialize progress for better visibility
+        setConsolidationBatchProgress({
+            current: 0,
+            total: 100,
+            percentage: 5,
+            message: 'Initializing consolidation...'
+        });
 
         try {
+            if (scope === 'range') {
+                const tradingDates = getTradingDates(rangeStartDate, rangeEndDate);
+                const BATCH_SIZE = 40;
+
+                if (tradingDates.length > BATCH_SIZE) {
+                    console.log(`[consolidation] Large range detected (${tradingDates.length} days). Batching consolidation...`);
+
+                    for (let i = 0; i < tradingDates.length; i += BATCH_SIZE) {
+                        const batch = tradingDates.slice(i, i + BATCH_SIZE);
+                        const batchStart = batch[0].toISOString().split('T')[0];
+                        const batchEnd = batch[batch.length - 1].toISOString().split('T')[0];
+
+                        const progress = {
+                            current: Math.min(i + BATCH_SIZE, tradingDates.length),
+                            total: tradingDates.length,
+                            percentage: Math.round((Math.min(i + BATCH_SIZE, tradingDates.length) / tradingDates.length) * 100),
+                            message: `Consolidating ${convertDateFormat(batchStart)} to ${convertDateFormat(batchEnd)}...`
+                        };
+                        setConsolidationBatchProgress(progress);
+                        setExportLog(prev => [...prev, progress.message]);
+
+                        // Call backend with fast_mode: false to persist averages for this sub-range
+                        // This "warms up" the DB with symbol_daily data if it wasn't already there
+                        // although the user should have "Downloaded Range" first.
+                        await fetch(`${VITE_API_URL}/api/consolidate-saved`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                start_date: convertDateFormat(batchStart),
+                                end_date: convertDateFormat(batchEnd),
+                                file_type: 'mcap', // Just mcap is enough to warm up common data
+                                fast_mode: false,
+                                skip_daily: true
+                            })
+                        });
+                    }
+                    setConsolidationBatchProgress({
+                        current: tradingDates.length,
+                        total: tradingDates.length,
+                        percentage: 100,
+                        message: 'Finalizing full consolidation...'
+                    });
+                }
+            }
+
+            // Final consolidation for the full range (or single date)
+            setConsolidationBatchProgress(prev => ({
+                ...prev,
+                percentage: Math.max(prev?.percentage || 0, 90),
+                message: 'Generating final consolidation Excel files...'
+            }));
+
+            const finalPayload = {
+                file_type: 'both',
+                fast_mode: false,
+                skip_daily: skipDaily
+            };
+
+            if (scope === 'range') {
+                finalPayload.start_date = convertDateFormat(rangeStartDate);
+                finalPayload.end_date = convertDateFormat(rangeEndDate);
+            } else {
+                finalPayload.date = convertDateFormat(nseDate);
+            }
+
             const response = await fetch(`${VITE_API_URL}/api/consolidate-saved`, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(payload)
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(finalPayload)
             });
 
             const headerLog = response.headers.get('x-export-log');
@@ -296,9 +417,11 @@ function App() {
             }
         } catch (err) {
             setError(err.message);
-            setExportLog([]);
+            // Don't clear export log on error, it might have useful info
         } finally {
+            setExportLoading(true); // Keep spinner if still doing something? No, set to false.
             setExportLoading(false);
+            setConsolidationBatchProgress(null);
         }
     };
 
@@ -606,30 +729,70 @@ function App() {
         setDashboardResult(null);
 
         try {
-            // Step 1: Download Range
-            setPipelineStage('Downloading data from NSE...');
-            const downloadRes = await fetch(`${VITE_API_URL}/api/download-nse-range`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    start_date: convertDateFormat(rangeStartDate),
-                    end_date: convertDateFormat(rangeEndDate),
-                    save_to_file: true,
-                    refresh_mode: 'missing_only'
-                })
-            });
+            // Step 1: Download Range (Batched to avoid Vercel timeout)
+            setPipelineStage('Downloading data from NSE (Batched)...');
 
-            if (!downloadRes.ok) {
-                const errorData = await downloadRes.json();
-                throw new Error(`Download failed: ${errorData.error}`);
+            const tradingDates = getTradingDates(rangeStartDate, rangeEndDate);
+            if (tradingDates.length === 0) {
+                throw new Error('No trading days found in the selected range');
             }
 
-            const downloadData = await downloadRes.json();
-            setRangeProgress({
-                summary: downloadData.summary,
-                entries: downloadData.entries || [],
-                errors: downloadData.errors || []
-            });
+            const initialProgress = {
+                summary: {
+                    total_requested: tradingDates.length,
+                    cached: 0,
+                    fetched: 0,
+                    failed: 0,
+                    percentage: 0
+                },
+                entries: [],
+                errors: []
+            };
+            setRangeProgress(initialProgress);
+
+            const BATCH_SIZE = 40;
+            let cumulativeSummary = { ...initialProgress.summary };
+            let cumulativeEntries = [];
+            let cumulativeErrors = [];
+
+            for (let i = 0; i < tradingDates.length; i += BATCH_SIZE) {
+                const batch = tradingDates.slice(i, i + BATCH_SIZE);
+                const batchStart = batch[0].toISOString().split('T')[0];
+                const batchEnd = batch[batch.length - 1].toISOString().split('T')[0];
+
+                const downloadRes = await fetch(`${VITE_API_URL}/api/download-nse-range`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        start_date: convertDateFormat(batchStart),
+                        end_date: convertDateFormat(batchEnd),
+                        save_to_file: true,
+                        refresh_mode: 'missing_only',
+                        parallel_workers: 20
+                    })
+                });
+
+                if (!downloadRes.ok) {
+                    const errorData = await downloadRes.json();
+                    throw new Error(`Download failed at batch ${Math.floor(i / BATCH_SIZE) + 1}: ${errorData.error}`);
+                }
+
+                const downloadData = await downloadRes.json();
+
+                // Aggregate
+                cumulativeSummary.cached += (downloadData.summary.cached_count || 0);
+                cumulativeSummary.fetched += (downloadData.summary.fetched_count || 0);
+                cumulativeSummary.failed += (downloadData.summary.failed_count || 0);
+                cumulativeSummary.percentage = Math.round(((i + batch.length) / tradingDates.length) * 100);
+                cumulativeEntries = [...cumulativeEntries, ...(downloadData.entries || [])];
+                cumulativeErrors = [...cumulativeErrors, ...(downloadData.errors || [])];
+
+                setRangeProgress({
+                    summary: cumulativeSummary,
+                    entries: cumulativeEntries,
+                    errors: cumulativeErrors
+                });
+            }
 
             // Step 2: Export Consolidated (calculates averages)
             setPipelineStage('Calculating averages (Optimized)...');
@@ -722,6 +885,7 @@ function App() {
                             handleFullPipeline={handleFullPipeline}
                             pipelineLoading={pipelineLoading}
                             pipelineStage={pipelineStage}
+                            consolidationBatchProgress={consolidationBatchProgress}
                         />
                     )}
                 </main>
