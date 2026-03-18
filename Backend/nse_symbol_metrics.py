@@ -237,11 +237,10 @@ class SymbolMetricsFetcher:
         }
         return result
 
-    def fetch_many(self, symbols, sleep_between=0.02, max_symbols=None, as_of=None, parallel=True, max_workers=20, chunk_size=100, max_time_seconds=None):
+    def fetch_many(self, symbols, sleep_between=0.02, max_symbols=None, as_of=None, parallel=True, max_workers=20, chunk_size=100, max_time_seconds=None, external_metrics_cache=None):
         """
         Fetch symbol data with optional timeout protection.
-        max_time_seconds: If set, stop fetching after this many seconds and return partial results.
-        Each batch uses minimum 5 workers for optimal parallel processing.
+        external_metrics_cache: dict of {symbol: dashboard_row} already stored in DB.
         """
         rows = []
         errors = []
@@ -250,10 +249,20 @@ class SymbolMetricsFetcher:
 
         if parallel and max_workers and max_workers > 1:
             def _worker(sym):
-                # Check time budget before making request
+                # 1. Check external cache first to skip slow API calls
+                if external_metrics_cache and sym in external_metrics_cache:
+                    cached_data = external_metrics_cache[sym]
+                    # Ensure cached data is for the same date and is complete
+                    # (must have market cap or other indicator of successful fetch)
+                    if cached_data.get('total_market_cap') is not None or cached_data.get('last_price') is not None:
+                        # Normalize keys if needed (symbol_metrics stores companyName, GetQuoteApi returns companyName)
+                        return ('ok', cached_data)
+
+                # 2. Check time budget before making request
                 if max_time_seconds and (time.time() - start_time) > max_time_seconds:
                     return ('timeout', {'symbol': sym, 'error': 'Skipped - time limit reached'})
-                # Fresh session per thread to avoid session locking
+                
+                # 3. Fresh session per thread for API call
                 sess = self._make_session()
                 self._prime_cookies(sess)
                 try:
@@ -299,20 +308,20 @@ class SymbolMetricsFetcher:
 
         return rows, errors
 
-    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=50, chunk_size=100, symbol_pr_data=None, symbol_mcap_data=None, max_time_seconds=None, fetch_indices_from_csv=False, nifty_indices_collection=None):
+    def build_dashboard(self, symbols, excel_path=None, max_symbols=None, as_of=None, parallel=True, max_workers=50, chunk_size=100, symbol_pr_data=None, symbol_mcap_data=None, max_time_seconds=None, fetch_indices_from_csv=False, nifty_indices_collection=None, external_index_mapping=None, external_metrics_cache=None):
         """
         Build dashboard with additional calculated columns.
         Optimized with minimum 5 workers per batch for parallel processing.
         
-        symbol_pr_data: dict of {symbol: {'days_with_data': int, 'total_trading_days': int, 'avg_pr': float}}
-        symbol_mcap_data: dict of {symbol: {'avg_mcap': float, 'avg_free_float': float, 'total_traded_value': float}}
-        max_time_seconds: Optional time limit for fetching (returns partial results if exceeded)
-        fetch_indices_from_csv: If True, fetch index data from Nifty indices CSV files (not recommended for production)
-        nifty_indices_collection: MongoDB collection for fetching stored index data (recommended)
+        external_index_mapping: Optional pre-fetched {symbol: [indices]} to avoid DB calls.
+        external_metrics_cache: Optional pre-fetched {symbol: dashboard_row} to avoid API calls.
         """
         # Fetch index mapping from DB (preferred) or CSV files (fallback)
-        if nifty_indices_collection is not None:
-            print("[build_dashboard] Fetching index data from MongoDB...")
+        if external_index_mapping is not None:
+            self.index_mapping = external_index_mapping
+            print(f"[build_dashboard] Using {len(self.index_mapping)} pre-fetched index mappings")
+        elif nifty_indices_collection is not None:
+            print("[build_dashboard] Fetching index data from MongoDB (Warning: fetching entire collection)...")
             try:
                 self.index_mapping = {}
                 for doc in nifty_indices_collection.find({}):
@@ -334,7 +343,12 @@ class SymbolMetricsFetcher:
         
         # Ensure minimum 5 workers for optimal parallel processing in batches
         effective_workers = max(5, max_workers) if parallel else 1
-        rows, errors = self.fetch_many(symbols, max_symbols=max_symbols, as_of=as_of, parallel=parallel, max_workers=effective_workers, chunk_size=chunk_size, max_time_seconds=max_time_seconds)
+        rows, errors = self.fetch_many(
+            symbols, max_symbols=max_symbols, as_of=as_of, 
+            parallel=parallel, max_workers=effective_workers, 
+            chunk_size=chunk_size, max_time_seconds=max_time_seconds,
+            external_metrics_cache=external_metrics_cache
+        )
 
         # Store API indices before overriding
         for row in rows:

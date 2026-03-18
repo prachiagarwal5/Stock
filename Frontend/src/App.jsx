@@ -568,114 +568,51 @@ function App() {
         setSuccess(null);
         setDashboardResult(null);
 
-        // Configuration for batch processing
+        // Configuration
         const TOTAL_SYMBOLS = 1100;
-        const BATCH_SIZE = 100;
-        const TOTAL_BATCHES = 11;
-
-        let allRows = [];
-        let allErrors = [];
-        let processedSymbols = 0;
 
         try {
-            // Throttled concurrent batch processing (2 at a time)
-            const CONCURRENCY_LIMIT = 2;
-            const batches = Array.from({ length: TOTAL_BATCHES }, (_, i) => i);
-
             setDashboardBatchProgress({
-                currentBatch: 0,
-                totalBatches: TOTAL_BATCHES,
+                currentBatch: 1,
+                totalBatches: 1,
                 symbolsProcessed: 0,
                 totalSymbols: TOTAL_SYMBOLS,
-                status: `Starting throttled fetch (${CONCURRENCY_LIMIT} batches at a time)...`
+                status: 'Fetching dashboard data (Single request optimized)...'
             });
 
-            for (let i = 0; i < batches.length; i += CONCURRENCY_LIMIT) {
-                const chunk = batches.slice(i, i + CONCURRENCY_LIMIT);
-                const chunkPromises = chunk.map(async (batchNum) => {
-                    const payload = {
-                        batch_index: batchNum,
-                        save_to_file: false,
-                        top_n: TOTAL_SYMBOLS,
-                        top_n_by: 'mcap',
-                        start_date: rangeStartDate,
-                        end_date: rangeEndDate
-                    };
-
-                    const response = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-
-                    if (!response.ok) {
-                        const errorData = await response.json();
-                        throw new Error(`Batch ${batchNum + 1} failed: ${errorData.error || 'Request failed'}`);
-                    }
-
-                    const data = await response.json();
-
-                    processedSymbols += (data.rows ? data.rows.length : 0);
-                    setDashboardBatchProgress(prev => ({
-                        ...prev,
-                        currentBatch: prev.currentBatch + 1,
-                        symbolsProcessed: processedSymbols,
-                        status: `✅ Batch ${batchNum + 1} complete`
-                    }));
-
-                    return data;
-                });
-
-                const results = await Promise.all(chunkPromises);
-                results.forEach(data => {
-                    if (data.rows) allRows = allRows.concat(data.rows);
-                    if (data.errors) allErrors = allErrors.concat(data.errors);
-                });
+            const response = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    top_n: TOTAL_SYMBOLS,
+                    top_n_by: 'mcap',
+                    as_on: rangeEndDate,
+                    start_date: rangeStartDate,
+                    end_date: rangeEndDate
+                })
+            });
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.error || 'Dashboard generation failed');
             }
 
-            // After all batches, send allRows to /api/nse-symbol-dashboard/save-excel
-            let lastFileId = null;
-            let lastDownloadUrl = null;
-            let fileName = `Symbol_Dashboard_${convertDateFormat(rangeStartDate)}_${convertDateFormat(rangeEndDate)}.xlsx`;
-            if (allRows.length > 0) {
-                const saveExcelResp = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard/save-excel`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ rows: allRows, as_on: rangeEndDate })
-                });
-                if (saveExcelResp.ok) {
-                    const saveExcelData = await saveExcelResp.json();
-                    lastFileId = saveExcelData.file_id;
-                    lastDownloadUrl = saveExcelData.download_url;
-                    if (saveExcelData.file) fileName = saveExcelData.file;
-                }
-            }
-
-            // Calculate averages from all collected rows
-            const averages = {};
-            if (allRows.length > 0) {
-                ['impact_cost', 'free_float_mcap', 'total_market_cap', 'total_traded_value', 'last_price'].forEach(field => {
-                    const values = allRows.map(r => r[field]).filter(v => v != null && !isNaN(v));
-                    if (values.length > 0) {
-                        averages[field] = (values.reduce((a, b) => a + b, 0) / values.length).toFixed(2);
-                    }
-                });
-            }
+            const data = await response.json();
 
             setDashboardResult({
-                success: true,
-                count: allRows.length,
-                symbols_used: allRows.length,
-                total_symbols: TOTAL_SYMBOLS,
-                averages: averages,
-                errors: allErrors,
-                file_id: lastFileId,
-                download_url: lastDownloadUrl,
-                file: fileName
+                rows: data.rows || [],
+                errors: data.errors || [],
+                count: data.count || 0,
+                download_url: data.download_url,
+                db_id: data.db_id
             });
-            setSuccess(`✅ Dashboard complete! ${allRows.length} symbols fetched in ${TOTAL_BATCHES} batches`);
+
+            setSuccess(`✅ Dashboard generated with ${data.count} symbols`);
+
+            if (data.download_url) {
+                const fullUrl = `${VITE_API_URL}${data.download_url}`;
+                setSuccess(prev => `${prev}. Excel ready.`);
+                window.open(fullUrl, '_blank');
+            }
         } catch (err) {
             setError(err.message);
         } finally {

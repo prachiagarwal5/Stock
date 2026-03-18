@@ -65,6 +65,21 @@ body {
     }
 }
 
+@keyframes pulse {
+    0% {
+        opacity: 0.6;
+        background-position: 0% 50%;
+    }
+    50% {
+        opacity: 1;
+        background-position: 100% 50%;
+    }
+    100% {
+        opacity: 0.6;
+        background-position: 0% 50%;
+    }
+}
+
 .sidebar-header {
     padding: 0 1rem;
     background: linear-gradient(135deg, #0d9488 0%, #10b981 100%);
