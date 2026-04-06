@@ -118,7 +118,7 @@ def _is_keepalive_authorized(req):
 # MongoDB connection
 try:
     # Hardcoded MongoDB connection string (as per user request)
-    mongo_uri = "mongodb+srv://prachiagrawal509:BSzCRUTG8F7voUBv@cluster0.kfbej.mongodb.net/Stocks?retryWrites=true&w=majority"
+    mongo_uri = "mongodb://localhost:27017/Stocks"
     
     print(f"🔄 Connecting to MongoDB...")
     mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
@@ -894,7 +894,8 @@ def get_consolidated_metrics_from_db(date_iso_list, data_type, allowed_symbols=N
     try:
         match_query = {
             'type': data_type,
-            'date': {'$in': date_iso_list}
+            'date': {'$in': date_iso_list},
+            'symbol': {'$nin': ['Permitted', 'PERMITTED']}
         }
         if allowed_symbols:
             match_query['symbol'] = {'$in': list(allowed_symbols)}
@@ -1038,8 +1039,8 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
     # Remove summary rows (vectorized, no apply())
     symbols_upper = df_all[symbol_col].astype(str).str.upper()
     symbols_normalized = symbols_upper.str.replace(r'[^A-Z0-9]', '', regex=True)
-    is_summary = symbols_normalized.isin({'TOTAL', 'LISTED', 'TOTALLISTED', 'LISTEDTOTAL'}) | \
-                 symbols_upper.str.startswith(('TOTAL', 'LISTED'))
+    is_summary = symbols_normalized.isin({'TOTAL', 'LISTED', 'TOTALLISTED', 'LISTEDTOTAL', 'PERMITTED'}) | \
+                 symbols_upper.str.startswith(('TOTAL', 'LISTED', 'PERMITTED'))
     df_all = df_all[~is_summary]
 
     # Filter to allowed symbols if needed
@@ -1136,7 +1137,9 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
     final_cols = ['Symbol', 'Company Name', 'Days With Data', avg_col] + available_cols
     df_all_pivot = df_all_pivot[final_cols]
 
-    dates_list = [(d, datetime.strptime(d, '%d-%m-%Y')) for d in available_cols]
+    # FINAL SAFETY FILTER: Remove 'PERMITTED' symbol if it survived aggregation/CSV parsing
+    if 'Symbol' in df_all_pivot.columns:
+        df_all_pivot = df_all_pivot[df_all_pivot['Symbol'].astype(str).str.strip().str.upper() != 'PERMITTED'].copy()
 
     return df_all_pivot, dates_list, avg_col
 
@@ -1246,8 +1249,8 @@ def calculate_averages_from_consolidated_data(symbols, start_date=None, end_date
                 current = start_dt
                 date_iso_list = []
                 while current <= end_dt:
-                    if current.weekday() < 5:  # Only weekdays
-                        date_iso_list.append(current.strftime('%Y-%m-%d'))
+                    # Removed weekend skip: Include Saturdays and Sundays as well
+                    date_iso_list.append(current.strftime('%Y-%m-%d'))
                     current += timedelta(days=1)
             except:
                 return {}
@@ -1434,6 +1437,13 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
     """
     try:
         df = pd.DataFrame(rows)
+        
+        # STRICT FILTER: Never include 'PERMITTED' symbol in any dashboard result
+        if not df.empty and 'symbol' in df.columns:
+            df = df[df['symbol'].astype(str).str.strip().str.upper() != 'PERMITTED'].copy()
+            
+        if df.empty:
+            return False
 
         # Fill missing companyName from symbol_aggregates DB
         if symbol_aggregates_collection is not None and 'symbol' in df.columns and 'companyName' in df.columns:
@@ -1459,8 +1469,8 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
                         current = start_dt
                         date_iso_list = []
                         while current <= end_dt:
-                            if current.weekday() < 5:  # Only weekdays
-                                date_iso_list.append(current.strftime('%Y-%m-%d'))
+                            # Removed weekend skip: Include Saturdays and Sundays as well
+                            date_iso_list.append(current.strftime('%Y-%m-%d'))
                             current += timedelta(days=1)
                         
                         if date_iso_list:
@@ -1545,9 +1555,21 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             for col in ['Day of Listing', 'listed> 6months', 'listed> 1 months', 'number of days from listing']:
                 df[col] = None
 
-        # Determine broader index - Vectorized
+        # Determine broader index - Strictly using the freshly fetched Nifty CSV data (Index (API))
         qualifying_indices = {'NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 150', 'NIFTY SMALLCAP 250'}
-        df['Broader Index'] = df['index'].apply(lambda x: 'NIFTY 500' if str(x).upper().strip() in qualifying_indices or str(x).replace(' ', '').upper() in [i.replace(' ', '') for i in qualifying_indices] else '')
+        # Standardize for comparison
+        std_qualifying = {i.replace(' ', '').upper() for i in qualifying_indices}
+        
+        def is_broader_index(idx):
+            if not idx or str(idx).strip().upper() == 'PERMITTED': return ''
+            idx_up = str(idx).replace(' ', '').upper()
+            return 'NIFTY 500' if idx_up in std_qualifying else ''
+            
+        df['Broader Index'] = df['index'].apply(is_broader_index)
+        
+        # Clean "Permitted" from Index (API) column
+        if 'index' in df.columns:
+            df['index'] = df['index'].apply(lambda x: None if str(x).strip().upper() == 'PERMITTED' else x)
         
         # Round and normalize to Crores - Vectorized
         numeric_cols = ['total_market_cap', 'free_float_mcap', 'total_traded_value']
@@ -1567,8 +1589,7 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             ('Serial No', 'serial_no'),
             ('Symbol', 'symbol'),
             ('Company name', 'companyName'),
-            ('Index (DB)', 'index'),
-            ('Index (API)', 'index_from_api'),
+            ('Index (API)', 'index'),
             ('Avg Impact cost', 'impact_cost'),
             ('Average Market Cap (Cr)', 'total_market_cap'),
             ('Average Free Float Market Cap (Cr)', 'free_float_mcap'),
@@ -1578,8 +1599,7 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             ('Broader Index', 'Broader Index'),
             ('listed> 6months', 'listed> 6months'),
             ('listed> 1 months', 'listed> 1 months'),
-            ('Ratio of avg free float to avg total market cap', 'Ratio of avg free float to avg total market cap'),
-            ('ratio of free float to avg total market cap', 'ratio of free float to avg total market cap')
+            ('Ratio of avg free float to avg total market cap', 'Ratio of avg free float to avg total market cap')
         ]
         
         df['serial_no'] = range(1, len(df) + 1)
@@ -1598,26 +1618,28 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
         # Define formats
         header_format = workbook.add_format({
             'bold': True, 'font_color': 'white', 'bg_color': '#4472C4',
-            'border': 1, 'align': 'center', 'valign': 'vcenter', 'text_wrap': True
+            'border': 1, 'border_color': '#000000',
+            'align': 'center', 'valign': 'vcenter', 'text_wrap': True
         })
         
-        cell_format = workbook.add_format({'border': 1})
-        num_format = workbook.add_format({'border': 1, 'num_format': '#,##0.00'})
-        ratio_format = workbook.add_format({'border': 1, 'num_format': '0.0000'})
+        cell_format = workbook.add_format({'border': 1, 'border_color': '#000000'})
+        num_format = workbook.add_format({'border': 1, 'border_color': '#000000', 'num_format': '#,##0.00'})
+        ratio_format = workbook.add_format({'border': 1, 'border_color': '#000000', 'num_format': '0.0000'})
         
-        # Column widths
-        widths = [8, 12, 30, 20, 20, 15, 24, 28, 26, 15, 25, 15, 13, 13, 18, 18]
+        # Column widths & Default Cell Format (Grid)
+        # Columns mapped: A(0), B(1), C(2), D(3), E(4), F(5), G(6), H(7), I(8), J(9), K(10), L(11), M(12), N(13)
+        widths = [8, 12, 30, 20, 15, 24, 28, 26, 15, 25, 15, 13, 13, 18]
         for i, w in enumerate(widths):
-            worksheet.set_column(i, i, w)
+            # Apply cell_format as the default for the column to ensure grid
+            worksheet.set_column(i, i, w, cell_format)
             
-        # Specific formats for data columns
-        # Index of columns (0-based): F(5), G(6), H(7), I(8), O(14), P(15)
-        # We apply formatting while writing or via set_column
-        worksheet.set_column(5, 5, 15, num_format)   # Avg Impact Cost
-        worksheet.set_column(6, 6, 24, num_format)   # Avg Market Cap
-        worksheet.set_column(7, 7, 28, num_format)   # Avg Free Float
-        worksheet.set_column(8, 8, 26, num_format)   # Avg Net Traded Value
-        worksheet.set_column(14, 15, 18, ratio_format) # Ratios
+        # Specific numeric formats for columns
+        # Index (API) is 3, Avg Impact Cost is 4, Mcap is 5, Free Float is 6, Traded Value is 7, Ratio is 13
+        worksheet.set_column(4, 4, 15, num_format)   # Avg Impact Cost
+        worksheet.set_column(5, 5, 24, num_format)   # Avg Market Cap
+        worksheet.set_column(6, 6, 28, num_format)   # Avg Free Float
+        worksheet.set_column(7, 7, 26, num_format)   # Avg Net Traded Value
+        worksheet.set_column(13, 13, 18, ratio_format) # Ratios
         
         # Re-apply header formatting
         for col_num, value in enumerate(output_df.columns.values):
@@ -1798,9 +1820,8 @@ def get_nse_dates():
         
         current = start_date
         while current <= today:
-            # Skip weekends (5=Saturday, 6=Sunday)
-            if current.weekday() < 5:
-                dates.append(current.strftime('%d-%b-%Y'))
+            # Removed weekend skip: Include Saturdays and Sundays as well
+            dates.append(current.strftime('%d-%b-%Y'))
             current += timedelta(days=1)
         
         # Reverse to show most recent first
@@ -1855,9 +1876,8 @@ def download_nse_range():
         trading_dates = []
         
         while current_date <= end_date:
-            # Only include weekdays (0-4 = Mon-Fri)
-            if current_date.weekday() < 5:
-                trading_dates.append(current_date)
+            # Removed weekend skip: Include Saturdays and Sundays as well
+            trading_dates.append(current_date)
             current_date += timedelta(days=1)
         
         if not trading_dates:
@@ -2119,8 +2139,13 @@ def nse_symbol_dashboard():
                                     {'symbol': 1, 'average': 1}
                                 ).sort([('average', -1), ('symbol', 1)]).limit(TOTAL_SYMBOLS))
                                 if db_symbols:
-                                    symbols_to_process = [s['symbol'] for s in db_symbols]
+                                    # STRICT FILTER: Never include 'PERMITTED' 
+                                    symbols_to_process = [s['symbol'] for s in db_symbols if str(s.get('symbol')).strip().upper() != 'PERMITTED']
                                     stream_log(f"Got {len(symbols_to_process)} symbols from MongoDB", 10)
+                        
+                        # GLOBAL FILTER: Ensure 'PERMITTED' is removed from any provided list as well
+                        if symbols_to_process:
+                            symbols_to_process = [s for s in symbols_to_process if str(s).strip().upper() != 'PERMITTED']
 
                         if not symbols_to_process:
                             stream_log("Checking local Market_Cap.xlsx fallback...", 12)
@@ -2427,8 +2452,8 @@ def consolidate_saved():
                         return jsonify({'error': 'start_date cannot be after end_date'}), 400
                     current = start_dt
                     while current <= end_dt:
-                        if current.weekday() < 5:
-                            date_iso_list.append(current.strftime('%Y-%m-%d'))
+                        # Removed weekend skip: Include Saturdays and Sundays as well
+                        date_iso_list.append(current.strftime('%Y-%m-%d'))
                         current += timedelta(days=1)
                 else:
                     return jsonify({'error': 'Provide either date or start_date/end_date'}), 400
@@ -2728,14 +2753,21 @@ def fetch_and_store_nifty_indices():
         for symbol, indices in index_mapping.items():
             # Standardize symbol for storage
             symbol = str(symbol).strip().upper()
+            if symbol == 'PERMITTED':
+                continue
+            # Filter out "Permitted" index
+            filtered_indices = [idx for idx in indices if str(idx).strip().upper() != 'PERMITTED']
+            if not filtered_indices:
+                continue
+                
             bulk_operations.append(
                 UpdateOne(
                     {'symbol': symbol},
                     {
                         '$set': {
                             'symbol': symbol,
-                            'indices': indices,
-                            'primary_index': indices[0] if indices else None,
+                            'indices': filtered_indices,
+                            'primary_index': filtered_indices[0],
                             'last_updated': timestamp
                         }
                     },

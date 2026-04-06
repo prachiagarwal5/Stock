@@ -91,6 +91,8 @@ class SymbolMetricsFetcher:
                         symbols = df['Symbol'].dropna().unique()
                         for symbol in symbols:
                             symbol = str(symbol).strip().upper()
+                            if symbol == 'PERMITTED':
+                                continue
                             if symbol not in symbol_to_indices:
                                 symbol_to_indices[symbol] = []
                             symbol_to_indices[symbol].append(index_name)
@@ -166,6 +168,10 @@ class SymbolMetricsFetcher:
         return item
 
     def fetch_symbol_data(self, symbol, series='EQ', as_of=None, session=None):
+        # STRICT FILTER: Never allow 'PERMITTED' 
+        if str(symbol).strip().upper() == 'PERMITTED':
+            return None
+            
         as_on = as_of or datetime.now().strftime('%Y-%m-%d')
         if isinstance(as_on, datetime):
             as_on = as_on.strftime('%Y-%m-%d')
@@ -214,7 +220,7 @@ class SymbolMetricsFetcher:
                 else:
                     index_candidates.append(lst)
 
-        index_clean = [idx for idx in index_candidates if idx]
+        index_clean = [idx for idx in index_candidates if idx and str(idx).strip().upper() != 'PERMITTED']
         index_value = index_clean[0] if index_clean else None
         index_list = list(dict.fromkeys(index_clean))  # de-dup while preserving order
 
@@ -321,6 +327,14 @@ class SymbolMetricsFetcher:
         external_index_mapping: Optional pre-fetched {symbol: [indices]} to avoid DB calls.
         external_metrics_cache: Optional pre-fetched {symbol: dashboard_row} to avoid API calls.
         """
+        # STRICT FILTER: Never allow 'PERMITTED' symbol in any dashboard result
+        if symbols:
+            symbols = [s for s in symbols if str(s).strip().upper() != 'PERMITTED']
+            
+        if not symbols:
+            if log_fn: log_fn("⚠️ No valid symbols provided for dashboard")
+            return [], []
+            
         # Fetch index mapping from DB (preferred) or CSV files (fallback)
         if external_index_mapping is not None:
             self.index_mapping = external_index_mapping
@@ -356,10 +370,18 @@ class SymbolMetricsFetcher:
             log_fn=log_fn
         )
 
-        # Store API indices before overriding
+        # Store API indices before overriding and clear current index/indexList
+        # if using an external source to ensure strictly DB-driven data.
+        has_external_source = (external_index_mapping is not None or 
+                              nifty_indices_collection is not None or 
+                              fetch_indices_from_csv)
+        
         for row in rows:
             row['index_from_api'] = row.get('index')
             row['indexList_from_api'] = row.get('indexList', [])
+            if has_external_source:
+                row['index'] = None
+                row['indexList'] = []
 
         # Override index data with DB/CSV data if available
         if self.index_mapping:
@@ -368,17 +390,14 @@ class SymbolMetricsFetcher:
             for row in rows:
                 symbol = str(row.get('symbol') or '').strip().upper()
                 if symbol and symbol in self.index_mapping:
-                    csv_indices = self.index_mapping[symbol]
+                    csv_indices = [idx for idx in self.index_mapping[symbol] if str(idx).strip().upper() != 'PERMITTED']
                     # Replace index and indexList with data from DB/CSV
                     row['index'] = csv_indices[0] if csv_indices else None
                     row['indexList'] = csv_indices
-                    replaced_index_count += 1
+                    if csv_indices: replaced_index_count += 1
                 elif symbol:
                     not_found_symbols.append(symbol)
-                    # Strictly use indices from DB - clear if not found
-                    if nifty_indices_collection is not None:
-                        row['index'] = None
-                        row['indexList'] = []
+                    # Already cleared above if has_external_source
             
             if replaced_index_count > 0:
                 source = "MongoDB" if nifty_indices_collection is not None else "Nifty CSV files"
@@ -432,20 +451,18 @@ class SymbolMetricsFetcher:
             df_copy = df.copy()
             
             # Calculate Broader Index - "Nifty 500" if in qualifying indices
-            # Updated Broader Index logic to prioritize indices from 'Index (DB)' over 'Index (API)'
-            def calc_broader_index(index_list_db, index_list_api):
-                # Strictly use 'Index (DB)' per user request
-                index_list = index_list_db
-                if not index_list:
+            # Strictly using the freshly fetched Nifty CSV data (Index (API) column)
+            def calc_broader_index(index_list_fresh):
+                if not index_list_fresh:
                     return ''
-                indices = index_list if isinstance(index_list, list) else [index_list]
+                indices = index_list_fresh if isinstance(index_list_fresh, list) else [index_list_fresh]
                 for idx in indices:
                     if idx in NIFTY_500_INDICES:
                         return 'Nifty 500'
                 return ''
             
             df_copy['Broader Index'] = df_copy.apply(
-                lambda row: calc_broader_index(row.get('indexList'), row.get('indexList_from_api')),
+                lambda row: calc_broader_index(row.get('indexList')),
                 axis=1
             )
             
@@ -626,20 +643,18 @@ class SymbolMetricsFetcher:
         
         df_copy = df.copy()
         
-        # Calculate Broader Index - "Nifty 500" if in qualifying indices
-        # Updated Broader Index logic to prioritize indices from 'Index (DB)' over 'Index (API)'
-        def calc_broader_index(index_list_db, index_list_api):
-            index_list = index_list_db or index_list_api  # Prefer 'Index (DB)' if available
-            if not index_list:
+        # Determine broader index - Strictly using the freshly fetched Nifty CSV data (Index (API) column)
+        def calc_broader_index(index_list_fresh):
+            if not index_list_fresh:
                 return ''
-            indices = index_list if isinstance(index_list, list) else [index_list]
+            indices = [idx for idx in index_list_fresh if str(idx).strip().upper() != 'PERMITTED'] if isinstance(index_list_fresh, list) else ([index_list_fresh] if str(index_list_fresh).strip().upper() != 'PERMITTED' else [])
             for idx in indices:
                 if idx in NIFTY_500_INDICES:
                     return 'Nifty 500'
             return ''
         
         df_copy['Broader Index'] = df_copy.apply(
-            lambda row: calc_broader_index(row.get('indexList'), row.get('indexList_from_api')),
+            lambda row: calc_broader_index(row.get('indexList')),
             axis=1
         ) if 'indexList' in df_copy.columns else ''
         
@@ -725,15 +740,16 @@ class SymbolMetricsFetcher:
                 'font_color': '#FFFFFF',
                 'bg_color': '#4F81BD',
                 'border': 1,
+                'border_color': '#000000',
                 'align': 'center',
                 'valign': 'vcenter',
                 'text_wrap': True
             })
-            text_fmt = wb.add_format({'border': 1, 'align': 'left'})
-            int_fmt = wb.add_format({'border': 1, 'align': 'right', 'num_format': '0'})
-            num_fmt = wb.add_format({'border': 1, 'align': 'right', 'num_format': '#,##0.00'})
-            ratio_fmt = wb.add_format({'border': 1, 'align': 'right', 'num_format': '0.0000'})
-            date_fmt = wb.add_format({'border': 1, 'align': 'left', 'num_format': 'yyyy-mm-dd'})
+            text_fmt = wb.add_format({'border': 1, 'border_color': '#000000', 'align': 'left'})
+            int_fmt = wb.add_format({'border': 1, 'border_color': '#000000', 'align': 'right', 'num_format': '0'})
+            num_fmt = wb.add_format({'border': 1, 'border_color': '#000000', 'align': 'right', 'num_format': '#,##0.00'})
+            ratio_fmt = wb.add_format({'border': 1, 'border_color': '#000000', 'align': 'right', 'num_format': '0.0000'})
+            date_fmt = wb.add_format({'border': 1, 'border_color': '#000000', 'align': 'left', 'num_format': 'yyyy-mm-dd'})
 
             for col_idx, col_name in enumerate(df_copy.columns):
                 ws.write(0, col_idx, col_name, header_fmt)

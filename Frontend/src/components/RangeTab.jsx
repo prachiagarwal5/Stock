@@ -28,7 +28,7 @@ const RangeTab = ({
         <section className="section range-tab-section">
             <div className="section-header">
                 <h2>📅 <span style={{ color: '#2d7ff9' }}>Download Market Cap Data</span> <span className="date-range-label">(Date Range)</span></h2>
-                <p className="section-hint">Download multiple days of data at once. Select start and end dates, and all trading days in between will be downloaded.</p>
+                <p className="section-hint">Download multiple days of data at once. Select start and end dates, and all days in between will be downloaded.</p>
             </div>
             <div className="card card-main">
                 <div className="form-row form-row-spaced">
@@ -58,7 +58,7 @@ const RangeTab = ({
                 <div className="info-box info-box-highlight" style={{ marginBottom: '24px' }}>
                     <span className="info-icon">ℹ️</span>
                     <span>
-                        <strong style={{ color: '#1bb76e' }}>All trading days between selected dates (excluding weekends) will be downloaded.</strong><br />
+                        <strong style={{ color: '#1bb76e' }}>All days between selected dates (including weekends) will be downloaded.</strong><br />
                         Files saved as <span className="filename">mcapDDMMYYYY.csv</span> in <span className="folder">Backend/nosubject/</span>.
                     </span>
                 </div>
@@ -126,7 +126,7 @@ const RangeTab = ({
                                     ⬇️ Downloading NSE Data...
                                 </div>
                                 <div style={{ color: '#0d47a1', fontSize: '0.95rem', marginTop: '4px' }}>
-                                    Processing batches of 40 trading days with 20 parallel workers
+                                    Processing batches of 40 days with 20 parallel workers
                                 </div>
                             </div>
                         </div>
@@ -157,7 +157,7 @@ const RangeTab = ({
                             </div>
                             <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '8px', fontSize: '0.9rem', color: '#1565c0' }}>
                                 <span>{rangeProgress.summary.cached + rangeProgress.summary.fetched + rangeProgress.summary.failed} days processed</span>
-                                <span>{rangeProgress.summary.total_requested} total trading days</span>
+                                <span>{rangeProgress.summary.total_requested} total days</span>
                             </div>
                         </div>
 
@@ -703,7 +703,7 @@ const RangeTab = ({
                         <span style={{ fontSize: '1.2rem', color: '#1bb76e' }}>✔️</span> Click <span className="filename">⬇️ Download Range</span>
                     </li>
                     <li style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 'bold', color: '#1bb76e' }}>
-                        <span style={{ fontSize: '1.2rem', color: '#1bb76e' }}>✔️</span> All trading days between dates are downloaded automatically
+                        <span style={{ fontSize: '1.2rem', color: '#1bb76e' }}>✔️</span> All days between dates are downloaded automatically
                     </li>
                     <li style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 'bold', color: '#1bb76e' }}>
                         <span style={{ fontSize: '1.2rem', color: '#1bb76e' }}>✔️</span> Files saved with pattern: <span className="filename">mcapDDMMYYYY.csv</span>

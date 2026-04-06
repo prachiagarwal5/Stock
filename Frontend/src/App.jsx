@@ -91,10 +91,8 @@ function App() {
         let curr = new Date(start);
 
         while (curr <= end) {
-            const day = curr.getDay();
-            if (day !== 0 && day !== 6) { // 0=Sun, 6=Sat
-                dates.push(new Date(curr));
-            }
+            // Removed weekend skip: Include Saturdays and Sundays
+            dates.push(new Date(curr));
             curr.setDate(curr.getDate() + 1);
         }
         return dates;

@@ -30,9 +30,9 @@ class MarketCapConsolidator:
         if not text:
             return False
         normalized = re.sub(r'[^A-Z0-9]', '', text)
-        if normalized in {'TOTAL', 'LISTED', 'TOTALLISTED', 'LISTEDTOTAL'}:
+        if normalized in {'TOTAL', 'LISTED', 'TOTALLISTED', 'LISTEDTOTAL', 'PERMITTED'}:
             return True
-        if text.startswith('TOTAL') or text.startswith('LISTED'):
+        if text.startswith(('TOTAL', 'LISTED', 'PERMITTED')):
             return True
         return False
 
