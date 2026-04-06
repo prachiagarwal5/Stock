@@ -118,7 +118,7 @@ def _is_keepalive_authorized(req):
 # MongoDB connection
 try:
     # Hardcoded MongoDB connection string (as per user request)
-    mongo_uri = "mongodb://localhost:27017/Stocks"
+    mongo_uri = "mongodb+srv://prachiagrawal509:BSzCRUTG8F7voUBv@cluster0.kfbej.mongodb.net/Stocks?retryWrites=true&w=majority"
     
     print(f"🔄 Connecting to MongoDB...")
     mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
