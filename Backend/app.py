@@ -2095,7 +2095,7 @@ def nse_symbol_dashboard():
     """
     Build a dashboard of impact cost, free float market cap, traded value, and index for symbols.
     Optimized for Render free tier (30s timeout).
-    Now supports SSE for real-time progress updates.
+    Uses batch processing from frontend to avoid network errors.
     """
     try:
         data = request.get_json() or {}
@@ -2113,166 +2113,105 @@ def nse_symbol_dashboard():
         TOTAL_SYMBOLS = 1100
         BATCH_SIZE = 100
 
-        import queue
-        import threading
-        msg_queue = queue.Queue()
+        symbols_to_process = provided_symbols[:] if provided_symbols else []
+        
+        if not symbols_to_process:
+            if symbol_aggregates_collection is not None:
+                db_symbols = list(symbol_aggregates_collection.find(
+                    {'type': 'mcap'},
+                    {'symbol': 1, 'average': 1}
+                ).sort([('average', -1), ('symbol', 1)]).limit(TOTAL_SYMBOLS))
+                if db_symbols:
+                    # STRICT FILTER: Never include 'PERMITTED' 
+                    symbols_to_process = [s['symbol'] for s in db_symbols if str(s.get('symbol')).strip().upper() != 'PERMITTED']
+        
+        # GLOBAL FILTER: Ensure 'PERMITTED' is removed from any provided list as well
+        if symbols_to_process:
+            symbols_to_process = [s for s in symbols_to_process if str(s).strip().upper() != 'PERMITTED']
 
-        def generate():
-            try:
-                def stream_log(msg, percentage=None):
-                    data = {'message': msg, 'req_id': req_id}
-                    if percentage is not None: data['percentage'] = percentage
-                    msg_queue.put(f"data: {json.dumps(data)}\n\n")
+        if not symbols_to_process:
+            market_cap_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject', 'Market_Cap.xlsx')
+            if os.path.exists(market_cap_path):
+                df = pd.read_excel(market_cap_path)
+                sym_col = next((c for c in df.columns if str(c).strip().lower() in ['symbol', 'symbols']), None)
+                if sym_col:
+                    symbols_to_process = df[sym_col].astype(str).tolist()[:TOTAL_SYMBOLS]
 
-                # Send initial connection log immediately
-                yield f"data: {json.dumps({'message': 'Initializing dashboard...', 'percentage': 0, 'req_id': req_id})}\n\n"
+        if not symbols_to_process:
+            return jsonify({'error': 'No symbols found'}), 400
 
-                def run_build():
-                    try:
-                        symbols_to_process = provided_symbols[:] if provided_symbols else []
-                        
-                        if not symbols_to_process:
-                            if symbol_aggregates_collection is not None:
-                                stream_log("Fetching top symbols from database...", 5)
-                                db_symbols = list(symbol_aggregates_collection.find(
-                                    {'type': 'mcap'},
-                                    {'symbol': 1, 'average': 1}
-                                ).sort([('average', -1), ('symbol', 1)]).limit(TOTAL_SYMBOLS))
-                                if db_symbols:
-                                    # STRICT FILTER: Never include 'PERMITTED' 
-                                    symbols_to_process = [s['symbol'] for s in db_symbols if str(s.get('symbol')).strip().upper() != 'PERMITTED']
-                                    stream_log(f"Got {len(symbols_to_process)} symbols from MongoDB", 10)
-                        
-                        # GLOBAL FILTER: Ensure 'PERMITTED' is removed from any provided list as well
-                        if symbols_to_process:
-                            symbols_to_process = [s for s in symbols_to_process if str(s).strip().upper() != 'PERMITTED']
+        final_symbols = list(dict.fromkeys(symbols_to_process))[:TOTAL_SYMBOLS]
+        for rs in ['GANECOS', 'ALLCARGO']:
+            if rs not in final_symbols: final_symbols.append(rs)
 
-                        if not symbols_to_process:
-                            stream_log("Checking local Market_Cap.xlsx fallback...", 12)
-                            market_cap_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'nosubject', 'Market_Cap.xlsx')
-                            if os.path.exists(market_cap_path):
-                                df = pd.read_excel(market_cap_path)
-                                sym_col = next((c for c in df.columns if str(c).strip().lower() in ['symbol', 'symbols']), None)
-                                if sym_col:
-                                    symbols_to_process = df[sym_col].astype(str).tolist()[:TOTAL_SYMBOLS]
-                                    stream_log(f"Got {len(symbols_to_process)} symbols from Market_Cap.xlsx", 15)
+        if nifty_indices_collection is not None:
+            for _sym in ['GANECOS', 'ALLCARGO']:
+                nifty_indices_collection.update_one({'symbol': _sym}, {'$set': {'symbol': _sym, 'indices': ['NIFTY MICROCAP 250'], 'primary_index': 'NIFTY MICROCAP 250', 'last_updated': datetime.now()}}, upsert=True)
 
-                        if not symbols_to_process:
-                            msg_queue.put(f"data: {json.dumps({'error': 'No symbols found'})}\n\n")
-                            msg_queue.put(None) # Signal end
-                            return
+        total_count = len(final_symbols)
+        if batch_index is None:
+            batch_symbols = final_symbols
+            batch_idx, total_batches = 0, 1
+        else:
+            batch_idx = int(batch_index)
+            symbol_batches = [final_symbols[i:i + BATCH_SIZE] for i in range(0, len(final_symbols), BATCH_SIZE)]
+            total_batches = len(symbol_batches)
+            if batch_idx >= total_batches:
+                return jsonify({'success': True, 'complete': True, 'rows': []}), 200
+            batch_symbols = symbol_batches[batch_idx]
 
-                        final_symbols = list(dict.fromkeys(symbols_to_process))[:TOTAL_SYMBOLS]
-                        for rs in ['GANECOS', 'ALLCARGO']:
-                            if rs not in final_symbols: final_symbols.append(rs)
+        symbol_pr_data, symbol_mcap_data, index_mapping, metrics_cache = {}, {}, {}, {}
 
-                        if nifty_indices_collection is not None:
-                            stream_log("Ensuring special symbol mappings...", 18)
-                            for _sym in ['GANECOS', 'ALLCARGO']:
-                                nifty_indices_collection.update_one({'symbol': _sym}, {'$set': {'symbol': _sym, 'indices': ['NIFTY MICROCAP 250'], 'primary_index': 'NIFTY MICROCAP 250', 'last_updated': datetime.now()}}, upsert=True)
+        if symbol_aggregates_collection is not None:
+            for doc in symbol_aggregates_collection.find({'symbol': {'$in': batch_symbols}}):
+                sym, dtype = doc.get('symbol'), doc.get('type')
+                if dtype == 'pr':
+                    symbol_pr_data[sym] = {'days_with_data': doc.get('days_with_data', 0), 'avg_pr': doc.get('average')}
+                    if sym not in symbol_mcap_data: symbol_mcap_data[sym] = {}
+                    symbol_mcap_data[sym]['total_traded_value'] = doc.get('average')
+                elif dtype == 'mcap':
+                    if sym not in symbol_mcap_data: symbol_mcap_data[sym] = {}
+                    symbol_mcap_data[sym]['avg_mcap'] = doc.get('average')
 
-                        total_count = len(final_symbols)
-                        if batch_index is None:
-                            batch_symbols = final_symbols
-                            batch_idx, total_batches = 0, 1
-                        else:
-                            batch_idx = int(batch_index)
-                            symbol_batches = [final_symbols[i:i + BATCH_SIZE] for i in range(0, len(final_symbols), BATCH_SIZE)]
-                            total_batches = len(symbol_batches)
-                            if batch_idx >= total_batches:
-                                msg_queue.put(f"data: {json.dumps({'complete': True, 'rows': []})}\n\n")
-                                msg_queue.put(None)
-                                return
-                            batch_symbols = symbol_batches[batch_idx]
+        if nifty_indices_collection is not None:
+            for doc in nifty_indices_collection.find({'symbol': {'$in': batch_symbols}}):
+                if doc.get('symbol') and doc.get('indices'): index_mapping[doc['symbol']] = doc['indices']
 
-                        stream_log(f"Bulk loading metadata for {len(batch_symbols)} symbols...", 20)
-                        symbol_pr_data, symbol_mcap_data, index_mapping, metrics_cache = {}, {}, {}, {}
+        if symbol_metrics_collection is not None:
+            for doc in symbol_metrics_collection.find({'as_on': as_on, 'symbol': {'$in': batch_symbols}}):
+                if doc.get('symbol'): metrics_cache[doc['symbol']] = doc
 
-                        if symbol_aggregates_collection is not None:
-                            for doc in symbol_aggregates_collection.find({'symbol': {'$in': batch_symbols}}):
-                                sym, dtype = doc.get('symbol'), doc.get('type')
-                                if dtype == 'pr':
-                                    symbol_pr_data[sym] = {'days_with_data': doc.get('days_with_data', 0), 'avg_pr': doc.get('average')}
-                                    if sym not in symbol_mcap_data: symbol_mcap_data[sym] = {}
-                                    symbol_mcap_data[sym]['total_traded_value'] = doc.get('average')
-                                elif dtype == 'mcap':
-                                    if sym not in symbol_mcap_data: symbol_mcap_data[sym] = {}
-                                    symbol_mcap_data[sym]['avg_mcap'] = doc.get('average')
+        fetcher = SymbolMetricsFetcher()
+        result = fetcher.build_dashboard(
+            batch_symbols, as_of=as_on, parallel=True, max_workers=10, 
+            chunk_size=max(10, len(batch_symbols) // 10),
+            symbol_pr_data=symbol_pr_data, symbol_mcap_data=symbol_mcap_data,
+            external_index_mapping=index_mapping, external_metrics_cache=metrics_cache
+        )
+        
+        rows = result.get('rows', [])
+        errors = result.get('errors', [])
 
-                        if nifty_indices_collection is not None:
-                            for doc in nifty_indices_collection.find({'symbol': {'$in': batch_symbols}}):
-                                if doc.get('symbol') and doc.get('indices'): index_mapping[doc['symbol']] = doc['indices']
+        index_map_detailed = primary_index_map_from_db(batch_symbols)
+        for row in rows:
+            row.pop('_id', None)
+            sym = row.get('symbol')
+            if sym in index_map_detailed: row['primary_index'] = index_map_detailed[sym]
+            if sym in symbol_pr_data: row['days_with_data'] = symbol_pr_data[sym].get('days_with_data', 0)
+        
+        # High-performance bulk upsert
+        bulk_upsert_symbol_metrics(rows, source='symbol_dashboard')
 
-                        if symbol_metrics_collection is not None:
-                            for doc in symbol_metrics_collection.find({'as_on': as_on, 'symbol': {'$in': batch_symbols}}):
-                                if doc.get('symbol'): metrics_cache[doc['symbol']] = doc
-
-                        stream_log("Starting parallel fetch for metrics...", 25)
-                        fetcher = SymbolMetricsFetcher()
-                        result = fetcher.build_dashboard(
-                            batch_symbols, as_of=as_on, parallel=True, max_workers=10, 
-                            chunk_size=max(10, len(batch_symbols) // 10),
-                            symbol_pr_data=symbol_pr_data, symbol_mcap_data=symbol_mcap_data,
-                            external_index_mapping=index_mapping, external_metrics_cache=metrics_cache,
-                            log_fn=lambda msg, percentage: stream_log(msg, 25 + int(percentage * 0.7))
-                        )
-                        
-                        rows = result.get('rows', [])
-                        errors = result.get('errors', [])
-
-                        stream_log("Enriching results and updating database...", 95)
-                        index_map_detailed = primary_index_map_from_db(batch_symbols)
-                        for row in rows:
-                            row.pop('_id', None)
-                            sym = row.get('symbol')
-                            if sym in index_map_detailed: row['primary_index'] = index_map_detailed[sym]
-                            if sym in symbol_pr_data: row['days_with_data'] = symbol_pr_data[sym].get('days_with_data', 0)
-                        
-                        # High-performance bulk upsert
-                        bulk_upsert_symbol_metrics(rows, source='symbol_dashboard')
-
-                        is_last = (batch_idx == total_batches - 1)
-                        download_url, db_id = None, None
-                        if is_last and len(rows) > 0:
-                            stream_log("Generating final Excel report...", 98)
-                            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
-                            e_path = temp_file.name
-                            temp_file.close()
-                            format_dashboard_excel(rows, e_path, start_date=start_date_str, end_date=end_date_str)
-                            db_id = save_excel_to_database(e_path, f"Symbol_Dashboard_{as_on}.xlsx", {'symbols': len(rows), 'as_on': as_on})
-                            if db_id: download_url = f"/api/nse-symbol-dashboard/download?id={db_id}"
-                            os.remove(e_path)
-
-                        final_data = {
-                            'success': True, 'count': len(rows), 'rows': rows, 'errors': errors,
-                            'batch_index': batch_idx, 'total_batches': total_batches,
-                            'total_symbols': total_count, 'complete': is_last,
-                            'download_url': download_url, 'file_id': str(db_id) if db_id else None,
-                            'message': 'Dashboard build complete!', 'percentage': 100
-                        }
-                        msg_queue.put(f"data: {json.dumps(final_data)}\n\n")
-                    except Exception as e:
-                        msg_queue.put(f"data: {json.dumps({'error': str(e)})}\n\n")
-                    finally:
-                        msg_queue.put(None) # Sentinel
-
-                # Start the build in a background thread
-                thread = threading.Thread(target=run_build)
-                thread.start()
-
-                # Poll the queue for messages and yield them
-                while True:
-                    msg = msg_queue.get()
-                    if msg is None: break
-                    yield msg
-                
-                thread.join()
-
-            except Exception as e:
-                print(f"Dashboard SSE Error: {e}")
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-        return Response(generate(), mimetype='text/event-stream')
+        is_last = (batch_idx == total_batches - 1)
+        
+        final_data = {
+            'success': True, 'count': len(rows), 'rows': rows, 'errors': errors,
+            'batch_index': batch_idx, 'total_batches': total_batches,
+            'total_symbols': total_count, 'complete': is_last,
+            'message': f'Dashboard batch {batch_idx + 1}/{total_batches} complete!', 'percentage': 100
+        }
+        
+        return jsonify(final_data), 200
 
     except Exception as e:
         print(f"[symbol-dashboard][error] {e}")

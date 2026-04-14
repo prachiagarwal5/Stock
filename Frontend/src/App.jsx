@@ -569,73 +569,115 @@ function App() {
 
         try {
             setDashboardBatchProgress({
-                currentBatch: 1,
+                currentBatch: 0,
                 totalBatches: 1,
                 symbolsProcessed: 0,
                 totalSymbols: TOTAL_SYMBOLS,
-                status: 'Connecting to dashboard stream...',
+                status: 'Connecting to dashboard API...',
                 message: 'Initializing...',
                 percentage: 0
             });
+            
+            let allRows = [];
+            let allErrors = [];
+            let totalBatches = 1;
+            let currentBatch = 0;
+            
+            while (currentBatch < totalBatches) {
+                setDashboardBatchProgress(prev => ({
+                    ...prev,
+                    currentBatch: currentBatch + 1,
+                    totalBatches: totalBatches,
+                    message: currentBatch > 0 ? `Batch ${currentBatch} processed, next batch is being processed (Batch ${currentBatch + 1} of ${totalBatches})...` : `Processing initial Batch 1 of ${totalBatches}...`,
+                    percentage: Math.round((currentBatch / totalBatches) * 100)
+                }));
+                
+                const response = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        top_n: TOTAL_SYMBOLS,
+                        top_n_by: 'mcap',
+                        as_on: rangeEndDate,
+                        start_date: convertDateFormat(rangeStartDate),
+                        end_date: convertDateFormat(rangeEndDate),
+                        batch_index: currentBatch
+                    })
+                });
 
-            const response = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard`, {
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.error || `Dashboard batch ${currentBatch + 1} generation failed`);
+                }
+
+                const data = await response.json();
+                
+                if (data.error) throw new Error(data.error);
+
+                allRows = [...allRows, ...(data.rows || [])];
+                allErrors = [...allErrors, ...(data.errors || [])];
+                
+                if (data.total_batches) {
+                    totalBatches = data.total_batches;
+                }
+                
+                setExportLog(prev => [...prev, data.message || `Processed batch ${currentBatch + 1}/${totalBatches}`]);
+                
+                currentBatch++;
+            }
+            
+            setDashboardBatchProgress(prev => ({
+                ...prev,
+                currentBatch: totalBatches,
+                totalBatches: totalBatches,
+                message: 'All batches processed. Generating final Excel report...',
+                percentage: 95
+            }));
+            
+            // Now save all rows to excel
+            const saveResponse = await fetch(`${VITE_API_URL}/api/nse-symbol-dashboard/save-excel`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    top_n: TOTAL_SYMBOLS,
-                    top_n_by: 'mcap',
+                    rows: allRows,
                     as_on: rangeEndDate,
-                    start_date: rangeStartDate,
-                    end_date: rangeEndDate
+                    start_date: convertDateFormat(rangeStartDate),
+                    end_date: convertDateFormat(rangeEndDate)
                 })
             });
-
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || 'Dashboard generation failed');
+            
+            if (!saveResponse.ok) {
+                const errorData = await saveResponse.json();
+                throw new Error(errorData.error || 'Failed to save excel report');
+            }
+            
+            const saveData = await saveResponse.json();
+            
+            const finalData = {
+                success: true,
+                count: allRows.length,
+                rows: allRows,
+                errors: allErrors,
+                total_symbols: TOTAL_SYMBOLS,
+                complete: true,
+                download_url: saveData.download_url,
+                file_id: saveData.file_id,
+                file: saveData.file
+            };
+            
+            setDashboardResult(finalData);
+            setSuccess(`✅ Dashboard built successfully with ${finalData.count} symbols`);
+            
+            setDashboardBatchProgress(prev => ({
+                 ...prev,
+                 message: 'Dashboard build complete!',
+                 percentage: 100
+            }));
+            
+            if (allRows && allRows.length > 0 && activeTab === 'mongo') {
+                await loadDashboardData(dashboardLimit);
             }
 
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines.pop();
-
-                for (const line of lines) {
-                    if (line.startsWith('data: ')) {
-                        try {
-                            const data = JSON.parse(line.substring(6));
-                            if (data.error) throw new Error(data.error);
-
-                            if (data.message) {
-                                setDashboardBatchProgress(prev => ({
-                                    ...prev,
-                                    message: data.message,
-                                    percentage: data.percentage !== undefined ? data.percentage : prev.percentage
-                                }));
-                                setExportLog(prev => [...prev, data.message]);
-                            }
-
-                            if (data.complete) {
-                                setDashboardResult(data);
-                                setSuccess(`✅ Dashboard built successfully with ${data.count} symbols`);
-                                if (data.rows && data.rows.length > 0 && activeTab === 'mongo') {
-                                    await loadDashboardData(dashboardLimit);
-                                }
-                                break;
-                            }
-                        } catch (e) {
-                            console.error("Error parsing dashboard SSE:", e);
-                        }
-                    }
-                }
-            }
         } catch (err) {
             console.error('Dashboard Error:', err);
             setError(err.message);
