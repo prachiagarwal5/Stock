@@ -278,39 +278,26 @@ def build_symbol_index_map(index_list):
 
 
 def primary_index_map_from_db(symbols):
-    """Return latest primary_index per symbol from Mongo (no external calls)."""
-    if symbol_metrics_collection is None or not symbols:
+    """Return latest primary_index per symbol from nifty_indices_collection."""
+    if nifty_indices_collection is None or not symbols:
         return {}
     mapping = {}
     try:
-        cursor = symbol_metrics_collection.find(
+        # Query exactly what we need: current constituents only
+        cursor = nifty_indices_collection.find(
             {'symbol': {'$in': symbols}},
-            {
-                'symbol': 1,
-                'primary_index': 1,
-                'index': 1,
-                'indexList': 1,
-                'updated_at': 1,
-                'as_on': 1
-            }
-        ).sort([
-            ('updated_at', -1),
-            ('as_on', -1)
-        ])
+            {'symbol': 1, 'primary_index': 1}
+        )
 
         for doc in cursor:
             sym = doc.get('symbol')
-            if not sym or sym in mapping:
+            if not sym:
                 continue
-            idx = doc.get('primary_index') or doc.get('index')
-            if not idx:
-                idx_list = doc.get('indexList')
-                if isinstance(idx_list, (list, tuple)) and idx_list:
-                    idx = idx_list[0]
+            idx = doc.get('primary_index')
             if idx:
                 mapping[sym] = idx
     except Exception as exc:
-        print(f"⚠️ Failed to build primary index map: {exc}")
+        print(f"⚠️ Failed to build primary index map from nifty_indices: {exc}")
     return mapping
 
 
@@ -2196,7 +2183,10 @@ def nse_symbol_dashboard():
         for row in rows:
             row.pop('_id', None)
             sym = row.get('symbol')
-            if sym in index_map_detailed: row['primary_index'] = index_map_detailed[sym]
+            if sym in index_map_detailed: 
+                row['primary_index'] = index_map_detailed[sym]
+            else:
+                row['primary_index'] = None  # EXPLICITLY clear stale index tags if not in current constituents
             if sym in symbol_pr_data: row['days_with_data'] = symbol_pr_data[sym].get('days_with_data', 0)
         
         # High-performance bulk upsert
@@ -2685,6 +2675,35 @@ def fetch_and_store_nifty_indices():
         if not index_mapping:
             return jsonify({'error': 'Failed to fetch any indices from CSV files'}), 500
         
+        # --- MANUAL OVERRIDES PHASE ---
+        print(f"[fetch-and-store-indices] Applying manual overrides...")
+        # 1. ADD: Akzo Nobel (AKZOINDIA) to Smallcap 250 if missing
+        if 'AKZOINDIA' not in index_mapping:
+            index_mapping['AKZOINDIA'] = ['NIFTY SMALLCAP 250']
+        elif 'NIFTY SMALLCAP 250' not in index_mapping['AKZOINDIA']:
+            index_mapping['AKZOINDIA'].append('NIFTY SMALLCAP 250')
+            
+        # 2. REMOVE: Extras from Smallcap 250 as requested by user
+        extras_to_remove = {'BASF', 'RELINFRA', 'SUNDRMFAST', 'VENTIVE', 'ASTRAZEN'}
+        for sym_rem in extras_to_remove:
+            sym_rem_up = sym_rem.upper()
+            if sym_rem_up in index_mapping:
+                # Remove index from list
+                if 'NIFTY SMALLCAP 250' in index_mapping[sym_rem_up]:
+                    index_mapping[sym_rem_up].remove('NIFTY SMALLCAP 250')
+                # If no indices left for this symbol, remove it from mapping entirely
+                if not index_mapping[sym_rem_up]:
+                    del index_mapping[sym_rem_up]
+        
+        # 3. Add Microcap hardcoded symbols (moved earlier for unified bulk ops)
+        for _sym in ['GANECOS', 'ALLCARGO']:
+            _sym_up = _sym.upper()
+            if _sym_up not in index_mapping:
+                index_mapping[_sym_up] = ['NIFTY MICROCAP 250']
+            elif 'NIFTY MICROCAP 250' not in index_mapping[_sym_up]:
+                index_mapping[_sym_up].append('NIFTY MICROCAP 250')
+        # ------------------------------
+        
         # Prepare bulk operations for MongoDB
         bulk_operations = []
         timestamp = datetime.now()
@@ -2714,10 +2733,13 @@ def fetch_and_store_nifty_indices():
                 )
             )
         
-        # Execute bulk write
+        # Execute bulk write (with clear first to remove stale data)
         if bulk_operations:
-            result = nifty_indices_collection.bulk_write(bulk_operations)
-            print(f"[fetch-and-store-indices] ✓ Stored {len(index_mapping)} symbols in DB")
+            print(f"[fetch-and-store-indices] Clearing existing indices to prevent stale data...")
+            nifty_indices_collection.delete_many({})
+            
+            result = nifty_indices_collection.bulk_write(bulk_operations, ordered=True)
+            print(f"[fetch-and-store-indices] ✓ synchronized {len(index_mapping)} symbols with DB")
             print(f"[fetch-and-store-indices] Matched: {result.matched_count}, Modified: {result.modified_count}, Upserted: {result.upserted_count}")
             
             # Count symbols per index
