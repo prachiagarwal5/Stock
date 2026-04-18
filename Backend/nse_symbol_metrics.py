@@ -239,6 +239,8 @@ class SymbolMetricsFetcher:
             'listingDate': sec_info.get('listingDate'),
             'basicIndustry': sec_info.get('basicIndustry') or data.get('industryInfo'),
             'applicableMargin': data.get('applicableMargin') or trade_info.get('applicableMargin'),
+            'live_detail_mc': self._to_float(data.get('totalMarketCap') or trade_info.get('totalMarketCap')),
+            'live_detail_ff': self._to_float(data.get('ffmc') or trade_info.get('ffmc')),
             'as_on': as_on
         }
         return result
@@ -421,7 +423,8 @@ class SymbolMetricsFetcher:
         replaced_traded = 0
         if symbol_mcap_data:
             for row in rows:
-                symbol = row.get('symbol')
+                raw_symbol = row.get('symbol')
+                symbol = str(raw_symbol or '').strip().upper()
                 if symbol and symbol in symbol_mcap_data:
                     mcap_info = symbol_mcap_data[symbol]
                     # Replace total_market_cap with avg_mcap from Excel data
@@ -431,6 +434,11 @@ class SymbolMetricsFetcher:
                     # Replace free_float_mcap with avg_free_float from Excel data
                     if 'avg_free_float' in mcap_info and mcap_info['avg_free_float'] is not None:
                         row['free_float_mcap'] = mcap_info['avg_free_float']
+                    # Pass through live MC/FF if available
+                    if 'live_mc' in mcap_info: row['live_mc'] = mcap_info['live_mc']
+                    if 'live_ff' in mcap_info: row['live_ff'] = mcap_info['live_ff']
+                    if 'total_possible_days' in mcap_info: row['total_possible_days'] = mcap_info['total_possible_days']
+                    if 'non_zero_days' in mcap_info: row['non_zero_days'] = mcap_info['non_zero_days']
                     # Replace total_traded_value with value from Excel data
                     if 'total_traded_value' in mcap_info and mcap_info['total_traded_value'] is not None:
                         row['total_traded_value'] = mcap_info['total_traded_value']

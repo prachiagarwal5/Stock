@@ -98,8 +98,27 @@ class MemoryOptimizedExporter:
         # Add header formatting
         header_format = workbook.add_format({
             'bold': True,
-            'bg_color': '#D3D3D3',
-            'border': 1
+            'bg_color': '#4F81BD',
+            'font_color': '#FFFFFF',
+            'border': 1,
+            'align': 'center',
+            'valign': 'vcenter'
+        })
+        
+        # Number format with comma separators
+        num_format = workbook.add_format({
+            'num_format': '#,##0.00',
+            'border': 1,
+            'align': 'right'
+        })
+        text_format = workbook.add_format({
+            'border': 1,
+            'align': 'left'
+        })
+        int_format = workbook.add_format({
+            'num_format': '0',
+            'border': 1,
+            'align': 'right'
         })
         
         for sheet_name, df in data_sheets.items():
@@ -112,11 +131,26 @@ class MemoryOptimizedExporter:
             # Create worksheet
             worksheet = workbook.add_worksheet(sheet_name)
             
+            # Identify column types for formatting
+            text_cols = {'Symbol', 'Company Name'}
+            int_cols = {'Days With Data'}
+            
             # Write headers with formatting
             for col_idx, column in enumerate(df_optimized.columns):
                 worksheet.write(0, col_idx, column, header_format)
-                # Auto-adjust column width
-                worksheet.set_column(col_idx, col_idx, min(len(str(column)) + 2, 20))
+            
+            # Set column widths and default formats
+            for col_idx, column in enumerate(df_optimized.columns):
+                if column in text_cols:
+                    width = 30 if column == 'Company Name' else 15
+                    worksheet.set_column(col_idx, col_idx, width, text_format)
+                elif column in int_cols:
+                    worksheet.set_column(col_idx, col_idx, 14, int_format)
+                else:
+                    worksheet.set_column(col_idx, col_idx, 16, num_format)
+            
+            # Freeze top row and first 2 columns
+            worksheet.freeze_panes(1, 2)
             
             # Write data in chunks
             chunk_size = 1000
@@ -126,12 +160,17 @@ class MemoryOptimizedExporter:
                 
                 for row_idx, (_, row) in enumerate(chunk.iterrows(), start=start_row + 1):
                     for col_idx, value in enumerate(row):
+                        col_name = df_optimized.columns[col_idx]
                         if pd.isna(value):
-                            worksheet.write(row_idx, col_idx, '')
+                            worksheet.write(row_idx, col_idx, '', text_format)
+                        elif col_name in text_cols:
+                            worksheet.write(row_idx, col_idx, str(value), text_format)
+                        elif col_name in int_cols:
+                            worksheet.write_number(row_idx, col_idx, int(value), int_format)
                         elif isinstance(value, (int, float, np.integer, np.floating)):
-                            worksheet.write(row_idx, col_idx, float(value) if not pd.isna(value) else '')
+                            worksheet.write_number(row_idx, col_idx, float(value), num_format)
                         else:
-                            worksheet.write(row_idx, col_idx, str(value))
+                            worksheet.write(row_idx, col_idx, str(value), text_format)
                 
                 # Force garbage collection after each chunk
                 gc.collect()

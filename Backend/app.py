@@ -247,12 +247,26 @@ def fetch_index_constituents(index_name, session, headers):
     except Exception:
         raise ValueError(f"Invalid JSON for index {index_name}")
     rows = data.get('data') or []
-    symbols = []
+    def clean_num(v):
+        if v is None or v == "" or v == "-": return None
+        if isinstance(v, (int, float)): return float(v)
+        try:
+            return float(str(v).replace(',', '').strip())
+        except:
+            return None
+
+    symbol_data_map = {}
     for row in rows:
         sym = row.get('symbol') or row.get('symbolName') or row.get('securitySymbol')
         if sym:
-            symbols.append(str(sym).strip())
-    return symbols
+            sym = str(sym).strip().upper()
+            # MC is Total Market Cap (expressed in Cr or full? Usually Cr in this API)
+            # FF is Free Float Market Cap
+            symbol_data_map[sym] = {
+                'mc': clean_num(row.get('marketCap')),
+                'ff': clean_num(row.get('ffmc'))
+            }
+    return symbol_data_map
 
 
 def build_symbol_index_map(index_list):
@@ -265,16 +279,21 @@ def build_symbol_index_map(index_list):
     sess = _make_session()
     _prime_cookies(sess, headers)
     mapping = {}
+    live_data_mapping = {}
     errors = []
     for idx in index_list:
         try:
-            syms = fetch_index_constituents(idx, sess, headers)
-            for sym in syms:
-                if sym not in mapping:  # primary index only
-                    mapping[sym] = idx
+            index_data = fetch_index_constituents(idx, sess, headers)
+            for sym, data in index_data.items():
+                if sym not in mapping:
+                    mapping[sym] = [idx]
+                    live_data_mapping[sym] = data
+                else:
+                    if idx not in mapping[sym]:
+                        mapping[sym].append(idx)
         except Exception as exc:
             errors.append({'index': idx, 'error': str(exc)})
-    return mapping, errors
+    return mapping, live_data_mapping, errors
 
 
 def primary_index_map_from_db(symbols):
@@ -551,12 +570,18 @@ def persist_consolidated_results(consolidator, data_type, source='consolidation'
                 # Prepare aggregate upsert
                 avg_val = row.get(consolidator.avg_col)
                 days_val = row.get(consolidator.days_col)
+                # Use unified snake_case keys for internal logic
+                non_zero_val = row.get(consolidator.non_zero_days_col) if hasattr(consolidator, 'non_zero_days_col') else row.get('non_zero_days', 0)
+                total_possible = row.get('total_possible_days', 0)
+                
                 if symbol_aggregates_collection is not None:
                     payload = {
                         'symbol': symbol,
                         'company_name': company_name,
                         'type': data_type,
                         'days_with_data': int(days_val or 0),
+                        'non_zero_days': int(non_zero_val or 0),
+                        'total_possible_days': int(total_possible or 0),
                         'average': _safe_float(avg_val),
                         'date_range': date_range,
                         'source': source,
@@ -918,12 +943,36 @@ def get_consolidated_metrics_from_db(date_iso_list, data_type, allowed_symbols=N
             
         # Convert to DataFrame
         rows = []
+        # Pre-sort date_iso_list to be sure of order
+        sorted_iso_range = sorted(date_iso_list)
+        
         for res in results:
+            daily_entries = res.get('daily_data', [])
+            daily_vals = [d.get('val') for d in daily_entries]
+            non_zero_days = sum(1 for v in daily_vals if v is not None and v > 0)
+            
+            # Calculate total_possible_days: 
+            # 1. Find the earliest date this symbol appeared in the requested range
+            all_dates_found = [d['date'] for d in daily_entries if d.get('date')]
+            if all_dates_found:
+                first_date = min(all_dates_found)
+                # 2. Find its index in the sorted_iso_range
+                try:
+                    first_idx = sorted_iso_range.index(first_date)
+                    total_possible = len(sorted_iso_range) - first_idx
+                except ValueError:
+                    # Date found but not in our list (unexpected but handleable)
+                    total_possible = res['count_val']
+            else:
+                total_possible = res['count_val']
+
             row = {
                 'Symbol': res['Symbol'],
                 'Company Name': res['Company Name'],
                 'Average Value': res['sum_val'] / res['count_val'] if res['count_val'] > 0 else 0,
-                'Days With Data': res['count_val']
+                'Days With Data': res['count_val'],
+                'non_zero_days': non_zero_days,
+                'total_possible_days': total_possible
             }
             # Flatten daily data for pivoting - fast string manipulation for YYYY-MM-DD -> DD-MM-YYYY
             for daily in res.get('daily_data', []):
@@ -1107,8 +1156,18 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
     available_cols = [c for c in date_cols if c in df_all_pivot.columns]
     
     # Vectorized metrics (one pass through data)
-    df_all_pivot['Days With Data'] = df_all_pivot[available_cols].notna().sum(axis=1)
-    df_all_pivot[avg_col] = df_all_pivot[available_cols].mean(axis=1)
+    numeric_pivot = df_all_pivot[available_cols].apply(pd.to_numeric, errors='coerce') if available_cols else pd.DataFrame()
+    df_all_pivot['Days With Data'] = numeric_pivot.notna().sum(axis=1) if not numeric_pivot.empty else 0
+    # Non Zero Days: days where value > 0 (actually traded, not just present/non-null)
+    df_all_pivot['Non Zero Days'] = (numeric_pivot > 0).sum(axis=1) if not numeric_pivot.empty else 0
+    df_all_pivot[avg_col] = numeric_pivot.mean(axis=1) if not numeric_pivot.empty else None
+
+    # Total possible days: count from first data point for each symbol to end of date range
+    if not numeric_pivot.empty:
+        first_idx = numeric_pivot.notna().values.argmax(axis=1)
+        df_all_pivot['total_possible_days'] = len(available_cols) - first_idx
+    else:
+        df_all_pivot['total_possible_days'] = 0
 
     # Sort by average
     df_all_pivot = df_all_pivot.sort_values(by=avg_col, ascending=False, na_position='last').reset_index(drop=True)
@@ -1117,12 +1176,11 @@ def build_consolidated_from_cache(date_iso_list, data_type, allow_missing=False,
     if available_cols:
         for col in available_cols:
             df_all_pivot[col] = pd.to_numeric(df_all_pivot[col], errors='coerce')
-        
         df_all_pivot[avg_col] = pd.to_numeric(df_all_pivot[avg_col], errors='coerce')
 
     # Final column order
-    final_cols = ['Symbol', 'Company Name', 'Days With Data', avg_col] + available_cols
-    df_all_pivot = df_all_pivot[final_cols]
+    final_cols = ['Symbol', 'Company Name', 'Days With Data', 'Non Zero Days', 'total_possible_days', avg_col] + available_cols
+    df_all_pivot = df_all_pivot[[c for c in final_cols if c in df_all_pivot.columns]]
 
     # FINAL SAFETY FILTER: Remove 'PERMITTED' symbol if it survived aggregation/CSV parsing
     if 'Symbol' in df_all_pivot.columns:
@@ -1558,18 +1616,82 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
         if 'index' in df.columns:
             df['index'] = df['index'].apply(lambda x: None if str(x).strip().upper() == 'PERMITTED' else x)
         
-        # Round and normalize to Crores - Vectorized
-        numeric_cols = ['total_market_cap', 'free_float_mcap', 'total_traded_value']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = (pd.to_numeric(df[col], errors='coerce') / 10000000).round(2)
+        # NOTE: Monetary normalization to Crores moved to the end of processing 
+        # to ensure ratio calculations use unit-safe raw values.
         
         if 'impact_cost' in df.columns:
             df['impact_cost'] = pd.to_numeric(df['impact_cost'], errors='coerce').round(2)
 
-        # Ratio calculations - Vectorized
-        df['Ratio of avg free float to avg total market cap'] = (df['free_float_mcap'] / df['total_market_cap'].replace(0, np.nan)).round(4)
-        df['ratio of free float to avg total market cap'] = df['Ratio of avg free float to avg total market cap']
+
+        # ── FF/MC Ratio ──────────────────────────────────────────────────────────
+        # Use raw units for ratio calculation to ensure unit safety.
+        # Safely read live detail columns (may not exist in cached/old rows)
+        if 'live_detail_mc' in df.columns:
+            df['live_detail_mc_num'] = pd.to_numeric(df['live_detail_mc'], errors='coerce')
+        else:
+            df['live_detail_mc_num'] = np.nan
+
+        if 'live_detail_ff' in df.columns:
+            df['live_detail_ff_num'] = pd.to_numeric(df['live_detail_ff'], errors='coerce')
+        else:
+            df['live_detail_ff_num'] = np.nan
+
+        # 1. FF/MC from Detail API (raw units → ratio is unit-safe)
+        df['FF/MC_Detail'] = (
+            df['live_detail_ff_num'] / df['live_detail_mc_num'].replace(0, np.nan)
+        ).round(4)
+
+        # 2. Fallback: use average columns (still in raw Rupees here)
+        _ff_col = pd.to_numeric(df['free_float_mcap'], errors='coerce') if 'free_float_mcap' in df.columns else pd.Series(np.nan, index=df.index)
+        _mc_col = pd.to_numeric(df['total_market_cap'], errors='coerce') if 'total_market_cap' in df.columns else pd.Series(np.nan, index=df.index)
+        df['FF/MC_Fallback'] = (_ff_col / _mc_col.replace(0, np.nan)).round(4)
+
+        # Final FF/MC: Detail API first, then fallback
+        df['FF/MC'] = df['FF/MC_Detail'].fillna(df['FF/MC_Fallback']).fillna(0)
+        
+        # REQUIREMENT: Remove stocks where FF/MC ratio is 0.000
+        initial_count = len(df)
+        df = df[df['FF/MC'] > 0].copy()
+        dropped = initial_count - len(df)
+        if dropped > 0:
+            print(f"[format_excel] Removed {dropped} rows with FF/MC ratio <= 0.000")
+
+        df['Ratio of avg free float to avg total market cap'] = df['FF/MC']
+        df['ratio of free float to avg total market cap'] = df['FF/MC']
+        
+        # 3. Scale primary metrics to Crores AFTER ratio calculations
+        monetary_cols = ['total_market_cap', 'free_float_mcap', 'total_traded_value']
+        for col in monetary_cols:
+            if col in df.columns:
+                # Robust scaling: only divide if values appear to be in raw Rupees (> 10M threshold for MCAP)
+                # This prevents double-scaling if data was already in Crores.
+                vals = pd.to_numeric(df[col], errors='coerce')
+                # If median is > 100,000, it's almost certainly raw Rupees (NSE listed companies are valued millions+)
+                if vals.median() > 100000:
+                    df[col] = (vals / 10000000).round(2)
+                else:
+                    df[col] = vals.round(2)
+
+        # 4. Calculate recalculate Free Float Market Cap (Cr) using: FF/MC * Current MC (Cr)
+        # Use live Detail MC if available, else fallback to aggregated MC.
+        live_detail_mc_cr = (df['live_detail_mc_num'] / 10000000).round(2)
+        live_mc_num = pd.to_numeric(df['live_mc'], errors='coerce') if 'live_mc' in df.columns else np.nan
+        
+        mc_source = live_detail_mc_cr.fillna(live_mc_num / 10000000) \
+                                     .fillna(df['total_market_cap'] if 'total_market_cap' in df.columns else np.nan)
+        
+        new_ff_mcap = (df['FF/MC'] * mc_source).round(2)
+        if 'free_float_mcap' in df.columns:
+            df['free_float_mcap'] = new_ff_mcap.fillna(df['free_float_mcap'])
+        else:
+            df['free_float_mcap'] = new_ff_mcap
+
+        if 'impact_cost' in df.columns:
+            df['impact_cost'] = pd.to_numeric(df['impact_cost'], errors='coerce').round(2)
+
+        # 5. Calculate Trading Consistency (% of Days Traded)
+        # Override: Forced to 100% for all symbols as requested
+        df['trading_consistency'] = 100.0
         
         # Reorder and rename columns
         output_columns = [
@@ -1581,12 +1703,13 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
             ('Average Market Cap (Cr)', 'total_market_cap'),
             ('Average Free Float Market Cap (Cr)', 'free_float_mcap'),
             ('Average Net Traded Value (Cr)', 'total_traded_value'),
+            ('% of Days Traded', 'trading_consistency'),
             ('Day of Listing', 'Day of Listing'),
             ('number of days from listing', 'number of days from listing'),
             ('Broader Index', 'Broader Index'),
             ('listed> 6months', 'listed> 6months'),
             ('listed> 1 months', 'listed> 1 months'),
-            ('Ratio of avg free float to avg total market cap', 'Ratio of avg free float to avg total market cap')
+            ('FF/MC', 'FF/MC')
         ]
         
         df['serial_no'] = range(1, len(df) + 1)
@@ -1614,23 +1737,40 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
         ratio_format = workbook.add_format({'border': 1, 'border_color': '#000000', 'num_format': '0.0000'})
         
         # Column widths & Default Cell Format (Grid)
-        # Columns mapped: A(0), B(1), C(2), D(3), E(4), F(5), G(6), H(7), I(8), J(9), K(10), L(11), M(12), N(13)
-        widths = [8, 12, 30, 20, 15, 24, 28, 26, 15, 25, 15, 13, 13, 18]
+        # 15 cols (0-14): SerialNo Symbol CompanyName Index ImpactCost AvgMC AvgFF AvgTV
+        #                  %Traded DayOfListing DaysFromListing BroaderIdx >6m >1m FF/MC
+        widths = [8, 12, 30, 20, 15, 24, 28, 26, 14, 15, 25, 15, 13, 13, 18]
         for i, w in enumerate(widths):
             # Apply cell_format as the default for the column to ensure grid
             worksheet.set_column(i, i, w, cell_format)
             
         # Specific numeric formats for columns
-        # Index (API) is 3, Avg Impact Cost is 4, Mcap is 5, Free Float is 6, Traded Value is 7, Ratio is 13
-        worksheet.set_column(4, 4, 15, num_format)   # Avg Impact Cost
-        worksheet.set_column(5, 5, 24, num_format)   # Avg Market Cap
-        worksheet.set_column(6, 6, 28, num_format)   # Avg Free Float
-        worksheet.set_column(7, 7, 26, num_format)   # Avg Net Traded Value
-        worksheet.set_column(13, 13, 18, ratio_format) # Ratios
+        worksheet.set_column(4, 4, 15, num_format)    # Avg Impact Cost
+        worksheet.set_column(5, 5, 24, num_format)    # Avg Market Cap
+        worksheet.set_column(6, 6, 28, num_format)    # Avg Free Float
+        worksheet.set_column(7, 7, 26, num_format)    # Avg Net Traded Value
+        worksheet.set_column(8, 8, 14, num_format)    # % of Days Traded
+        worksheet.set_column(14, 14, 18, ratio_format) # FF/MC ratio
         
         # Re-apply header formatting
         for col_num, value in enumerate(output_df.columns.values):
             worksheet.write(0, col_num, value, header_format)
+            
+        # Define standard Excel light-red format for 'N' values
+        warning_format = workbook.add_format({
+            'bg_color':   '#FFC7CE',
+            'font_color': '#9C0006'
+        })
+        
+        # Apply conditional formatting to 'listed> 6months' (Col 12) and 'listed> 1 months' (Col 13)
+        last_row = len(output_df)
+        if last_row > 0:
+            worksheet.conditional_format(1, 12, last_row, 13, {
+                'type':     'cell',
+                'criteria': 'equal to',
+                'value':    '"N"',
+                'format':   warning_format
+            })
             
         # Freeze panes
         worksheet.freeze_panes(1, 0)
@@ -2151,27 +2291,50 @@ def nse_symbol_dashboard():
 
         if symbol_aggregates_collection is not None:
             for doc in symbol_aggregates_collection.find({'symbol': {'$in': batch_symbols}}):
-                sym, dtype = doc.get('symbol'), doc.get('type')
+                sym = str(doc.get('symbol') or '').strip().upper()
+                dtype = doc.get('type')
+                if not sym: continue
+                
                 if dtype == 'pr':
-                    symbol_pr_data[sym] = {'days_with_data': doc.get('days_with_data', 0), 'avg_pr': doc.get('average')}
+                    # Robust key check for legacy/new naming
+                    nz_days = doc.get('non_zero_days') if doc.get('non_zero_days') is not None else doc.get('Non Zero Days', 0)
+                    symbol_pr_data[sym] = {
+                        'days_with_data': doc.get('days_with_data', 0), 
+                        'non_zero_days': nz_days,
+                        'total_possible_days': doc.get('total_possible_days', 0),
+                        'avg_pr': doc.get('average')
+                    }
                     if sym not in symbol_mcap_data: symbol_mcap_data[sym] = {}
                     symbol_mcap_data[sym]['total_traded_value'] = doc.get('average')
+                    # Propagate consistency fields to the main map used by fetcher
+                    symbol_mcap_data[sym]['non_zero_days'] = nz_days
+                    symbol_mcap_data[sym]['total_possible_days'] = doc.get('total_possible_days', 0)
                 elif dtype == 'mcap':
                     if sym not in symbol_mcap_data: symbol_mcap_data[sym] = {}
                     symbol_mcap_data[sym]['avg_mcap'] = doc.get('average')
+                    symbol_mcap_data[sym]['total_possible_days'] = doc.get('total_possible_days', 0)
+                    # Robust key check for legacy/new naming
+                    symbol_mcap_data[sym]['non_zero_days'] = doc.get('non_zero_days') if doc.get('non_zero_days') is not None else doc.get('Non Zero Days', 0)
 
         if nifty_indices_collection is not None:
             for doc in nifty_indices_collection.find({'symbol': {'$in': batch_symbols}}):
-                if doc.get('symbol') and doc.get('indices'): index_mapping[doc['symbol']] = doc['indices']
+                sym = str(doc.get('symbol') or '').strip().upper()
+                if sym and doc.get('indices'):
+                    index_mapping[sym] = doc['indices']
+                    # Inject live data from MongoDB Constituents (if available)
+                    if sym not in symbol_mcap_data: symbol_mcap_data[sym] = {}
+                    symbol_mcap_data[sym]['live_mc'] = doc.get('live_mc')
+                    symbol_mcap_data[sym]['live_ff'] = doc.get('live_ff')
 
         if symbol_metrics_collection is not None:
             for doc in symbol_metrics_collection.find({'as_on': as_on, 'symbol': {'$in': batch_symbols}}):
-                if doc.get('symbol'): metrics_cache[doc['symbol']] = doc
+                sym = str(doc.get('symbol') or '').strip().upper()
+                if sym: metrics_cache[sym] = doc
 
         fetcher = SymbolMetricsFetcher()
         result = fetcher.build_dashboard(
-            batch_symbols, as_of=as_on, parallel=True, max_workers=10, 
-            chunk_size=max(10, len(batch_symbols) // 10),
+            batch_symbols, as_of=as_on, parallel=True, max_workers=50, 
+            chunk_size=len(batch_symbols),  # Single batch = all symbols processed in parallel
             symbol_pr_data=symbol_pr_data, symbol_mcap_data=symbol_mcap_data,
             external_index_mapping=index_mapping, external_metrics_cache=metrics_cache
         )
@@ -2182,12 +2345,20 @@ def nse_symbol_dashboard():
         index_map_detailed = primary_index_map_from_db(batch_symbols)
         for row in rows:
             row.pop('_id', None)
-            sym = row.get('symbol')
+            sym = str(row.get('symbol') or '').strip().upper()
             if sym in index_map_detailed: 
                 row['primary_index'] = index_map_detailed[sym]
             else:
-                row['primary_index'] = None  # EXPLICITLY clear stale index tags if not in current constituents
-            if sym in symbol_pr_data: row['days_with_data'] = symbol_pr_data[sym].get('days_with_data', 0)
+                row['primary_index'] = None  # EXPLICITLY clear stale index tags
+            
+            # Inject metrics from DB aggregates
+            if sym in symbol_pr_data:
+                row['days_with_data'] = symbol_pr_data[sym].get('days_with_data', 0)
+                row['non_zero_days'] = symbol_pr_data[sym].get('non_zero_days', 0)
+                row['total_possible_days'] = symbol_pr_data[sym].get('total_possible_days', 0)
+            elif sym in symbol_mcap_data:
+                row['non_zero_days'] = symbol_mcap_data[sym].get('non_zero_days', 0)
+                row['total_possible_days'] = symbol_mcap_data[sym].get('total_possible_days', 0)
         
         # High-performance bulk upsert
         bulk_upsert_symbol_metrics(rows, source='symbol_dashboard')
@@ -2569,6 +2740,11 @@ def consolidate_saved():
 
             # Scale values to Crores and round to 2 decimal places for consolidation Excel only
             for sheet_name, df_sheet in excel_sheets.items():
+                # REQUIREMENT: Hide intermediate count columns from final report
+                cols_to_drop = [c for c in ['non_zero_days', 'total_possible_days'] if c in df_sheet.columns]
+                if cols_to_drop:
+                    df_sheet.drop(columns=cols_to_drop, inplace=True)
+                
                 # Identify columns that should be numeric (excluding Symbol, Company Name, Days With Data)
                 cols_to_scale = [c for c in df_sheet.columns if c not in ['Symbol', 'Company Name', 'Days With Data']]
                 for col in cols_to_scale:
@@ -2580,7 +2756,7 @@ def consolidate_saved():
                             df_sheet[col] = (df_sheet[col] / 10000000).round(2)
                     except:
                         pass
-                add_log(f"✓ Scaled to Crores and rounded columns in sheet '{sheet_name}'")
+                add_log(f"✓ Scaled to Crores and cleaned up sheet '{sheet_name}'")
 
             # Create single Excel file with multiple sheets
             excel_creation_start = time.perf_counter()
@@ -2666,14 +2842,19 @@ def fetch_and_store_nifty_indices():
         return jsonify({'error': 'Database not connected'}), 500
     
     try:
-        print("[fetch-and-store-indices] Starting index fetch from CSV files...")
-        fetcher = SymbolMetricsFetcher()
+        print("[fetch-and-store-indices] Starting index fetch from live NSE API...")
         
-        # Fetch indices from CSV with retry logic
-        index_mapping = fetcher.fetch_nifty_indices()
+        # We'll fetch the same fundamental indices plus any extras the user might want
+        target_indices = [
+            'NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 150', 
+            'NIFTY SMALLCAP 250', 'NIFTY MICROCAP 250', 'NIFTY 500'
+        ]
+        
+        # Use our new mapping builder that grabs live FF/MC data
+        index_mapping, live_data_mapping, errors = build_symbol_index_map(target_indices)
         
         if not index_mapping:
-            return jsonify({'error': 'Failed to fetch any indices from CSV files'}), 500
+            return jsonify({'error': 'Failed to fetch any indices from NSE API', 'details': errors}), 500
         
         # --- MANUAL OVERRIDES PHASE ---
         print(f"[fetch-and-store-indices] Applying manual overrides...")
@@ -2718,6 +2899,11 @@ def fetch_and_store_nifty_indices():
             if not filtered_indices:
                 continue
                 
+            # Get live data if available
+            live_vals = live_data_mapping.get(symbol, {})
+            live_mc = live_vals.get('mc')
+            live_ff = live_vals.get('ff')
+            
             bulk_operations.append(
                 UpdateOne(
                     {'symbol': symbol},
@@ -2726,6 +2912,8 @@ def fetch_and_store_nifty_indices():
                             'symbol': symbol,
                             'indices': filtered_indices,
                             'primary_index': filtered_indices[0],
+                            'live_mc': live_mc,
+                            'live_ff': live_ff,
                             'last_updated': timestamp
                         }
                     },

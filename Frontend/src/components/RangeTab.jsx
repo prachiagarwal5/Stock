@@ -373,7 +373,7 @@ const RangeTab = ({
                                 {rangeProgress && <span style={{ fontSize: '1.2rem', color: '#1bb76e' }}>✔️</span>}
                                 2. Download Range (fetch MCAP/PR files)
                             </li>
-                            <li style={{ fontWeight: 'bold', color: '#f9a825' }}>3. Export Range Excel (calculates averages)</li>
+                            <li style={{ fontWeight: 'bold', color: '#f9a825' }}>3. Consolidate Range (prepare database)</li>
                         </ol>
                     </div>
                 )}
@@ -527,28 +527,6 @@ const RangeTab = ({
                             disabled={!dashboardResult.download_url}
                         >
                             <span style={{ fontSize: '1.3rem' }}>⬇️</span> Download Dashboard Excel
-                        </button>
-                        <button
-                            className="btn btn-success btn-large"
-                            style={{
-                                background: 'linear-gradient(135deg, #66bb6a 0%, #43a047 100%)',
-                                color: '#fff',
-                                fontWeight: '700',
-                                borderRadius: '16px',
-                                fontSize: '1.1rem',
-                                padding: '16px 36px',
-                                boxShadow: '0 6px 24px rgba(76, 175, 80, 0.35)',
-                                border: 'none',
-                                cursor: 'pointer',
-                                transition: 'all 0.3s ease',
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: '10px'
-                            }}
-                            onClick={() => handleExportConsolidated('range')}
-                            disabled={exportLoading || !rangeStartDate || !rangeEndDate}
-                        >
-                            <span style={{ fontSize: '1.3rem' }}>📑</span> Export Range Excel
                         </button>
                         {dashboardResult.errors && dashboardResult.errors.length > 0 && (
                             <div style={{ marginTop: '0', width: '100%' }}>

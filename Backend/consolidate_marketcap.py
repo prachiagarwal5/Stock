@@ -50,6 +50,7 @@ class MarketCapConsolidator:
             self.avg_col = 'Average Market Cap'
             self.avg_ff_col = 'Average Free Float'
         self.days_col = 'Days With Data'
+        self.non_zero_days_col = 'non_zero_days'
 
     def _load_corporate_actions(self):
         if os.path.exists(self.config_file):
@@ -255,12 +256,23 @@ class MarketCapConsolidator:
         numeric_dates = pivot[date_cols].apply(pd.to_numeric, errors='coerce') if date_cols else pd.DataFrame()
         pivot[self.days_col] = numeric_dates.count(axis=1) if not numeric_dates.empty else 0
         pivot[self.avg_col] = numeric_dates.mean(axis=1) if not numeric_dates.empty else None
+        
+        # Non Zero Days: count of days where value > 0 (actually traded, not just present)
+        pivot[self.non_zero_days_col] = (numeric_dates > 0).sum(axis=1) if not numeric_dates.empty else 0
+        
+        # Calculate Total Possible Trading Days (from first appearance to end of range)
+        if not numeric_dates.empty:
+            # Find the first index (0-based) where data is not NaN for each symbol
+            first_appearance_idx = numeric_dates.notna().values.argmax(axis=1)
+            pivot['total_possible_days'] = len(date_cols) - first_appearance_idx
+        else:
+            pivot['total_possible_days'] = 0
 
         if self.file_type == 'mcap':
             pivot[self.avg_ff_col] = ff_avg
-            columns_order = ['Symbol', 'Company Name', self.days_col, self.avg_col, self.avg_ff_col] + date_cols
+            columns_order = ['Symbol', 'Company Name', self.days_col, self.non_zero_days_col, 'total_possible_days', self.avg_col, self.avg_ff_col] + date_cols
         else:
-            columns_order = ['Symbol', 'Company Name', self.days_col, self.avg_col] + date_cols
+            columns_order = ['Symbol', 'Company Name', self.days_col, self.non_zero_days_col, 'total_possible_days', self.avg_col] + date_cols
         self.df_consolidated = pivot[columns_order]
 
         self.df_consolidated = self.df_consolidated[~self.df_consolidated['Symbol'].apply(self._is_summary_symbol)]
@@ -319,12 +331,13 @@ class MarketCapConsolidator:
         df = self.df_consolidated.copy()
         
         # Convert numeric columns to Crores for Excel output only
-        # Excluding Symbol, Company Name, Days With Data
-        cols_to_scale = [c for c in df.columns if c not in ['Symbol', 'Company Name', 'Days With Data']]
+        # Excluding non-monetary columns: Symbol, Company Name, and count fields
+        cols_to_exclude = ['Symbol', 'Company Name', 'Days With Data', self.non_zero_days_col, 'total_possible_days']
+        cols_to_scale = [c for c in df.columns if c not in cols_to_exclude]
+        
         for col in cols_to_scale:
             try:
-                # IMPORTANT: Only scale MCAP and Traded Value, NOT impact cost or ratios if they were here
-                # In this consolidator, self.value_col is Market Cap or Net Traded Value
+                # IMPORTANT: Only scale MCAP and Traded Value columns (dates and average column)
                 df[col] = pd.to_numeric(df[col], errors='coerce')
                 # If Market Cap or Net Traded Value (division by 10^7)
                 df[col] = (df[col] / 10000000).round(2)
@@ -336,8 +349,14 @@ class MarketCapConsolidator:
         df = df.where(pd.notna(df), None)
 
         main_sheet = 'Market Cap Data' if self.file_type == 'mcap' else 'Net Traded Value'
+        # REQUIREMENT: Hide intermediate count columns from BOTH sheets in Excel
         avg_headers = ['Symbol', 'Company Name', self.days_col, self.avg_col]
         avg_df = df[avg_headers].copy()
+        
+        # Drop from main sheet as well
+        cols_to_drop = [c for c in [self.non_zero_days_col, 'total_possible_days'] if c in df.columns]
+        if cols_to_drop:
+            df = df.drop(columns=cols_to_drop)
 
         def chunk_rows(frame, chunk_size=5000):
             values = frame.to_numpy()
@@ -388,8 +407,9 @@ class MarketCapConsolidator:
         ws_main.set_column(1, 1, 30, text_fmt)
         ws_main.set_column(2, 2, 12, int_fmt)
         ws_main.set_column(3, 3, 18, num_fmt)
-        if len(df.columns) > 4:
-            ws_main.set_column(4, len(df.columns) - 1, 14, num_fmt)
+        # Numeric data starts from index 3 (Average Market Cap) after dropping intermediate columns
+        if len(df.columns) > 3:
+            ws_main.set_column(3, len(df.columns) - 1, 15, num_fmt)
         ws_main.freeze_panes(1, 2)
 
         ws_avg.set_column(0, 0, 15, text_fmt)
