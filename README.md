@@ -17,7 +17,7 @@ This is a **complete full-stack web application** for consolidating daily market
 ## 📦 Project Structure
 
 ```
-Proj01/
+Proj01
 ├── Backend/
 │   ├── app.py                    # Flask REST API server with MongoDB integration
 │   ├── consolidate_marketcap.py  # Data consolidation logic
