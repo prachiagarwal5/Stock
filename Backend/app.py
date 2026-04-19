@@ -32,6 +32,7 @@ from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from memory_optimized_export import MemoryOptimizedExporter, ChunkedDataProcessor, get_memory_usage_mb
 import gc
+from auth_routes import auth_bp, init_auth
 
 app = Flask(__name__)
 
@@ -85,6 +86,9 @@ def handle_preflight():
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Accept, X-Requested-With'
         response.headers['Access-Control-Max-Age'] = '3600'
         return response
+
+# Register auth blueprint
+app.register_blueprint(auth_bp)
 
 @app.route("/")
 def home():
@@ -162,6 +166,8 @@ try:
     symbol_metrics_daily_collection.create_index([('daily_data.date', 1)], name='daily_date_idx')
     nifty_indices_collection.create_index([('symbol', 1)], name='symbol_idx', unique=True)
     print("✅ MongoDB connected successfully")
+    # Initialise auth (users collection + indexes) — does NOT touch any existing collection
+    init_auth(db)
 except Exception as e:
     print(f"⚠️ MongoDB connection failed: {e}")
     import traceback

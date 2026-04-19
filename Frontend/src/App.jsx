@@ -8,11 +8,17 @@ import {
     DownloadTab,
     RangeTab
 } from './components';
+import SignIn from './components/SignIn';
+import SignUp from './components/SignUp';
+import { useAuth } from './context/AuthContext';
 
 // API URL from environment variable with fallback to localhost
 const VITE_API_URL = import.meta.env.VITE_API_URL;
 
 function App() {
+    const { user, logout, authLoading } = useAuth();
+    const [authPage, setAuthPage] = useState('signin'); // 'signin' | 'signup'
+    const [signupSuccessMsg, setSignupSuccessMsg] = useState(''); // shown on SignIn after registration
     const [uploadedFiles, setUploadedFiles] = useState([]);
     const [loading, setLoading] = useState(false);
     const [pipelineLoading, setPipelineLoading] = useState(false);
@@ -839,12 +845,41 @@ function App() {
         }
     };
 
+    // ── Auth gate ─────────────────────────────────────────────────────────
+    // Show a spinner while verifying the stored JWT on page load
+    if (authLoading) {
+        return (
+            <div className="auth-boot-loader">
+                <span className="auth-boot-spinner" />
+            </div>
+        );
+    }
+    if (!user) {
+        if (authPage === 'signup') {
+            return (
+                <SignUp
+                    onSwitchToSignIn={() => setAuthPage('signin')}
+                    onSignupSuccess={(firstName) =>
+                        setSignupSuccessMsg(`Account created for ${firstName}! Please sign in.`)
+                    }
+                />
+            );
+        }
+        return (
+            <SignIn
+                onSwitchToSignUp={() => { setSignupSuccessMsg(''); setAuthPage('signup'); }}
+                successMessage={signupSuccessMsg}
+            />
+        );
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     return (
         <div className="app">
             <TabBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
             <div className="content-area">
-                <Header />
+                <Header user={user} onLogout={logout} />
 
                 <main className="main-content">
                     <AlertMessages

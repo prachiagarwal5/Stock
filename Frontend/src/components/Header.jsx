@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 
-const Header = () => {
+const Header = ({ user, onLogout }) => {
     const [refreshing, setRefreshing] = useState(false);
     const [indexStatus, setIndexStatus] = useState(null);
     const [showStatus, setShowStatus] = useState(false);
@@ -81,6 +81,28 @@ const Header = () => {
                     <p>Upload CSV files and consolidate market cap data into a professional Excel file</p>
                 </div>
                 <div className="header-actions">
+                    {/* Greeting + logout — only rendered when a user is logged in */}
+                    {user && (
+                        <div className="header-user-block">
+                            <span className="header-greeting">
+                                Hi, {user.first_name} 👋
+                            </span>
+                            <button
+                                id="logout-btn"
+                                className="logout-btn"
+                                onClick={onLogout}
+                                title="Sign out"
+                            >
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                                    <polyline points="16 17 21 12 16 7" />
+                                    <line x1="21" y1="12" x2="9" y2="12" />
+                                </svg>
+                                Logout
+                            </button>
+                        </div>
+                    )}
+
                     <button
                         className={`refresh-indices-btn ${refreshing ? 'loading' : ''}`}
                         onClick={handleRefreshIndices}
