@@ -122,7 +122,7 @@ def _is_keepalive_authorized(req):
 # MongoDB connection
 try:
     # Hardcoded MongoDB connection string (as per user request)
-    mongo_uri = "mongodb+srv://prachiagrawal509:BSzCRUTG8F7voUBv@cluster0.kfbej.mongodb.net/Stocks?retryWrites=true&w=majority"
+    mongo_uri = "mongodb+srv://devaholdings123_db_user:27O8lO91RB1Kji3h@cluster0.kzlm4ui.mongodb.net/Stocks?retryWrites=true&w=majority"
     
     print(f"🔄 Connecting to MongoDB...")
     mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
@@ -1303,6 +1303,7 @@ def calculate_averages_from_consolidated_data(symbols, start_date=None, end_date
                     # Removed weekend skip: Include Saturdays and Sundays as well
                     date_iso_list.append(current.strftime('%Y-%m-%d'))
                     current += timedelta(days=1)
+                print(f"[calculate_averages_from_consolidated_data] Processing {len(date_iso_list)} dates for {len(symbols)} symbols")
             except:
                 return {}
         else:
