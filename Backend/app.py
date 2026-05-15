@@ -469,7 +469,7 @@ def upsert_symbol_metrics(row, source='nse_symbol_metrics'):
 
 METRIC_FIELDS_FROM_NSE = [
     'impact_cost', 'free_float_mcap', 'total_market_cap', 
-    'total_traded_value', 'companyName', 'listingDate', 'basicIndustry'
+    'total_traded_value', 'companyName', 'listingDate', 'basicIndustry', 'primary_index'
 ]
 
 def enrich_rows_from_metrics_db(rows):
@@ -495,40 +495,41 @@ def enrich_rows_from_metrics_db(rows):
 
     # Fetch latest stored doc per symbol (sort by as_on desc)
     try:
+        # Optimized pipeline to fetch latest non-null metrics per symbol
         pipeline = [
             {'$match': {'symbol': {'$in': syms}}},
-            {'$sort': {'as_on': -1, 'updated_at': -1}},
-            {'$group': {
-                '_id': '$symbol',
-                'impact_cost':        {'$first': '$impact_cost'},
-                'free_float_mcap':    {'$first': '$free_float_mcap'},
-                'total_market_cap':   {'$first': '$total_market_cap'},
-                'total_traded_value': {'$first': '$total_traded_value'},
-                'companyName':        {'$first': '$companyName'},
-                'listingDate':        {'$first': '$listingDate'},
-                'basicIndustry':      {'$first': '$basicIndustry'},
-            }}
+            {'$sort': {'as_on': -1}},
+            {
+                '$group': {
+                    '_id': '$symbol',
+                    'latest_doc': {'$first': '$$ROOT'}
+                }
+            },
+            {'$replaceRoot': {'newRoot': '$latest_doc'}}
         ]
-        fallback_map = {}
-        for doc in symbol_metrics_collection.aggregate(pipeline):
-            sym = doc.pop('_id')
-            fallback_map[sym] = doc
+        latest_docs = list(symbol_metrics_collection.aggregate(pipeline))
+        fallback_map = {doc['symbol']: doc for doc in latest_docs}
 
-        filled = 0
-        for row in needs_fallback:
-            sym = row.get('symbol')
-            fb = fallback_map.get(sym)
-            if not fb:
-                continue
-            for field in METRIC_FIELDS_FROM_NSE:
-                if row.get(field) is None and fb.get(field) is not None:
-                    row[field] = fb[field]
-                    filled += 1
-
-        if filled:
-            print(f"[enrich_metrics_db] ✓ Filled {filled} null metric fields for {len(fallback_map)} symbols from history")
     except Exception as exc:
-        print(f"[enrich_metrics_db] ⚠️ Fallback query failed: {exc}")
+        print(f"⚠️ Fallback query failed for symbol_metrics: {exc}")
+        fallback_map = {}
+
+    # Apply fallbacks
+    for r in needs_fallback:
+        sym = r.get('symbol')
+        if not sym or sym not in fallback_map:
+            continue
+        
+        fallback_doc = fallback_map[sym]
+
+        # If 'index' is missing or None, fall back to 'primary_index'
+        if r.get('index') is None and fallback_doc.get('primary_index'):
+            r['index'] = fallback_doc['primary_index']
+            
+        # Fallback for other fields
+        for f in METRIC_FIELDS_FROM_NSE:
+            if r.get(f) is None and fallback_doc.get(f) is not None:
+                r[f] = fallback_doc[f]
 
     return rows
 
@@ -1297,6 +1298,7 @@ def calculate_averages_from_consolidated_data(symbols, start_date=None, end_date
                     # Removed weekend skip: Include Saturdays and Sundays as well
                     date_iso_list.append(current.strftime('%Y-%m-%d'))
                     current += timedelta(days=1)
+            
             except:
                 return {}
         else:
@@ -1605,10 +1607,29 @@ def format_dashboard_excel(rows, excel_path, start_date=None, end_date=None):
         # Standardize for comparison
         std_qualifying = {i.replace(' ', '').upper() for i in qualifying_indices}
         
-        def is_broader_index(idx):
-            if not idx or str(idx).strip().upper() == 'PERMITTED': return ''
-            idx_up = str(idx).replace(' ', '').upper()
-            return 'NIFTY 500' if idx_up in std_qualifying else ''
+        def is_broader_index(idx_val):
+            """Check if any of the indices in the list qualify for Broader Index."""
+            if not idx_val:
+                return ''
+            
+            # The 'index' can be a single string or a list of strings
+            indices = idx_val if isinstance(idx_val, list) else [str(idx_val)]
+            
+            for idx in indices:
+                if not idx or str(idx).strip().upper() == 'PERMITTED':
+                    continue
+                
+                idx_up = str(idx).replace(' ', '').upper()
+
+                # Check against the set of qualifying indices
+                if idx_up in std_qualifying:
+                    return 'NIFTY 500'
+                
+                # Also handle cases where 'NIFTY 500' is directly present
+                if 'NIFTY500' in idx_up:
+                    return 'NIFTY 500'
+            
+            return ''
             
         df['Broader Index'] = df['index'].apply(is_broader_index)
         
@@ -2317,6 +2338,35 @@ def nse_symbol_dashboard():
                     symbol_mcap_data[sym]['non_zero_days'] = doc.get('non_zero_days') if doc.get('non_zero_days') is not None else doc.get('Non Zero Days', 0)
 
         if nifty_indices_collection is not None:
+            # Check if the collection has data; if not, auto-fetch from Nifty CSV files
+            indices_count = nifty_indices_collection.count_documents({})
+            if indices_count == 0:
+                print("[nse-symbol-dashboard] nifty_indices_collection is EMPTY. Auto-fetching from Nifty CSV files...")
+                try:
+                    fetcher_tmp = SymbolMetricsFetcher()
+                    auto_index_map = fetcher_tmp.fetch_nifty_indices()
+                    if auto_index_map:
+                        from pymongo import UpdateOne as _UO
+                        _ops = []
+                        _ts = datetime.now()
+                        for _sym, _idxs in auto_index_map.items():
+                            _sym = str(_sym).strip().upper()
+                            if _sym == 'PERMITTED' or not _idxs:
+                                continue
+                            _filtered = [i for i in _idxs if str(i).strip().upper() != 'PERMITTED']
+                            if not _filtered:
+                                continue
+                            _ops.append(_UO(
+                                {'symbol': _sym},
+                                {'$set': {'symbol': _sym, 'indices': _filtered, 'primary_index': _filtered[0], 'last_updated': _ts}},
+                                upsert=True
+                            ))
+                        if _ops:
+                            nifty_indices_collection.bulk_write(_ops, ordered=False)
+                            print(f"[nse-symbol-dashboard] Auto-stored {len(_ops)} symbols to nifty_indices_collection")
+                except Exception as _ae:
+                    print(f"[nse-symbol-dashboard] Auto-fetch indices failed: {_ae}")
+
             for doc in nifty_indices_collection.find({'symbol': {'$in': batch_symbols}}):
                 sym = str(doc.get('symbol') or '').strip().upper()
                 if sym and doc.get('indices'):
@@ -2332,11 +2382,15 @@ def nse_symbol_dashboard():
                 if sym: metrics_cache[sym] = doc
 
         fetcher = SymbolMetricsFetcher()
+        # CRITICAL FIX: Only pass external_index_mapping if it is non-empty.
+        # Passing an empty dict {} causes build_dashboard to treat it as an "external source"
+        # and CLEAR all index values from NSE API response. None = use NSE API index data.
+        effective_index_mapping = index_mapping if index_mapping else None
         result = fetcher.build_dashboard(
             batch_symbols, as_of=as_on, parallel=True, max_workers=50, 
             chunk_size=len(batch_symbols),  # Single batch = all symbols processed in parallel
             symbol_pr_data=symbol_pr_data, symbol_mcap_data=symbol_mcap_data,
-            external_index_mapping=index_mapping, external_metrics_cache=metrics_cache
+            external_index_mapping=effective_index_mapping, external_metrics_cache=metrics_cache
         )
         
         rows = result.get('rows', [])
@@ -2346,10 +2400,20 @@ def nse_symbol_dashboard():
         for row in rows:
             row.pop('_id', None)
             sym = str(row.get('symbol') or '').strip().upper()
+            
+            # Inject index from DB mapping if available
+            if sym in index_mapping:
+                indices_list = [idx for idx in index_mapping[sym] if str(idx).strip().upper() != 'PERMITTED']
+                row['index'] = indices_list[0] if indices_list else row.get('index')
+                row['indexList'] = indices_list
+            
             if sym in index_map_detailed: 
                 row['primary_index'] = index_map_detailed[sym]
+            elif sym in index_mapping:
+                indices_list = [idx for idx in index_mapping[sym] if str(idx).strip().upper() != 'PERMITTED']
+                row['primary_index'] = indices_list[0] if indices_list else None
             else:
-                row['primary_index'] = None  # EXPLICITLY clear stale index tags
+                row['primary_index'] = row.get('primary_index')  # Keep existing value, don't clear
             
             # Inject metrics from DB aggregates
             if sym in symbol_pr_data:
@@ -2835,26 +2899,25 @@ def consolidate_saved():
 @app.route('/api/nifty-indices/fetch-and-store', methods=['POST'])
 def fetch_and_store_nifty_indices():
     """
-    Fetch Nifty indices from CSV files and store in MongoDB.
-    This should be called when user clicks the 'Refresh Indices' button.
+    Fetch exactly 5 Nifty indices from niftyindices.com CSVs and store in MongoDB.
+    Indices: NIFTY 50, NIFTY NEXT 50, NIFTY MIDCAP 150, NIFTY SMALLCAP 250, NIFTY MICROCAP 250.
+    Called when user clicks the 'Refresh Indices' button in the header.
     """
     if nifty_indices_collection is None:
         return jsonify({'error': 'Database not connected'}), 500
     
     try:
-        print("[fetch-and-store-indices] Starting index fetch from live NSE API...")
+        print("[fetch-and-store-indices] Fetching 5 Nifty indices from niftyindices.com CSVs...")
         
-        # We'll fetch the same fundamental indices plus any extras the user might want
-        target_indices = [
-            'NIFTY 50', 'NIFTY NEXT 50', 'NIFTY MIDCAP 150', 
-            'NIFTY SMALLCAP 250', 'NIFTY MICROCAP 250', 'NIFTY 500'
-        ]
-        
-        # Use our new mapping builder that grabs live FF/MC data
-        index_mapping, live_data_mapping, errors = build_symbol_index_map(target_indices)
-        
+        # Fetch all 5 indices via reliable niftyindices.com CSV files
+        # (NIFTY_INDEX_URLS in nse_symbol_metrics.py already defines exactly these 5)
+        fetcher_inst = SymbolMetricsFetcher()
+        index_mapping = fetcher_inst.fetch_nifty_indices()  # returns {symbol: [index_name, ...]}
+        live_data_mapping = {}  # CSV-based fetch doesn't include live MC/FF data
+        errors = []
+
         if not index_mapping:
-            return jsonify({'error': 'Failed to fetch any indices from NSE API', 'details': errors}), 500
+            return jsonify({'error': 'Failed to fetch any indices from CSV files', 'details': errors}), 500
         
         # --- MANUAL OVERRIDES PHASE ---
         print(f"[fetch-and-store-indices] Applying manual overrides...")

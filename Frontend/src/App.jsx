@@ -38,6 +38,9 @@ function App() {
     const [dashboardLoading, setDashboardLoading] = useState(false);
     const [dashboardBatchProgress, setDashboardBatchProgress] = useState(null);
     const [consolidationBatchProgress, setConsolidationBatchProgress] = useState(null);
+    const [dashboardLimit, setDashboardLimit] = useState(100);
+    const [indicesLoading, setIndicesLoading] = useState(false);
+    const [dashboardError, setDashboardError] = useState(null);
     // Reset consolidation status when date range changes
     useEffect(() => {
         if (exportedRange) {
@@ -526,7 +529,7 @@ function App() {
         setSuccess(null);
 
         try {
-            const response = await fetch(`${VITE_API_URL}/api/update-indices`, {
+            const response = await fetch(`${VITE_API_URL}/api/nifty-indices/fetch-and-store`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -539,10 +542,7 @@ function App() {
                 throw new Error(data.error || 'Index update failed');
             }
 
-            setSuccess(`✅ Indices updated for ${data.count} symbols`);
-            if (data.download_path) {
-                window.open(`${VITE_API_URL}${data.download_path}`, '_blank');
-            }
+            setSuccess(`✅ Indices updated for ${data.total_symbols} symbols`);
 
             if (activeTab === 'mongo') {
                 await loadDashboardData(dashboardLimit);
@@ -889,6 +889,8 @@ function App() {
                             pipelineLoading={pipelineLoading}
                             pipelineStage={pipelineStage}
                             consolidationBatchProgress={consolidationBatchProgress}
+                            handleUpdateIndices={handleUpdateIndices}
+                            indicesLoading={indicesLoading}
                         />
                     )}
                 </main>
